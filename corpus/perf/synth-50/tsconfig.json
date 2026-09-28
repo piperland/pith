@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "commonjs",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./.tsbuildinfo/synth-50.tsbuildinfo",
+    "skipLibCheck": true
+  },
+  "include": [
+    "*.ts"
+  ]
+}
