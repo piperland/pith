@@ -70,11 +70,41 @@
 //! fact-fed from the adapter's function declarator facts; only the
 //! literal-kind enum mapping is driver-side (mechanical and exhaustive).
 //!
-//! BLOCKER (P013 call facts): call-site arity checking (too few/many
-//! arguments) needs call facts the adapter does not emit — explicit
-//! non-goal. `void` returns are excluded from the corpus: tsc accepts
-//! `undefined` for `void` while the shared annotation map distinguishes
-//! them (pre-existing const-subset gap, unchanged here).
+//! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
+//! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
+//! corpus: tsc accepts `undefined` for `void` while the shared annotation
+//! map distinguishes them (pre-existing const-subset gap, unchanged here).
+//!
+//! Call-site checks (P014, probed on tsc 7.0.2 `--strict --pretty false`):
+//!
+//! - `PITH2554` <-> `TS2554`: `Expected 2 arguments, but got 1.` (arity is
+//!   exact; tsc always spells `arguments`, even for one).
+//! - `PITH2345` <-> `TS2345`: `Argument of type 'string' is not assignable
+//!   to parameter of type 'number'.` (widened literal names, one per call).
+//!
+//! - One family per call site, arity first: `add("oops")` against two
+//!   `number` params reports only `TS2554` (the type mismatch never
+//!   surfaces), and `add("x", "y")` reports a single `TS2345` at the FIRST
+//!   mismatched argument. The solver mirrors both.
+//! - Span anchoring mirrors tsc: too-few arity anchors at the callee
+//!   identifier, too-many at the first excess argument, arg-type at the
+//!   mismatched argument — all from call facts, never string-searching.
+//! - Range/variadic arities are declined: optional/defaulted params spell
+//!   `Expected 1-2 arguments, but got 3.` and rest params spell `TS2555`
+//!   (`Expected at least 1 arguments, but got 0.`); the subset checks exact
+//!   counts only. Overload failures spell `TS2769` with continuation lines;
+//!   multiple same-name declarations (overloads, or shadowing the fact set
+//!   cannot disambiguate — a documented precision limit) decline with reason.
+//! - Unresolved callees are skipped, not diagnosed: the name is already
+//!   tracked as an unresolved reference (see [`Binder::unresolved`]), so a
+//!   diagnostic would double-report one signal (and per-site unsupported
+//!   notes would flood the report with duplicates of a tracked signal).
+//!   Return/body checkability is irrelevant: calls to complex-bodied
+//!   functions still arity/arg-check, exactly like tsc.
+//! - Non-literal arguments degrade per-argument (skipped for type checks,
+//!   arity still enforced): expression facts do not exist yet, and declining
+//!   whole calls over one identifier argument would forfeit decidable arity
+//!   verdicts.
 //!
 //! Design law (H-002): literal freshness and every other per-occurrence
 //! verdict lives in query-side tables keyed by occurrence
@@ -99,6 +129,10 @@ pub const CODE_MISSING_MEMBER: &str = "PITH2741";
 pub const CODE_MISSING_MANY: &str = "PITH2739";
 /// Code for excess members in a fresh object literal (oracle `TS2353`).
 pub const CODE_EXCESS_MEMBER: &str = "PITH2353";
+/// Code for call-site arity mismatches (oracle `TS2554`).
+pub const CODE_ARITY: &str = "PITH2554";
+/// Code for call-site argument-type mismatches (oracle `TS2345`).
+pub const CODE_ARG_TYPE: &str = "PITH2345";
 
 /// One solver verdict: machine-comparable code plus anchored span.
 ///
@@ -331,15 +365,22 @@ pub struct ConstDecl {
 
 /// One function parameter: name + whether it carries a type annotation.
 ///
-/// Fact-fed from the adapter's identifier parameter list (names only). The
-/// solver gates on `annotated`, never on parameter types: call-site arity
-/// checking needs call facts the adapter does not emit (explicit non-goal).
+/// Fact-fed from the adapter's identifier parameter list. The return checker
+/// gates on `annotated` only; the call-site checker additionally needs
+/// `annotation` (arg-type checks), `optional`, and `is_rest` (exact-arity
+/// checks decline range/variadic lists).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionParam {
     /// Parameter name as written.
     pub name: String,
     /// Whether the parameter carries a type annotation.
     pub annotated: bool,
+    /// Raw annotation text (`Some("number")`); `None` when unannotated.
+    pub annotation: Option<String>,
+    /// `true` for `b?: number` and defaulted `b: T = …` (arity is a range).
+    pub optional: bool,
+    /// `true` for `...rest: T[]` (variadic).
+    pub is_rest: bool,
 }
 
 /// A straight-line `return <expr>;`: literal kind plus object members.
@@ -624,6 +665,271 @@ fn function_shape(
         ));
     }
     Ok((annotation, body.kind, body.init_object.clone()))
+}
+
+/// One call-site argument: literal kind plus span.
+///
+/// Fact-fed from the adapter's `CallArgFact`; only the enum mapping is
+/// driver-side (mechanical and exhaustive). Kinds reuse [`InitKind`] so
+/// argument checks run through [`annotation_type`] and [`InitKind::type_id`]
+/// unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallArg {
+    /// Literal kind of the argument expression.
+    pub kind: InitKind,
+    /// Span of the argument expression.
+    pub span: Span,
+}
+
+/// One direct `f(...)` call site to check.
+///
+/// Fact-fed from the adapter's `CallFact`: callee name plus its identifier
+/// span, the whole call span, and one [`CallArg`] per argument in source
+/// order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallSite {
+    /// Callee name as written.
+    pub callee: String,
+    /// Span of the callee identifier (too-few-arity anchor, mirroring tsc).
+    pub callee_span: Span,
+    /// Span of the whole call expression.
+    pub span: Span,
+    /// Argument facts in source order.
+    pub args: Vec<CallArg>,
+}
+
+/// Checks every direct call site in `calls` against the function
+/// declarations in `decls` for `file`, returning the sorted [`FileReport`].
+///
+/// Resolution is by callee name within the file's declaration set (the
+/// single-file closed world: every declared name is in `decls`). Per-call
+/// outcomes, in order:
+///
+/// - No declaration bears the name: the call is skipped, never diagnosed.
+///   A genuinely undeclared callee is already tracked as an unresolved
+///   reference (see [`Binder::unresolved`]) — diagnosing would double-report
+///   one signal. A name that is neither declared nor unresolved-tracked is
+///   driver skew, recorded as [`UnsupportedDecl`] rather than silently
+///   dropped.
+/// - Several declarations bear the name (overloads, or shadowing the
+///   fact set cannot disambiguate): one [`UnsupportedDecl`] — overload
+///   resolution is future work, never speculative.
+/// - Exactly one declaration: parameter gates (structural first —
+///   `params_complex`, unannotated, optional/rest, uncheckable parameter
+///   types — each its own [`UnsupportedDecl`] at the callee span), then at
+///   most one diagnostic: arity (`PITH2554`) beats arg types (`PITH2345`),
+///   and only the first mismatched argument reports (both probed on tsc
+///   7.0.2). Non-literal arguments are skipped per-argument for type checks
+///   while arity still enforces. Return annotations and body shapes are
+///   irrelevant here: calls to complex-bodied functions still check.
+///
+/// Spans mirror the oracle: too-few arity at the callee identifier, too-many
+/// at the first excess argument, arg-type at the mismatched argument.
+#[must_use]
+pub fn check_calls(
+    file: FileId,
+    decls: &[FunctionDecl],
+    calls: &[CallSite],
+    binder: &Binder,
+) -> FileReport {
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, decl) in decls.iter().enumerate() {
+        by_name.entry(decl.name.as_str()).or_default().push(index);
+    }
+    let mut report = FileReport::default();
+    for call in calls {
+        check_one_call(file, decls, &by_name, call, binder, &mut report);
+    }
+    sort_report(&mut report);
+    report
+}
+
+/// Checks one call site, pushing into `report`.
+///
+/// At most one diagnostic ever fires per call (arity before types, first
+/// mismatch only); declines push exactly one [`UnsupportedDecl`].
+fn check_one_call(
+    file: FileId,
+    decls: &[FunctionDecl],
+    by_name: &HashMap<&str, Vec<usize>>,
+    call: &CallSite,
+    binder: &Binder,
+    report: &mut FileReport,
+) {
+    let candidates = by_name.get(call.callee.as_str());
+    let Some(candidates) = candidates else {
+        if binder
+            .unresolved()
+            .iter()
+            .any(|entry| entry.file == file && entry.name == call.callee)
+        {
+            // Tracked as an unresolved reference already: skip, never
+            // double-diagnose.
+            return;
+        }
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span: call.callee_span,
+            reason: format!(
+                "call to undeclared name '{}': nothing to check against",
+                call.callee
+            ),
+        });
+        return;
+    };
+    if candidates.len() != 1 {
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span: call.callee_span,
+            reason: format!(
+                "multiple declarations for '{}': overload resolution is outside the subset",
+                call.callee
+            ),
+        });
+        return;
+    }
+    let decl = &decls[candidates[0]];
+    let Some(params) = call_params(call, decl, file, report) else {
+        return;
+    };
+    if call.args.len() != params.len() {
+        let span = if call.args.len() < params.len() {
+            call.callee_span
+        } else {
+            call.args[params.len()].span
+        };
+        report.diagnostics.push(PithDiagnostic {
+            code: CODE_ARITY.to_owned(),
+            file,
+            span,
+            message: format!(
+                "Expected {} arguments, but got {}.",
+                params.len(),
+                call.args.len()
+            ),
+        });
+        return;
+    }
+    for (argument, (expected, display)) in call.args.iter().zip(params.iter()) {
+        if argument.kind == InitKind::NonLiteral {
+            continue;
+        }
+        if argument.kind.type_id() != *expected {
+            report.diagnostics.push(PithDiagnostic {
+                code: CODE_ARG_TYPE.to_owned(),
+                file,
+                span: argument.span,
+                message: format!(
+                    "Argument of type '{}' is not assignable to parameter of type '{display}'.",
+                    argument.kind.name(),
+                ),
+            });
+            return;
+        }
+    }
+}
+
+/// Gates one call's parameter list for [`check_one_call`].
+///
+/// `Some` carries per-parameter `(expected [``TypeId``], display text)` in
+/// source order; `None` means one [`UnsupportedDecl`] was pushed at the
+/// callee span and the call declines. Structural gates run
+/// parameter-by-parameter in order (unannotated, optional/rest, then
+/// uncheckable type text): the first failure wins, so reasons stay
+/// single and deterministic.
+fn call_params(
+    call: &CallSite,
+    decl: &FunctionDecl,
+    file: FileId,
+    report: &mut FileReport,
+) -> Option<Vec<(TypeId, String)>> {
+    if decl.params_complex {
+        decline(
+            call,
+            file,
+            report,
+            "non-identifier parameter pattern is outside the subset",
+        );
+        return None;
+    }
+    let mut params = Vec::with_capacity(decl.params.len());
+    for param in &decl.params {
+        if !param.annotated {
+            decline(
+                call,
+                file,
+                report,
+                &format!(
+                    "unannotated parameter '{}' is outside the subset",
+                    param.name
+                ),
+            );
+            return None;
+        }
+        if param.optional {
+            decline(
+                call,
+                file,
+                report,
+                &format!(
+                    "optional parameter '{}' takes a range of arities, outside the subset",
+                    param.name
+                ),
+            );
+            return None;
+        }
+        if param.is_rest {
+            decline(
+                call,
+                file,
+                report,
+                &format!(
+                    "rest parameter '{}' is variadic, outside the subset",
+                    param.name
+                ),
+            );
+            return None;
+        }
+        match classify_param(param) {
+            Ok((expected, display)) => params.push((expected, display)),
+            Err(reason) => {
+                decline(call, file, report, &reason);
+                return None;
+            }
+        }
+    }
+    Some(params)
+}
+
+/// Pushes one call-site [`UnsupportedDecl`] at the callee span.
+fn decline(call: &CallSite, file: FileId, report: &mut FileReport, reason: &str) {
+    report.unsupported.push(UnsupportedDecl {
+        file,
+        span: call.callee_span,
+        reason: format!("call to '{}': {reason}", call.callee),
+    });
+}
+
+/// Classifies one annotated, non-optional, non-rest parameter into its
+/// expected ([`TypeId`], display text): `Err` carries the decline reason
+/// (union, object, unknown, or missing type text the subset cannot spell
+/// argument checks against).
+fn classify_param(param: &FunctionParam) -> Result<(TypeId, String), String> {
+    let text = param.annotation.as_deref().map_or("", str::trim);
+    if text.contains('|') {
+        return Err(format!(
+            "union parameter type '{text}' is outside the subset"
+        ));
+    }
+    annotation_type(text).map_or_else(
+        || {
+            Err(format!(
+                "parameter type '{text}' for '{}' is outside the subset",
+                param.name
+            ))
+        },
+        |expected| Ok((expected, text.to_owned())),
+    )
 }
 
 /// Occurrence [`NodeId`] for the `index`-th synthetic function-return
@@ -1273,7 +1579,7 @@ fn check_object_annotation_non_object_init(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pith_symbols::{ScopeInput, SymbolInput};
+    use pith_symbols::{ScopeInput, SymbolInput, UnresolvedInput};
 
     const FILE: FileId = FileId(0);
 
@@ -1282,14 +1588,26 @@ mod tests {
     }
 
     fn binder_with(names: &[(&str, Span)]) -> Binder {
+        calls_binder(names, &[])
+    }
+
+    /// A binder with declared symbols plus unresolved (global) references.
+    fn calls_binder(declared: &[(&str, Span)], unresolved: &[&str]) -> Binder {
         let mut binder = Binder::new();
-        let symbols: Vec<SymbolInput> = names
+        let symbols: Vec<SymbolInput> = declared
             .iter()
             .map(|(name, decl_span)| SymbolInput {
                 scope: 0,
                 name: (*name).to_owned(),
                 span: *decl_span,
                 flags: 0,
+            })
+            .collect();
+        let missing: Vec<UnresolvedInput> = unresolved
+            .iter()
+            .map(|name| UnresolvedInput {
+                name: (*name).to_owned(),
+                count: 1,
             })
             .collect();
         binder.build_file(
@@ -1299,7 +1617,7 @@ mod tests {
                 parent: u32::MAX,
             }],
             &symbols,
-            &[],
+            &missing,
         );
         binder
     }
@@ -2069,6 +2387,9 @@ mod tests {
                 .map(|(name, annotated)| FunctionParam {
                     name: name.to_owned(),
                     annotated,
+                    annotation: None,
+                    optional: false,
+                    is_rest: false,
                 })
                 .collect(),
             params_complex: false,
@@ -2082,6 +2403,46 @@ mod tests {
             kind: Some(kind),
             init_object: None,
         })
+    }
+
+    /// A declaration with fully annotated primitive params for call-site
+    /// tests: `params` are `(name, type-text)` pairs, all exact-arity.
+    fn callable(name: &str, params: Vec<(&str, &str)>) -> FunctionDecl {
+        FunctionDecl {
+            name: name.to_owned(),
+            span: span(0, 10),
+            scope: 0,
+            symbol: None,
+            params: params
+                .into_iter()
+                .map(|(param, ty)| FunctionParam {
+                    name: param.to_owned(),
+                    annotated: true,
+                    annotation: Some(ty.to_owned()),
+                    optional: false,
+                    is_rest: false,
+                })
+                .collect(),
+            params_complex: false,
+            return_annotation: Some("number".to_owned()),
+            body: single(InitKind::Number),
+        }
+    }
+
+    /// One call site at `callee_span` with literal-kind args.
+    fn call(callee: &str, callee_span: Span, args: Vec<(InitKind, Span)>) -> CallSite {
+        CallSite {
+            callee: callee.to_owned(),
+            callee_span,
+            span: span(0, 60),
+            args: args
+                .into_iter()
+                .map(|(kind, arg_span)| CallArg {
+                    kind,
+                    span: arg_span,
+                })
+                .collect(),
+        }
     }
 
     fn object_return(members: Vec<(&str, ObjectMemberKind)>) -> FunctionBody {
@@ -2372,5 +2733,311 @@ mod tests {
         assert!(func_report.diagnostics.is_empty());
         assert!(func_report.unsupported.is_empty());
         assert_eq!(db.recompute_count(), 2);
+    }
+
+    #[test]
+    fn call_correct_is_silent() {
+        let binder = calls_binder(&[("add", span(0, 10))], &[]);
+        let decls = [callable("add", vec![("a", "number"), ("b", "number")])];
+        let calls = [call(
+            "add",
+            span(20, 23),
+            vec![
+                (InitKind::Number, span(24, 25)),
+                (InitKind::Number, span(27, 28)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn call_too_few_is_pith2554_at_callee() {
+        let binder = calls_binder(&[("add", span(0, 10))], &[]);
+        let decls = [callable("add", vec![("a", "number"), ("b", "number")])];
+        let calls = [call(
+            "add",
+            span(20, 23),
+            vec![(InitKind::Number, span(24, 25))],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARITY);
+        assert_eq!(report.diagnostics[0].span, span(20, 23));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Expected 2 arguments, but got 1."
+        );
+    }
+
+    #[test]
+    fn call_too_many_is_pith2554_at_excess_arg() {
+        let binder = calls_binder(&[("add", span(0, 10))], &[]);
+        let decls = [callable("add", vec![("a", "number"), ("b", "number")])];
+        let calls = [call(
+            "add",
+            span(20, 23),
+            vec![
+                (InitKind::Number, span(24, 25)),
+                (InitKind::Number, span(27, 28)),
+                (InitKind::Number, span(30, 31)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARITY);
+        assert_eq!(report.diagnostics[0].span, span(30, 31));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Expected 2 arguments, but got 3."
+        );
+    }
+
+    #[test]
+    fn call_wrong_arg_type_is_pith2345_at_arg() {
+        let binder = calls_binder(&[("add", span(0, 10))], &[]);
+        let decls = [callable("add", vec![("a", "number"), ("b", "number")])];
+        let calls = [call(
+            "add",
+            span(20, 23),
+            vec![
+                (InitKind::Number, span(24, 25)),
+                (InitKind::String, span(27, 33)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(report.diagnostics[0].span, span(27, 33));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'string' is not assignable to parameter of type 'number'."
+        );
+    }
+
+    #[test]
+    fn call_arity_beats_arg_type() {
+        // Probed on tsc 7.0.2: `add("oops")` against two `number` params
+        // reports only TS2554 — one family per call site, arity first.
+        let binder = calls_binder(&[("add", span(0, 10))], &[]);
+        let decls = [callable("add", vec![("a", "number"), ("b", "number")])];
+        let calls = [call(
+            "add",
+            span(20, 23),
+            vec![(InitKind::String, span(24, 30))],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARITY);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Expected 2 arguments, but got 1."
+        );
+    }
+
+    #[test]
+    fn call_reports_first_mismatch_only() {
+        // Probed on tsc 7.0.2: `add("x", "y")` reports one TS2345 at the
+        // first argument, never one per argument.
+        let binder = calls_binder(&[("add", span(0, 10))], &[]);
+        let decls = [callable("add", vec![("a", "number"), ("b", "number")])];
+        let calls = [call(
+            "add",
+            span(20, 23),
+            vec![
+                (InitKind::String, span(24, 27)),
+                (InitKind::String, span(29, 32)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(report.diagnostics[0].span, span(24, 27));
+    }
+
+    #[test]
+    fn call_non_literal_arg_skips_type_but_not_arity() {
+        let binder = calls_binder(&[("add", span(0, 10))], &[]);
+        let decls = [callable("add", vec![("a", "number"), ("b", "number")])];
+        // An identifier argument degrades per-argument: the literal second
+        // argument still checks.
+        let typed = [call(
+            "add",
+            span(20, 23),
+            vec![
+                (InitKind::NonLiteral, span(24, 25)),
+                (InitKind::String, span(27, 33)),
+            ],
+        )];
+        let typed_report = check_calls(FILE, &decls, &typed, &binder);
+        assert_eq!(typed_report.diagnostics.len(), 1);
+        assert_eq!(typed_report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(typed_report.diagnostics[0].span, span(27, 33));
+        // Arity still enforces over non-literal arguments.
+        let short = [call(
+            "add",
+            span(40, 43),
+            vec![(InitKind::NonLiteral, span(44, 45))],
+        )];
+        let short_report = check_calls(FILE, &decls, &short, &binder);
+        assert_eq!(short_report.diagnostics.len(), 1);
+        assert_eq!(short_report.diagnostics[0].code, CODE_ARITY);
+    }
+
+    #[test]
+    fn call_unresolved_callee_skips_silently() {
+        // The oracle reports TS2304 here; the solver stays silent because
+        // the name is already tracked as an unresolved reference — never a
+        // double diagnosis.
+        let binder = calls_binder(&[], &["missing"]);
+        let decls: Vec<FunctionDecl> = Vec::new();
+        let calls = [call(
+            "missing",
+            span(0, 7),
+            vec![(InitKind::Number, span(8, 9))],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn call_untracked_name_is_unsupported_not_silent() {
+        // Neither declared nor unresolved-tracked: driver skew, recorded
+        // rather than silently dropped.
+        let binder = calls_binder(&[], &[]);
+        let decls: Vec<FunctionDecl> = Vec::new();
+        let calls = [call("ghost", span(0, 5), Vec::new())];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("nothing to check against"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn call_multiple_declarations_decline() {
+        // Overloads (or shadowing the fact set cannot disambiguate): no
+        // speculative resolution, one unsupported note.
+        let binder = calls_binder(&[("over", span(0, 10))], &[]);
+        let decls = [
+            callable("over", vec![("a", "number")]),
+            callable("over", vec![("a", "string")]),
+        ];
+        let calls = [call(
+            "over",
+            span(30, 34),
+            vec![
+                (InitKind::Number, span(35, 36)),
+                (InitKind::Number, span(38, 39)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].span, span(30, 34));
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("multiple declarations"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn call_param_gates_are_unsupported_never_silent() {
+        let binder = calls_binder(&[], &[]);
+        let mut unannotated = callable("u", vec![("v", "number")]);
+        unannotated.params[0].annotated = false;
+        unannotated.params[0].annotation = None;
+        let mut optional = callable("o", vec![("b", "number")]);
+        optional.params[0].optional = true;
+        let mut rest = callable("r", vec![("items", "number[]")]);
+        rest.params[0].is_rest = true;
+        let union = callable("n", vec![("v", "number | string")]);
+        let unknown = callable("w", vec![("v", "Nope")]);
+        let mut complex = callable("c", vec![("v", "number")]);
+        complex.params_complex = true;
+        let decls = [unannotated, optional, rest, union, unknown, complex];
+        let calls = [
+            call("u", span(0, 1), vec![(InitKind::Number, span(2, 3))]),
+            call("o", span(10, 11), vec![(InitKind::Number, span(12, 13))]),
+            call("r", span(20, 21), vec![(InitKind::Number, span(22, 23))]),
+            call("n", span(30, 31), vec![(InitKind::Number, span(32, 33))]),
+            call("w", span(40, 41), vec![(InitKind::Number, span(42, 43))]),
+            call("c", span(50, 51), vec![(InitKind::Number, span(52, 53))]),
+        ];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 6);
+        let los: Vec<u32> = report.unsupported.iter().map(|note| note.span.lo).collect();
+        assert_eq!(los, [0, 10, 20, 30, 40, 50]);
+        let reasons: Vec<&str> = report
+            .unsupported
+            .iter()
+            .map(|note| note.reason.as_str())
+            .collect();
+        assert!(
+            reasons[0].contains("unannotated parameter"),
+            "reason: {}",
+            reasons[0]
+        );
+        assert!(
+            reasons[1].contains("optional parameter"),
+            "reason: {}",
+            reasons[1]
+        );
+        assert!(
+            reasons[2].contains("rest parameter"),
+            "reason: {}",
+            reasons[2]
+        );
+        assert!(
+            reasons[3].contains("union parameter type"),
+            "reason: {}",
+            reasons[3]
+        );
+        assert!(
+            reasons[4].contains("parameter type"),
+            "reason: {}",
+            reasons[4]
+        );
+        assert!(
+            reasons[5].contains("non-identifier parameter pattern"),
+            "reason: {}",
+            reasons[5]
+        );
     }
 }

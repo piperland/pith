@@ -163,6 +163,9 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                     .map(|param| FunctionParam {
                         name: param.name.clone(),
                         annotated: param.annotated,
+                        annotation: param.annotation_text.clone(),
+                        optional: param.optional,
+                        is_rest: param.is_rest,
                     })
                     .collect(),
                 params_complex: func.params_complex,
@@ -422,6 +425,21 @@ fn driver_maps_facts_without_hand_feeding() {
             .map(|param| param.annotated)
             .collect::<Vec<bool>>(),
         [true, false]
+    );
+    // Call-checker enabling rides along verbatim: annotation text plus
+    // optional/rest markers.
+    let param_texts: Vec<Option<&str>> = decls[0]
+        .params
+        .iter()
+        .map(|param| param.annotation.as_deref())
+        .collect();
+    assert_eq!(param_texts, [Some("number"), None]);
+    assert!(
+        !decls[0]
+            .params
+            .iter()
+            .any(|param| param.optional || param.is_rest),
+        "plain params carry no markers"
     );
     assert_eq!(decls[1].name, "point");
     for decl in &decls {
