@@ -59,6 +59,23 @@
 //! the driver hand-feeds those whole. Declaration spans and scopes always
 //! come from adapter facts; [`ConstDecl::span`] is only a fallback.
 //!
+//! Function declarations (P013): [`check_functions`] gates annotatedness
+//! (every identifier parameter plus the return annotation) and body shape
+//! (straight-line single `return` only), then delegates checkable returns
+//! through synthetic [`ConstDecl`]s to the same primitive/object paths, so
+//! `TS2322`/`TS2304`/object-family verdicts match by construction.
+//! Occurrence nodes for synthetic returns live in a disjoint range (see
+//! `function_occurrence_node`), so consts and functions for one file may
+//! share a [`QueryDb`]. Params, return annotations, and body shapes are
+//! fact-fed from the adapter's function declarator facts; only the
+//! literal-kind enum mapping is driver-side (mechanical and exhaustive).
+//!
+//! BLOCKER (P013 call facts): call-site arity checking (too few/many
+//! arguments) needs call facts the adapter does not emit — explicit
+//! non-goal. `void` returns are excluded from the corpus: tsc accepts
+//! `undefined` for `void` while the shared annotation map distinguishes
+//! them (pre-existing const-subset gap, unchanged here).
+//!
 //! Design law (H-002): literal freshness and every other per-occurrence
 //! verdict lives in query-side tables keyed by occurrence
 //! ([`NodeId`], see [`FreshnessTable`] plus the [`QueryDb`] memo entries),
@@ -173,17 +190,21 @@ impl InitKind {
     }
 }
 
-/// Whether the declarator is `const` or `let`.
+/// Whether the declarator is `const`, `let`, or a synthetic function return.
 ///
-/// Both check identically today: mutability and reassignment are unchecked
-/// (no flow analysis yet). The kind is recorded so a later phase can diverge
-/// `let` narrowing without re-plumbing every input.
+/// All three check identically today: mutability and reassignment are
+/// unchecked (no flow analysis yet), and function returns delegate through
+/// synthetic declarations (see [`check_functions`]). The kind is recorded so
+/// a later phase can diverge narrowing without re-plumbing every input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclKind {
     /// A `const` declarator.
     Const,
     /// A `let` declarator (same rules as [`DeclKind::Const`] for now).
     Let,
+    /// A synthetic function-return declaration (same rules as
+    /// [`DeclKind::Const`] for now; never constructed by const drivers).
+    Function,
 }
 
 /// One member of a hand-fed object-literal initializer.
@@ -294,7 +315,8 @@ pub struct ConstDecl {
     /// Exact binder identity when the driver resolved it (preferred over
     /// scope-sensitive lookup); must come from the same `file`/`Binder`.
     pub symbol: Option<SymbolId>,
-    /// `const` vs `let`; same checking rules (mutability unchecked).
+    /// `const` vs `let` vs synthetic function return; same checking rules
+    /// (mutability unchecked).
     pub kind: DeclKind,
     /// Raw annotation text (`Some("number")`, `Some("{ a: number }")`);
     /// `None` means unannotated.
@@ -305,6 +327,88 @@ pub struct ConstDecl {
     /// otherwise. A `Some` paired with a primitive `init` (or vice versa)
     /// is contradictory input and becomes an [`UnsupportedDecl`].
     pub init_object: Option<ObjectInit>,
+}
+
+/// One function parameter: name + whether it carries a type annotation.
+///
+/// Fact-fed from the adapter's identifier parameter list (names only). The
+/// solver gates on `annotated`, never on parameter types: call-site arity
+/// checking needs call facts the adapter does not emit (explicit non-goal).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionParam {
+    /// Parameter name as written.
+    pub name: String,
+    /// Whether the parameter carries a type annotation.
+    pub annotated: bool,
+}
+
+/// A straight-line `return <expr>;`: literal kind plus object members.
+///
+/// Shapes reuse [`InitKind`]/[`ObjectInit`] so the return delegates to the
+/// existing check paths unchanged: `kind` is the literal kind (`None` iff
+/// the return is an object literal), `init_object` the member facts (always
+/// fresh — only direct syntactic literals carry them). A
+/// `Some(NonLiteral)` kind declines before delegation; the impossible pairs
+/// (`Some` + `Some`, `None` + `None`) delegate into the shared
+/// contradictory/missing unsupported paths rather than growing
+/// function-specific ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionReturn {
+    /// Literal kind; `None` iff the return is an object literal.
+    pub kind: Option<InitKind>,
+    /// Object-literal members when the return is `{ ... }`; `None` otherwise.
+    pub init_object: Option<ObjectInit>,
+}
+
+/// Body shapes of one function declaration.
+///
+/// Only [`FunctionBody::SingleReturn`] is checkable; the rest decline to
+/// [`UnsupportedDecl`] with distinct reasons.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FunctionBody {
+    /// Exactly one statement, `return <expr>;` with an argument.
+    SingleReturn(FunctionReturn),
+    /// No body node: `declared` tells `declare function` apart from an
+    /// overload signature.
+    NoBody {
+        /// `true` for `declare function` (ambient, never has a body).
+        declared: bool,
+    },
+    /// A body with no statements.
+    Empty,
+    /// Anything else: multiple returns, branches, loops, bare or missing
+    /// `return`.
+    Complex,
+}
+
+/// One `function name(params): ret` declaration to check.
+///
+/// `name`/`span`/`scope`/`symbol` locate the declaration exactly like
+/// [`ConstDecl`]; `params`/`params_complex`/`return_annotation`/`body` are
+/// fact-fed from the adapter's function declarator facts (only the
+/// literal-kind enum mapping is driver-side, mechanical and exhaustive).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionDecl {
+    /// Declared name, resolved scope-sensitively through the [`Binder`].
+    pub name: String,
+    /// Fallback span, used only when neither `symbol` nor scope-sensitive
+    /// resolution finds the declaration in the [`Binder`].
+    pub span: Span,
+    /// Per-file scope index of the declarator (from the adapter's facts).
+    pub scope: u32,
+    /// Exact binder identity when the driver resolved it (preferred over
+    /// scope-sensitive lookup); must come from the same `file`/`Binder`.
+    pub symbol: Option<SymbolId>,
+    /// Identifier parameters in source order (names only; a prefix when
+    /// `params_complex`).
+    pub params: Vec<FunctionParam>,
+    /// `true` when the parameter list holds an unrepresentable pattern:
+    /// the declaration declines regardless of `params`.
+    pub params_complex: bool,
+    /// Raw return annotation text; `None` means unannotated.
+    pub return_annotation: Option<String>,
+    /// Body shape; only [`FunctionBody::SingleReturn`] is checkable.
+    pub body: FunctionBody,
 }
 
 /// Maps a primitive annotation name to its builtin [`TypeId`].
@@ -375,15 +479,168 @@ pub fn check_file(
     }
     let mut report = FileReport::default();
     for (index, decl) in decls.iter().enumerate() {
-        check_one(file, index, decl, binder, db, &freshness, &mut report);
+        check_one(
+            file,
+            occurrence_node(index),
+            decl,
+            binder,
+            db,
+            &freshness,
+            &mut report,
+        );
     }
+    sort_report(&mut report);
+    report
+}
+
+/// Sorts a [`FileReport`] by `(file, span.lo, span.hi)` on both sinks so
+/// repeated runs agree byte-for-byte.
+fn sort_report(report: &mut FileReport) {
     report.diagnostics.sort_by(|left, right| {
         (left.file, left.span.lo, left.span.hi).cmp(&(right.file, right.span.lo, right.span.hi))
     });
     report.unsupported.sort_by(|left, right| {
         (left.file, left.span.lo, left.span.hi).cmp(&(right.file, right.span.lo, right.span.hi))
     });
+}
+
+/// Checks every function declaration in `decls` for `file`, returning the
+/// sorted [`FileReport`].
+///
+/// Gates (at most one note per declaration, structural first):
+/// unrepresentable parameter patterns, unannotated parameters, missing
+/// return annotation, then non-straight-line bodies all decline to
+/// [`UnsupportedDecl`]. Checkable declarations (identifier params all
+/// annotated, return annotated, single literal `return`) delegate to the
+/// same [`check_one`] path as [`check_file`] through a synthetic
+/// [`ConstDecl`] — the return literal as initializer, always fresh — so
+/// verdicts and messages match the const/object subset by construction.
+///
+/// Occurrence identity lives in a disjoint node range (see
+/// `function_occurrence_node`): consts and functions for one file may share
+/// a [`QueryDb`] without aliasing memo entries.
+#[must_use]
+pub fn check_functions(
+    file: FileId,
+    decls: &[FunctionDecl],
+    binder: &Binder,
+    db: &mut QueryDb,
+) -> FileReport {
+    let mut synth: Vec<ConstDecl> = Vec::with_capacity(decls.len());
+    let mut report = FileReport::default();
+    for decl in decls {
+        let span = binder_span_for(binder, file, &decl.name, decl.scope, decl.symbol, decl.span);
+        match function_shape(decl) {
+            Ok((annotation, kind, init_object)) => synth.push(ConstDecl {
+                name: decl.name.clone(),
+                span: decl.span,
+                scope: decl.scope,
+                symbol: decl.symbol,
+                kind: DeclKind::Function,
+                annotation: Some(annotation.to_owned()),
+                init: kind,
+                init_object,
+            }),
+            Err(reason) => report
+                .unsupported
+                .push(UnsupportedDecl { file, span, reason }),
+        }
+    }
+    let mut freshness = FreshnessTable::default();
+    for (index, decl) in synth.iter().enumerate() {
+        if let Some(init) = decl.init_object.as_ref() {
+            freshness
+                .fresh
+                .insert((file, function_occurrence_node(index)), init.fresh);
+        }
+    }
+    for (index, decl) in synth.iter().enumerate() {
+        check_one(
+            file,
+            function_occurrence_node(index),
+            decl,
+            binder,
+            db,
+            &freshness,
+            &mut report,
+        );
+    }
+    sort_report(&mut report);
     report
+}
+
+/// Gates one function declaration: `Ok` carries the return annotation text,
+/// return literal kind, and object members for the synthetic [`ConstDecl`];
+/// `Err` carries the unsupported reason.
+fn function_shape(
+    decl: &FunctionDecl,
+) -> Result<(&str, Option<InitKind>, Option<ObjectInit>), String> {
+    if decl.params_complex {
+        return Err("non-identifier parameter pattern is outside the subset".to_owned());
+    }
+    if let Some(param) = decl.params.iter().find(|param| !param.annotated) {
+        return Err(format!(
+            "unannotated parameter '{}' is outside the subset",
+            param.name
+        ));
+    }
+    let Some(annotation) = decl.return_annotation.as_deref() else {
+        return Err(format!(
+            "no return annotation on '{}': inference is outside the subset",
+            decl.name
+        ));
+    };
+    let body = match &decl.body {
+        FunctionBody::SingleReturn(body) => body,
+        FunctionBody::NoBody { declared: true } => {
+            return Err(format!(
+                "declare function '{}' has no body to check",
+                decl.name
+            ));
+        }
+        FunctionBody::NoBody { declared: false } => {
+            return Err(format!(
+                "overload signature for '{}' has no body to check",
+                decl.name
+            ));
+        }
+        FunctionBody::Empty => {
+            return Err(format!(
+                "empty body on '{}': nothing to check against",
+                decl.name
+            ));
+        }
+        FunctionBody::Complex => {
+            return Err(format!(
+                "complex body on '{}': control flow is outside the subset",
+                decl.name
+            ));
+        }
+    };
+    if body.kind == Some(InitKind::NonLiteral) {
+        return Err(format!(
+            "non-literal return in '{}' is outside the subset",
+            decl.name
+        ));
+    }
+    Ok((annotation, body.kind, body.init_object.clone()))
+}
+
+/// Occurrence [`NodeId`] for the `index`-th synthetic function-return
+/// declaration (P013).
+///
+/// [`check_functions`] delegates to the same [`check_one`] path as
+/// [`check_file`], so its memo keys must not alias const-declarator nodes
+/// when both check one file against one [`QueryDb`]. Function indices land
+/// in a disjoint high range (saturating: skewed inputs pin the top, never
+/// wrap into const space).
+fn function_occurrence_node(index: usize) -> NodeId {
+    const BASE: u32 = 0x4000_0000;
+    NodeId(
+        u32::try_from(index)
+            .unwrap_or(u32::MAX)
+            .saturating_add(BASE),
+    )
 }
 
 /// Saturating declaration index into the occurrence [`NodeId`] key.
@@ -395,16 +652,32 @@ fn occurrence_node(index: usize) -> NodeId {
     NodeId(u32::try_from(index).unwrap_or(u32::MAX))
 }
 
-/// Declaration span for `decl` in `file`: the exact [`SymbolId`] first,
-/// then scope-sensitive [`Binder::resolve`] from the declarator scope, then
-/// the caller fallback.
+/// Declaration span for a const-style declaration in `file`: the exact
+/// [`SymbolId`] first, then scope-sensitive [`Binder::resolve`] from the
+/// declarator scope, then the caller fallback.
 ///
-/// The middle step is the P012 fix: resolving from `decl.scope` keeps a
-/// shadowing inner declaration from verdicting against the outer span (the
-/// old name-only lookup always found the first declaration in the file).
-/// A `symbol` is trusted only when the store's symbol was declared in the
-/// queried file: bare ids are store-relative numbers, so the file check is
-/// cheap defense against cross-file laundering. Same-binder ids are
+/// See [`binder_span_for`] for the resolution contract.
+fn binder_span(binder: &Binder, file: FileId, decl: &ConstDecl) -> Span {
+    binder_span_for(
+        binder,
+        file,
+        decl.name.as_str(),
+        decl.scope,
+        decl.symbol,
+        decl.span,
+    )
+}
+
+/// Declaration span for `(name, scope, symbol)` in `file`: the exact
+/// [`SymbolId`] first, then scope-sensitive [`Binder::resolve`] from the
+/// declarator scope, then the caller fallback.
+///
+/// The middle step is the P012 fix: resolving from the declarator scope
+/// keeps a shadowing inner declaration from verdicting against the outer
+/// span (the old name-only lookup always found the first declaration in the
+/// file). A `symbol` is trusted only when the store's symbol was declared in
+/// the queried file: bare ids are store-relative numbers, so the file check
+/// is cheap defense against cross-file laundering. Same-binder ids are
 /// authoritative by contract (the driver resolves them from this binder),
 /// even ahead of a stale name/scope — see
 /// `exact_symbol_identity_beats_scope_lookup`.
@@ -414,8 +687,15 @@ fn occurrence_node(index: usize) -> NodeId {
 /// a same-file local symbol is indistinguishable from the real thing; the
 /// e2e drivers always resolve from the checking binder, so this cannot
 /// happen on any real path.
-fn binder_span(binder: &Binder, file: FileId, decl: &ConstDecl) -> Span {
-    if let Some(id) = decl.symbol {
+fn binder_span_for(
+    binder: &Binder,
+    file: FileId,
+    name: &str,
+    scope: u32,
+    symbol: Option<SymbolId>,
+    fallback: Span,
+) -> Span {
+    if let Some(id) = symbol {
         if let Some(found) = binder.store().get(id) {
             if found.file == file {
                 return found.span;
@@ -423,9 +703,9 @@ fn binder_span(binder: &Binder, file: FileId, decl: &ConstDecl) -> Span {
         }
     }
     binder
-        .resolve(file, decl.scope, &decl.name)
+        .resolve(file, scope, name)
         .and_then(|id| binder.store().get(id))
-        .map_or(decl.span, |found| found.span)
+        .map_or(fallback, |found| found.span)
 }
 
 /// Parses an object annotation (`{ a: number; b: string }`) into member
@@ -493,13 +773,17 @@ fn object_type_text(names: &[&str], types: &[&str]) -> String {
 
 /// Checks one declarator, pushing into `report`.
 ///
+/// `node` is the occurrence identity for memo keys and freshness lookups:
+/// [`check_file`] passes [`occurrence_node`] positions, [`check_functions`]
+/// passes disjoint function nodes — never mix the two for one file.
+///
 /// Priority inside the object path mirrors tsc (probed 7.0.2): wrong-member
 /// `TS2322`s (literal order, one per member) beat the first-excess `TS2353`,
 /// which beats missing members (one `TS2741`, or one `TS2739` for several).
 /// Only one family ever fires per declaration.
 fn check_one(
     file: FileId,
-    index: usize,
+    node: NodeId,
     decl: &ConstDecl,
     binder: &Binder,
     db: &mut QueryDb,
@@ -526,7 +810,6 @@ fn check_one(
         return;
     }
     if annotation.starts_with('{') {
-        let node = occurrence_node(index);
         let mut ctx = CheckCtx {
             file,
             node,
@@ -557,7 +840,6 @@ fn check_one(
     // Thread through the memo database: the annotation type is the answer
     // to this declaration's TypeOf query; the dep edge lets a later edit
     // invalidate exactly this entry.
-    let node = occurrence_node(index);
     let key = QueryKey {
         file,
         node,
@@ -1767,5 +2049,328 @@ mod tests {
             "reason: {}",
             report.unsupported[0].reason
         );
+    }
+
+    fn function(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        params: Vec<(&str, bool)>,
+        annotation: Option<&str>,
+        body: FunctionBody,
+    ) -> FunctionDecl {
+        FunctionDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            params: params
+                .into_iter()
+                .map(|(name, annotated)| FunctionParam {
+                    name: name.to_owned(),
+                    annotated,
+                })
+                .collect(),
+            params_complex: false,
+            return_annotation: annotation.map(str::to_owned),
+            body,
+        }
+    }
+
+    fn single(kind: InitKind) -> FunctionBody {
+        FunctionBody::SingleReturn(FunctionReturn {
+            kind: Some(kind),
+            init_object: None,
+        })
+    }
+
+    fn object_return(members: Vec<(&str, ObjectMemberKind)>) -> FunctionBody {
+        FunctionBody::SingleReturn(FunctionReturn {
+            kind: None,
+            init_object: Some(ObjectInit {
+                members: members
+                    .into_iter()
+                    .map(|(name, kind)| ObjectMemberInit {
+                        name: name.to_owned(),
+                        kind,
+                    })
+                    .collect(),
+                fresh: true,
+            }),
+        })
+    }
+
+    #[test]
+    fn function_correct_is_silent_and_memoized() {
+        let binder = binder_with(&[("add", span(0, 10)), ("point", span(11, 21))]);
+        let decls = [
+            function(
+                "add",
+                0,
+                10,
+                vec![("a", true), ("b", true)],
+                Some("number"),
+                single(InitKind::Number),
+            ),
+            function(
+                "point",
+                11,
+                21,
+                Vec::new(),
+                Some("{ x: number; label: string }"),
+                object_return(vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("label", ObjectMemberKind::String),
+                ]),
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(db.recompute_count(), 2);
+        let repeat = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(repeat.diagnostics.is_empty());
+        assert!(repeat.unsupported.is_empty());
+        assert_eq!(db.recompute_count(), 2);
+    }
+
+    #[test]
+    fn function_return_mismatch_is_pith2322() {
+        let binder = binder_with(&[("pick", span(0, 10))]);
+        let decls = [function(
+            "pick",
+            0,
+            10,
+            vec![("flag", true)],
+            Some("number"),
+            single(InitKind::String),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(report.diagnostics[0].span, span(0, 10));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
+    fn function_gates_are_unsupported_never_silent() {
+        let binder = binder_with(&[
+            ("pattern", span(0, 8)),
+            ("param", span(9, 17)),
+            ("ret", span(18, 26)),
+            ("over", span(27, 35)),
+        ]);
+        let mut complex_params = function(
+            "pattern",
+            0,
+            8,
+            Vec::new(),
+            Some("number"),
+            single(InitKind::Number),
+        );
+        complex_params.params_complex = true;
+        let unannotated_param = function(
+            "param",
+            9,
+            17,
+            vec![("value", false)],
+            Some("number"),
+            single(InitKind::Number),
+        );
+        let missing_return = function(
+            "ret",
+            18,
+            26,
+            vec![("n", true)],
+            None,
+            single(InitKind::Number),
+        );
+        let overload = function(
+            "over",
+            27,
+            35,
+            vec![("a", true)],
+            Some("number"),
+            FunctionBody::NoBody { declared: false },
+        );
+        let decls = [complex_params, unannotated_param, missing_return, overload];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 4);
+        let los: Vec<u32> = report.unsupported.iter().map(|u| u.span.lo).collect();
+        assert_eq!(los, [0, 9, 18, 27]);
+        let reasons: Vec<&str> = report
+            .unsupported
+            .iter()
+            .map(|u| u.reason.as_str())
+            .collect();
+        assert!(
+            reasons[0].contains("parameter pattern"),
+            "reason: {}",
+            reasons[0]
+        );
+        assert!(reasons[1].contains("'value'"), "reason: {}", reasons[1]);
+        assert!(
+            reasons[2].contains("no return annotation"),
+            "reason: {}",
+            reasons[2]
+        );
+        assert!(reasons[3].contains("overload"), "reason: {}", reasons[3]);
+    }
+
+    #[test]
+    fn function_body_gates_are_unsupported_never_silent() {
+        let binder = binder_with(&[
+            ("ambient", span(36, 44)),
+            ("empty", span(45, 53)),
+            ("branch", span(54, 62)),
+            ("alias", span(63, 71)),
+        ]);
+        let ambient = function(
+            "ambient",
+            36,
+            44,
+            vec![("a", true)],
+            Some("number"),
+            FunctionBody::NoBody { declared: true },
+        );
+        let empty = function(
+            "empty",
+            45,
+            53,
+            Vec::new(),
+            Some("void"),
+            FunctionBody::Empty,
+        );
+        let branch = function(
+            "branch",
+            54,
+            62,
+            vec![("flag", true)],
+            Some("number"),
+            FunctionBody::Complex,
+        );
+        let alias = function(
+            "alias",
+            63,
+            71,
+            vec![("n", true)],
+            Some("number"),
+            single(InitKind::NonLiteral),
+        );
+        let decls = [ambient, empty, branch, alias];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 4);
+        let los: Vec<u32> = report.unsupported.iter().map(|u| u.span.lo).collect();
+        assert_eq!(los, [36, 45, 54, 63]);
+        let reasons: Vec<&str> = report
+            .unsupported
+            .iter()
+            .map(|u| u.reason.as_str())
+            .collect();
+        assert!(
+            reasons[0].contains("declare function"),
+            "reason: {}",
+            reasons[0]
+        );
+        assert!(reasons[1].contains("empty"), "reason: {}", reasons[1]);
+        assert!(reasons[2].contains("complex"), "reason: {}", reasons[2]);
+        assert!(reasons[3].contains("non-literal"), "reason: {}", reasons[3]);
+    }
+
+    #[test]
+    fn function_unknown_return_annotation_is_pith2304() {
+        // Delegation proof: unknown return names diagnose like annotations.
+        let binder = binder_with(&[("f", span(0, 10))]);
+        let decls = [function(
+            "f",
+            0,
+            10,
+            Vec::new(),
+            Some("Nope"),
+            single(InitKind::Number),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_UNKNOWN_ANNOTATION);
+        assert_eq!(report.diagnostics[0].message, "Cannot find name 'Nope'.");
+    }
+
+    #[test]
+    fn function_object_return_wrong_member_is_pith2322() {
+        // Delegation proof: object returns run the shared object machinery.
+        let binder = binder_with(&[("point", span(0, 10))]);
+        let decls = [function(
+            "point",
+            0,
+            10,
+            Vec::new(),
+            Some("{ x: number; label: string }"),
+            object_return(vec![
+                ("x", ObjectMemberKind::String),
+                ("label", ObjectMemberKind::String),
+            ]),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
+    fn function_node_space_is_disjoint_from_consts() {
+        // Consts and functions for one file share a db in the real pipeline:
+        // same-position occurrence nodes must not alias memo entries (a
+        // same-index const `number` and function `string` would trip the
+        // memo debug_assert if they shared a node).
+        let binder = binder_with(&[("a", span(0, 10)), ("f", span(11, 21))]);
+        let consts = [decl("a", 0, 10, "number", InitKind::Number)];
+        let funcs = [function(
+            "f",
+            11,
+            21,
+            Vec::new(),
+            Some("string"),
+            single(InitKind::String),
+        )];
+        let mut db = QueryDb::new();
+        let const_report = check_file(FILE, &consts, &binder, &mut db);
+        assert!(const_report.diagnostics.is_empty());
+        let func_report = check_functions(FILE, &funcs, &binder, &mut db);
+        assert!(func_report.diagnostics.is_empty());
+        assert!(func_report.unsupported.is_empty());
+        assert_eq!(db.recompute_count(), 2);
     }
 }
