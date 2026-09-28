@@ -111,6 +111,32 @@
 //! with reasons. No other generic syntax facts: call-site type arguments,
 //! type references, and variance positions are out of scope.
 //!
+//! Interface facts (P017): [`ParsedFile::interfaces`] carries one
+//! [`InterfaceFact`] per `interface` declaration (including `export` and
+//! `declare` forms), in visitor (pre-order) order. Each fact links its own
+//! [`SymbolFact`] exactly like [`DeclFact`] (per-file index plus owning
+//! scope) and records member facts ([`InterfaceMemberFact`]: name plus
+//! colon-stripped annotation text) in source order. Only plain non-optional
+//! properties with identifier keys feed the solver: methods, index/call/
+//! construct signatures, optional members, computed or non-identifier keys,
+//! and missing annotations each carry a `complex_reason` instead of
+//! mis-keying, and the solver declines those interfaces with per-member
+//! reasons. Heritage clauses record parent names
+//! ([`InterfaceHeritageFact`]) and generic parameter lists set
+//! `has_type_params`; both decline solver-side. `readonly` needs no flag:
+//! it never affects literal assignability (probed tsc 7.0.2: clean when
+//! members match, plain `TS2322` when wrong).
+//!
+//! Merge note (P005 law): oxc pre-merges same-scope redeclarations, so
+//! `interface Foo {}` plus `const Foo = …` surfaces as ONE [`SymbolFact`]
+//! (flags OR-ed, span at the first declaration — read off the oxc 0.152.0
+//! `declare_symbol`/`check_redeclaration` sources: `InterfaceExcludes`
+//! never intersects value flags, and only `var` redeclarations error).
+//! The interface fact links that merged symbol; the const declarator finds
+//! no exact `(name, start)` key and emits no [`DeclFact`] — drivers resolve
+//! merged spans through the binder instead (see the solver's interface
+//! driver, which pins first-declaration anchoring in tests).
+//!
 //! Probe basis (tsc 7.0.2 `--strict --pretty false`, recorded in the solver
 //! docs): simple `===`/`!==` typeof guards refine (then/else/after per
 //! negation), `==` narrows identically but is declined (subset pins
@@ -124,8 +150,8 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Expression, Function,
     FunctionBody, FunctionType, IfStatement, ObjectPropertyKind, Program, PropertyKey,
-    PropertyKind, Statement, TSTypeAnnotation, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    PropertyKind, Statement, TSInterfaceDeclaration, TSPropertySignature, TSSignature,
+    TSTypeAnnotation, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -492,6 +518,72 @@ pub struct DeclineRegionFact {
     pub reason: String,
 }
 
+/// One member of an `interface` declaration: its name plus its annotation.
+///
+/// Checkable members (plain non-optional properties with identifier keys)
+/// carry the colon-stripped annotation text verbatim (`Some("number")`);
+/// the solver classifies it into primitives (checked), unknown names
+/// (`TS2304`, mirroring the object path), or union/complex shapes
+/// (declined). Anything structural the subset cannot spell — methods,
+/// index/call/construct signatures, optional members, computed or
+/// non-identifier keys, missing annotations — carries a `complex_reason`
+/// instead, so the solver declines with a per-member reason, never a
+/// forced verdict. `readonly` is not structural: those members stay
+/// checkable (assignability ignores it — probed tsc 7.0.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceMemberFact {
+    /// Member name as written (identifier keys verbatim; sliced key text
+    /// for computed keys; the parameter name for index signatures; fixed
+    /// descriptors (`"call signature"`) for keyless shapes).
+    pub name: String,
+    /// Colon-stripped annotation text; `None` when absent or keyless.
+    pub annotation_text: Option<String>,
+    /// Span of the whole member signature.
+    pub span: Span,
+    /// Why this member is outside the subset; `None` when checkable.
+    pub complex_reason: Option<String>,
+}
+
+/// One heritage parent of an `interface` declaration: name plus span.
+///
+/// Names feed decline reasons only — heritage is outside the subset, so no
+/// verdict ever reads them. An unsliceable parent name (only possible with
+/// recovery from parse errors) records `""` rather than dropping the
+/// clause: the non-empty fact still declines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceHeritageFact {
+    /// Parent name as written (`"Base"`, `"A.B"` for qualified names).
+    pub name: String,
+    /// Span of the heritage clause.
+    pub span: Span,
+}
+
+/// One `interface` declaration's declaration facts, keyed to its symbol.
+///
+/// `symbol`/`scope` link exactly like [`DeclFact`]: the per-file index of
+/// the [`SymbolFact`] for the interface name (matched on name + binding
+/// start) plus that symbol's owning scope. Merged pairs (`interface Foo`
+/// plus `const Foo`) share one symbol — the interface fact links it; the
+/// const emits no [`DeclFact`] (see the module-level merge note).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceFact {
+    /// Per-file symbol index of the interface name binding.
+    pub symbol: u32,
+    /// Owning scope (per-file scope index) of [`InterfaceFact::symbol`].
+    pub scope: u32,
+    /// Interface name as written.
+    pub name: String,
+    /// Span of the whole declaration.
+    pub span: Span,
+    /// Member facts in source order.
+    pub members: Vec<InterfaceMemberFact>,
+    /// Heritage parents; non-empty declines solver-side.
+    pub heritage: Vec<InterfaceHeritageFact>,
+    /// `true` when the interface declares type parameters: the solver
+    /// declines instead of instantiating them.
+    pub has_type_params: bool,
+}
+
 /// Everything Pith owns after a frontend pass. Arenas are dropped on return.
 #[derive(Clone, Debug)]
 pub struct ParsedFile {
@@ -515,6 +607,9 @@ pub struct ParsedFile {
     /// One decline region per out-of-subset guard/function shape, in visitor
     /// (pre-order) order. Empty when every guard is simple.
     pub decline_regions: Vec<DeclineRegionFact>,
+    /// One fact per `interface` declaration, in visitor (pre-order) order.
+    /// Empty when the file declares no interfaces.
+    pub interfaces: Vec<InterfaceFact>,
     /// Parser + semantic diagnostics as plain strings (codes deferred to P008).
     pub errors: Vec<String>,
 }
@@ -551,6 +646,7 @@ struct DeclCollector<'a> {
     calls: Vec<CallFact>,
     guards: Vec<TypeofGuardFact>,
     declines: Vec<DeclineRegionFact>,
+    interfaces: Vec<InterfaceFact>,
     /// `if` statements enclosing the current visit point: anything above zero
     /// means a nested guard (decline, never refine).
     if_depth: u32,
@@ -620,6 +716,124 @@ fn type_param_facts(source: &str, func: &Function<'_>) -> (Vec<TypeParamFact>, b
         }
     }
     (params, complex)
+}
+
+/// Names one interface member key: identifier keys verbatim plus a
+/// plain-key flag; anything else (computed, private, literal keys) slices
+/// the key text (`"<unknown>"` only on skew) and clears the flag so the
+/// caller declines instead of mis-keying.
+fn interface_key_name(source: &str, key: &PropertyKey<'_>) -> (String, bool) {
+    if let PropertyKey::StaticIdentifier(found) = key {
+        if let Some(name) = slice_at(source, found.span) {
+            return (name.to_owned(), true);
+        }
+    }
+    let fallback = slice_at(source, key.span()).unwrap_or("<unknown>");
+    (fallback.to_owned(), false)
+}
+
+/// One declined interface member: real span, recorded name, reason.
+///
+/// Every complex shape funnels here so none is ever silently dropped; the
+/// solver quotes `complex_reason` in its per-member decline.
+fn declined_member(
+    file: FileId,
+    span: oxc_span::Span,
+    name: String,
+    reason: String,
+) -> InterfaceMemberFact {
+    InterfaceMemberFact {
+        name,
+        annotation_text: None,
+        span: Span {
+            file,
+            lo: span.start,
+            hi: span.end,
+        },
+        complex_reason: Some(reason),
+    }
+}
+
+/// Classifies one interface property signature.
+///
+/// Plain non-optional properties with identifier keys and a sliced
+/// annotation stay checkable (`complex_reason: None`); computed or
+/// non-identifier keys, optional members, and missing annotations decline
+/// with per-member reasons. The annotation text is verbatim — the solver
+/// classifies primitives vs unknown names vs union/complex shapes, exactly
+/// like object-annotation members.
+fn property_member_fact(
+    source: &str,
+    file: FileId,
+    prop: &TSPropertySignature<'_>,
+) -> InterfaceMemberFact {
+    let span = Span {
+        file,
+        lo: prop.span.start,
+        hi: prop.span.end,
+    };
+    let (name, plain) = interface_key_name(source, &prop.key);
+    let annotation = prop
+        .type_annotation
+        .as_ref()
+        .and_then(|ann| annotation_fact(source, file, ann.span));
+    let reason = if !plain {
+        Some(format!(
+            "computed or non-identifier key '{name}' is outside the subset"
+        ))
+    } else if prop.optional {
+        Some(format!("optional member '{name}' is outside the subset"))
+    } else if annotation.is_none() {
+        Some(format!(
+            "member '{name}' has no type annotation: outside the subset"
+        ))
+    } else {
+        None
+    };
+    InterfaceMemberFact {
+        name,
+        annotation_text: annotation.map(|fact| fact.text),
+        span,
+        complex_reason: reason,
+    }
+}
+
+/// Classifies one interface member signature into its fact.
+///
+/// Only [`property_member_fact`] can stay checkable; methods, index
+/// signatures, and call/construct signatures always decline. Index members
+/// keep their parameter name for the reason; keyless shapes use fixed
+/// descriptors as names (documented, never skipped).
+fn interface_member_fact(
+    source: &str,
+    file: FileId,
+    member: &TSSignature<'_>,
+) -> InterfaceMemberFact {
+    match member {
+        TSSignature::TSPropertySignature(prop) => property_member_fact(source, file, prop),
+        TSSignature::TSMethodSignature(method) => {
+            let (name, _) = interface_key_name(source, &method.key);
+            let reason = format!("method signature '{name}' is outside the subset");
+            declined_member(file, method.span, name, reason)
+        }
+        TSSignature::TSIndexSignature(index) => {
+            let name = index.parameter.name.to_string();
+            let reason = format!("index signature '{name}' is outside the subset");
+            declined_member(file, index.span, name, reason)
+        }
+        TSSignature::TSCallSignatureDeclaration(decl) => declined_member(
+            file,
+            decl.span,
+            "call signature".to_owned(),
+            "call signature is outside the subset".to_owned(),
+        ),
+        TSSignature::TSConstructSignatureDeclaration(decl) => declined_member(
+            file,
+            decl.span,
+            "construct signature".to_owned(),
+            "construct signature is outside the subset".to_owned(),
+        ),
+    }
 }
 
 /// Nearest same-name symbol at or before `start`: the overload-merge owner.
@@ -1011,6 +1225,66 @@ impl DeclCollector<'_> {
         });
     }
 
+    /// Records one interface declaration with its member facts.
+    ///
+    /// Symbol linkage reuses the `(name, binding start)` keying of
+    /// [`DeclFact`]: merged pairs (`interface Foo` plus `const Foo`) share
+    /// oxc's pre-merged symbol, so the interface fact links it while the
+    /// const finds no exact key (see the module-level merge note).
+    /// Anonymous default-exported interfaces have no sliceable name and are
+    /// skipped. Heritage names slice off the parent type spans; an
+    /// unsliceable name (only possible with recovery from parse errors)
+    /// records `""` rather than dropping the clause.
+    fn record_interface(&mut self, decl: &TSInterfaceDeclaration<'_>) {
+        let Some(name) = slice_at(self.source, decl.id.span) else {
+            return;
+        };
+        let Some(&symbol) = self.symbols.get(&(name.to_owned(), decl.id.span.start)) else {
+            // No matching symbol (only possible with recovery from parse
+            // errors): skip rather than invent a key.
+            return;
+        };
+        let source = self.source;
+        let file = self.file;
+        let heritage = decl
+            .extends
+            .iter()
+            .map(|parent| {
+                let span = parent.span;
+                InterfaceHeritageFact {
+                    name: slice_at(source, parent.type_name.span())
+                        .unwrap_or("")
+                        .to_owned(),
+                    span: Span {
+                        file,
+                        lo: span.start,
+                        hi: span.end,
+                    },
+                }
+            })
+            .collect();
+        let members = decl
+            .body
+            .body
+            .iter()
+            .map(|member| interface_member_fact(source, file, member))
+            .collect();
+        let span = decl.span;
+        self.interfaces.push(InterfaceFact {
+            symbol,
+            scope: self.scopes.get(&symbol).copied().unwrap_or(u32::MAX),
+            name: name.to_owned(),
+            span: Span {
+                file,
+                lo: span.start,
+                hi: span.end,
+            },
+            members,
+            heritage,
+            has_type_params: decl.type_parameters.is_some(),
+        });
+    }
+
     /// Records one call expression when it is a direct `f(...)` call.
     ///
     /// Anything else emits no fact, never a wrong one: member/computed calls
@@ -1172,6 +1446,14 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
         self.fn_depth = self.fn_depth.saturating_sub(1);
     }
 
+    fn visit_ts_interface_declaration(&mut self, it: &TSInterfaceDeclaration<'a>) {
+        self.record_interface(it);
+        // Keep walking: member types nest no declarators, but the walk keeps
+        // the visitor total over future AST shapes (mirrors the other
+        // record-then-walk methods).
+        walk::walk_ts_interface_declaration(self, it);
+    }
+
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
         self.record_if(it);
         // Keep walking: branches nest consts and further guards (which
@@ -1297,6 +1579,7 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         calls: collected.calls,
         guards: collected.guards,
         decline_regions: collected.declines,
+        interfaces: collected.interfaces,
         errors,
     }
 }
@@ -1309,6 +1592,7 @@ struct CollectedFacts {
     calls: Vec<CallFact>,
     guards: Vec<TypeofGuardFact>,
     declines: Vec<DeclineRegionFact>,
+    interfaces: Vec<InterfaceFact>,
 }
 
 /// Runs the targeted declarator walk and returns owned facts.
@@ -1342,6 +1626,7 @@ fn collect_decls<'a>(
         calls: Vec::new(),
         guards: Vec::new(),
         declines: Vec::new(),
+        interfaces: Vec::new(),
         if_depth: 0,
         fn_depth: 0,
     };
@@ -1352,6 +1637,7 @@ fn collect_decls<'a>(
         calls,
         guards,
         declines,
+        interfaces,
         ..
     } = collector;
     CollectedFacts {
@@ -1360,6 +1646,7 @@ fn collect_decls<'a>(
         calls,
         guards,
         declines,
+        interfaces,
     }
 }
 
@@ -2401,5 +2688,147 @@ export function f(a: string): string { return a + b; }
             "function g(): void {\n    const c: number = x;\n  }"
         );
         assert!(region.reason.contains("closure"));
+    }
+
+    #[test]
+    fn interface_facts_primitive_members_exact_spans() {
+        // Offsets hand-counted: `interface` at 0..9, `Point` at 10..15, `{`
+        // at 16, `x` at 18, `label` at 29..34, `}` at 44.
+        let src = "interface Point { x: number; label: string; }\n";
+        let pf = parse_module(FileId(0), "i.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.interfaces.len(), 1);
+        let fact = &pf.interfaces[0];
+        assert_eq!(fact.name, "Point");
+        assert_eq!((fact.span.lo, fact.span.hi), (0, 45));
+        assert_eq!(
+            slice_of(src, fact.span),
+            "interface Point { x: number; label: string; }"
+        );
+        let symbol = &pf.symbols[usize::try_from(fact.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "Point");
+        assert_eq!((symbol.span.lo, symbol.span.hi), (10, 15));
+        assert_eq!(fact.scope, symbol.scope);
+        assert_eq!(fact.members.len(), 2);
+        let first = &fact.members[0];
+        assert_eq!(first.name, "x");
+        assert_eq!(first.annotation_text.as_deref(), Some("number"));
+        assert!(first.complex_reason.is_none());
+        assert_eq!(first.span.lo, 18);
+        assert!(first.span.lo < first.span.hi);
+        assert_eq!(first.span.file, FileId(0));
+        assert!(slice_of(src, first.span).starts_with("x: number"));
+        let second = &fact.members[1];
+        assert_eq!(second.name, "label");
+        assert_eq!(second.annotation_text.as_deref(), Some("string"));
+        assert!(second.complex_reason.is_none());
+        assert_eq!(second.span.lo, 29);
+        assert!(slice_of(src, second.span).starts_with("label: string"));
+        assert!(fact.heritage.is_empty());
+        assert!(!fact.has_type_params);
+    }
+
+    #[test]
+    fn interface_facts_complex_members_carry_reasons() {
+        let src = "interface M { run(n: number): string; }\n\
+                   interface O { a: number; b?: string; }\n\
+                   interface I { [key: string]: number; }\n\
+                   interface C { (): void; }\n\
+                   interface D extends Base { a: number; }\n\
+                   interface G<T> { a: T; }\n\
+                   interface R { readonly x: number; }\n\
+                   export interface E { a: number; }\n\
+                   declare interface A { a: number; }\n";
+        let pf = parse_module(FileId(0), "c.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.interfaces.len(), 9);
+        let names: Vec<&str> = pf
+            .interfaces
+            .iter()
+            .map(|fact| fact.name.as_str())
+            .collect();
+        assert_eq!(names, ["M", "O", "I", "C", "D", "G", "R", "E", "A"]);
+        // Method signatures decline with their name in the reason.
+        assert_eq!(pf.interfaces[0].members.len(), 1);
+        assert_eq!(pf.interfaces[0].members[0].name, "run");
+        assert!(pf.interfaces[0].members[0]
+            .complex_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("method") && reason.contains("run")));
+        // Plain members stay checkable; optional members decline.
+        assert!(pf.interfaces[1].members[0].complex_reason.is_none());
+        assert_eq!(
+            pf.interfaces[1].members[0].annotation_text.as_deref(),
+            Some("number")
+        );
+        assert_eq!(pf.interfaces[1].members[1].name, "b");
+        assert!(pf.interfaces[1].members[1]
+            .complex_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("optional")));
+        // Index signatures keep their parameter name for the reason.
+        assert_eq!(pf.interfaces[2].members[0].name, "key");
+        assert!(pf.interfaces[2].members[0]
+            .complex_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("index")));
+        // Keyless shapes use fixed descriptors, never skipped.
+        assert_eq!(pf.interfaces[3].members[0].name, "call signature");
+        assert!(pf.interfaces[3].members[0]
+            .complex_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("call")));
+        // Heritage records the parent name; members stay checkable.
+        assert_eq!(pf.interfaces[4].heritage.len(), 1);
+        assert_eq!(pf.interfaces[4].heritage[0].name, "Base");
+        assert!(pf.interfaces[4].members[0].complex_reason.is_none());
+        // Generic parameter lists set the flag; the member itself still records.
+        assert!(pf.interfaces[5].has_type_params);
+        assert_eq!(
+            pf.interfaces[5].members[0].annotation_text.as_deref(),
+            Some("T")
+        );
+        assert!(pf.interfaces[5].members[0].complex_reason.is_none());
+        // `readonly` is not structural: the member stays checkable.
+        assert!(pf.interfaces[6].members[0].complex_reason.is_none());
+        assert_eq!(
+            pf.interfaces[6].members[0].annotation_text.as_deref(),
+            Some("number")
+        );
+        // Exported and ambient forms emit facts like plain declarations.
+        for fact in pf.interfaces.iter().skip(7) {
+            assert_eq!(fact.members.len(), 1);
+            assert!(fact.members[0].complex_reason.is_none());
+            assert!(fact.heritage.is_empty());
+            assert!(!fact.has_type_params);
+        }
+        for fact in &pf.interfaces {
+            assert_eq!(fact.span.file, FileId(0));
+            assert!(fact.span.lo < fact.span.hi);
+        }
+    }
+
+    #[test]
+    fn interface_facts_merged_value_links_one_symbol() {
+        // `interface Foo` plus `const Foo` pre-merge in oxc (see the
+        // module-level merge note): one symbol at the first declaration, no
+        // decl fact for the const (exact `(name, start)` miss).
+        let src = "interface Foo { a: string; }\nconst Foo = 42;\n";
+        let pf = parse_module(FileId(0), "m.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let foos: Vec<_> = pf.symbols.iter().filter(|s| s.name == "Foo").collect();
+        assert_eq!(foos.len(), 1, "merged pair surfaces as one symbol");
+        assert_eq!((foos[0].span.lo, foos[0].span.hi), (10, 13));
+        assert_eq!(pf.interfaces.len(), 1);
+        let fact = &pf.interfaces[0];
+        assert_eq!(fact.name, "Foo");
+        assert_eq!((fact.span.lo, fact.span.hi), (0, 28));
+        let symbol = &pf.symbols[usize::try_from(fact.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "Foo");
+        assert_eq!(fact.scope, symbol.scope);
+        assert_eq!(fact.members.len(), 1);
+        assert_eq!(fact.members[0].name, "a");
+        assert!(fact.members[0].complex_reason.is_none());
+        assert!(pf.decls.is_empty(), "merged const emits no decl fact");
     }
 }
