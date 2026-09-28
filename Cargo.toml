@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pith-ids", "crates/pith-frontend"]
+members = ["crates/pith-ids", "crates/pith-frontend", "crates/pith-symbols"]
 resolver = "2"
 
 [workspace.package]

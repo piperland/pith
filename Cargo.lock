@@ -530,6 +530,14 @@ name = "pith-ids"
 version = "0.1.0"
 
 [[package]]
+name = "pith-symbols"
+version = "0.1.0"
+dependencies = [
+ "pith-frontend",
+ "pith-ids",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,17 @@
+[package]
+name = "pith-symbols"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pith_symbols"
+path = "src/lib.rs"
+
+[dependencies]
+pith-ids = { path = "../pith-ids" }
+
+[dev-dependencies]
+pith-frontend = { path = "../pith-frontend" }
+
+[lints]
+workspace = true
