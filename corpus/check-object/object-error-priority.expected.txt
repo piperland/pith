@@ -1,0 +1,2 @@
+object-error-priority.ts:TS2322: Type 'string' is not assignable to type 'number'.
+object-error-priority.ts:TS2353: Object literal may only specify known properties, and 'extra' does not exist in type '{ x: number; y: string; }'.

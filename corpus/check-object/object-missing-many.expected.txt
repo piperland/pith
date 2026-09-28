@@ -1,0 +1,1 @@
+object-missing-many.ts:TS2739: Type '{ secure: false; host: string; }' is missing the following properties from type '{ host: string; port: number; secure: boolean; retries: number; }': port, retries
