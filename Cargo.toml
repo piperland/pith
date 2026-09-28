@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/pith-ids"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "TBD"
+repository = "https://github.com/piperland/pith"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

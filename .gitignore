@@ -1,0 +1,26 @@
+# local engineering substrate - never public
+.agent/
+.opencode/
+.worktrees/
+*.deepnote
+.deepnote/
+
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_* 
+
+# rust
+target/
+Cargo.lock
+
+# node (plugins tooling)
+node_modules/
+
+# evidence (large, local only)
+.agent/runs/
+.agent/evidence/
+.agent/scratch/

@@ -1,0 +1,11 @@
+[package]
+name = "pith-ids"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pith_ids"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
