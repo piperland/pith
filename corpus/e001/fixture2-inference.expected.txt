@@ -1,0 +1,2 @@
+fixture2-inference.ts:TS2322: Type '{ v: number; }' is not assignable to type 'string'.
+fixture2-inference.ts:TS2322: Type '{ v: number; }' is not assignable to type 'number'.
