@@ -1,0 +1,17 @@
+[package]
+name = "pith-solver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pith_solver"
+path = "src/lib.rs"
+
+[dependencies]
+pith-ids = { path = "../pith-ids" }
+pith-types = { path = "../pith-types" }
+pith-symbols = { path = "../pith-symbols" }
+pith-queries = { path = "../pith-queries" }
+
+[lints]
+workspace = true

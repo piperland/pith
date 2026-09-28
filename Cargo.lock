@@ -539,6 +539,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pith-solver"
+version = "0.1.0"
+dependencies = [
+ "pith-ids",
+ "pith-queries",
+ "pith-symbols",
+ "pith-types",
+]
+
+[[package]]
 name = "pith-symbols"
 version = "0.1.0"
 dependencies = [
