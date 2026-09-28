@@ -1,0 +1,2 @@
+union-member-declined.ts:TS2322: Type 'string | T' is not assignable to type 'T'.
+  'T' could be instantiated with an arbitrary type which could be unrelated to 'string | T'.

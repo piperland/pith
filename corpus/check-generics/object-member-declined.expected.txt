@@ -1,0 +1,1 @@
+object-member-declined.ts:TS2322: Type 'T' is not assignable to type '{ v: T; }'.
