@@ -190,6 +190,24 @@
 //! guard literals outside the union narrow to `never` (silent uses — the
 //! solver declines those regions), and literal-initialized `const`s do not
 //! narrow at all.
+//!
+//! Module facts (P019): [`ParsedFile::named_imports`] carries one
+//! [`NamedImportFact`] per import binding (`import { A as B } from "./m"`),
+//! [`ParsedFile::local_exports`] one [`LocalExportFact`] per locally-declared
+//! exported name (`export const X`, `export { X }`, `export { Y as X }`), and
+//! [`ParsedFile::reexports`] one [`ReExportFact`] per re-export
+//! (`export { A as B } from "./m"`, `export * from "./m"`). All three map
+//! mechanically off oxc's ESM module record (spans from facts, never sliced
+//! text): import bindings link their local [`SymbolFact`] exactly like
+//! [`DeclFact`] (`(local name, local-name start)`); a binding with no
+//! matching symbol (only possible with recovery from parse errors) is
+//! skipped rather than invented. Default exports record no fact and default
+//! (`import D from`) plus namespace (`import * as ns`) bindings record their
+//! shape explicitly so the cross-file driver declines them with reasons
+//! instead of mis-resolving. `export * as ns` records its namespace marker
+//! for the same decline. Type-only imports/exports (`import type`,
+//! `export type`) record identically to value ones: elision is unobservable
+//! to checking, so no fork exists.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -204,6 +222,9 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{ScopeFlags, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
+use oxc_syntax::module_record::{
+    ExportExportName, ExportImportName, ExportLocalName, ImportImportName, ModuleRecord,
+};
 use oxc_syntax::operator::{BinaryOperator, UnaryOperator};
 use pith_ids::{FileId, Span};
 
@@ -254,6 +275,71 @@ pub struct UnresolvedFact {
 #[derive(Clone, Debug)]
 pub struct ImportFact {
     pub specifier: String,
+    pub span: Span,
+}
+
+/// Which exported name an import binding asks its target module for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportedName {
+    /// `import { A as B }`: the name `A` in the target module.
+    Named(String),
+    /// `import D from`: the default export (outside the subset — declined).
+    Default,
+    /// `import * as ns from`: the module namespace (outside the subset).
+    Namespace,
+}
+
+/// One named import binding: `import { LIMIT as L } from "./shared"`.
+#[derive(Clone, Debug)]
+pub struct NamedImportFact {
+    /// Per-file symbol index of the local binding.
+    pub symbol: u32,
+    /// Owning scope (per-file scope index) of [`NamedImportFact::symbol`].
+    pub scope: u32,
+    /// Local name as written (`L` above).
+    pub local: String,
+    /// Requested name in the target module (`LIMIT` above).
+    pub imported: ImportedName,
+    /// Module specifier as written (`"./shared"` above).
+    pub specifier: String,
+    /// Span of the local binding name.
+    pub span: Span,
+    /// Span of the imported name (`LIMIT` above); `None` for default and
+    /// namespace bindings (no such name exists in the source). Anchors the
+    /// oracle's `TS2305` exactly (probed tsc 7.0.2: the diagnostic names the
+    /// imported member at its own position, even when aliased).
+    pub imported_span: Option<Span>,
+    /// Span of the module-specifier string literal.
+    pub specifier_span: Span,
+    /// `true` for `import type` bindings (recorded identically: elision is
+    /// unobservable to checking, so the driver never forks on this flag).
+    pub is_type: bool,
+}
+
+/// One locally-declared exported name: `export const X`, `export { X }`,
+/// `export { Y as X }`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalExportFact {
+    /// Name visible to importers (`X` above).
+    pub exported: String,
+    /// Local binding name (`Y` in the aliased form, else `X`).
+    pub local: String,
+    /// Span of the exported name.
+    pub span: Span,
+}
+
+/// One re-export: `export { A as B } from "./m"` or `export * from "./m"`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReExportFact {
+    /// Name visible to importers (`B` above); `None` for `export *`.
+    pub exported: Option<String>,
+    /// Requested name in the target module (`A` above); `None` for `export *`
+    /// and for `export * as ns` (a namespace object: outside the subset, so
+    /// the driver declines those on the `Some`/`None` split, never silently).
+    pub imported: Option<String>,
+    /// Module specifier as written (`"./m"` above).
+    pub specifier: String,
+    /// Span of the whole export entry.
     pub span: Span,
 }
 
@@ -744,6 +830,15 @@ pub struct ParsedFile {
     pub symbols: Vec<SymbolFact>,
     pub unresolved: Vec<UnresolvedFact>,
     pub imports: Vec<ImportFact>,
+    /// One fact per import binding, in module-record order. Empty when the
+    /// file imports nothing by name.
+    pub named_imports: Vec<NamedImportFact>,
+    /// One fact per locally-declared exported name, in module-record order.
+    /// Empty when the file exports nothing locally.
+    pub local_exports: Vec<LocalExportFact>,
+    /// One fact per re-export, in module-record order. Empty when the file
+    /// re-exports nothing.
+    pub reexports: Vec<ReExportFact>,
     /// One fact per `const` declarator (identifier bindings only), in
     /// source order. Empty when the file declares no consts.
     pub decls: Vec<DeclFact>,
@@ -2054,12 +2149,16 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         .collect();
 
     let collected = collect_decls(file, source, &parse.program, &symbols, &scopes);
+    let module_facts = collect_module_facts(file, &parse.module_record, &symbols);
     ParsedFile {
         file,
         scopes,
         symbols,
         unresolved,
         imports,
+        named_imports: module_facts.named_imports,
+        local_exports: module_facts.local_exports,
+        reexports: module_facts.reexports,
         decls: collected.decls,
         functions: collected.functions,
         calls: collected.calls,
@@ -2069,6 +2168,191 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         enums: collected.enums,
         namespaces: collected.namespaces,
         errors,
+    }
+}
+
+/// Owned module facts from one frontend pass, bundled so the collector
+/// return stays lean.
+struct ModuleFacts {
+    named_imports: Vec<NamedImportFact>,
+    local_exports: Vec<LocalExportFact>,
+    reexports: Vec<ReExportFact>,
+}
+
+/// Maps one import entry's requested name off the module record.
+fn imported_name(entry: &oxc_syntax::module_record::ImportEntry<'_>) -> ImportedName {
+    match &entry.import_name {
+        ImportImportName::Name(found) => ImportedName::Named(found.name.to_string()),
+        ImportImportName::NamespaceObject => ImportedName::Namespace,
+        ImportImportName::Default(_) => ImportedName::Default,
+    }
+}
+
+/// Records one import binding when its local symbol links.
+///
+/// Linkage reuses the `(name, binding start)` keying of [`DeclFact`]: the
+/// binding symbol's span must start at the local name. A binding with no
+/// matching symbol (only possible with recovery from parse errors) is
+/// skipped rather than invented.
+fn record_named_import(
+    file: FileId,
+    entry: &oxc_syntax::module_record::ImportEntry<'_>,
+    index_of: &std::collections::HashMap<(String, u32), (u32, u32)>,
+    out: &mut Vec<NamedImportFact>,
+) {
+    let local = entry.local_name.name.to_string();
+    let Some(&(symbol, scope)) = index_of.get(&(local.clone(), entry.local_name.span.start)) else {
+        return;
+    };
+    let imported_span = match &entry.import_name {
+        ImportImportName::Name(found) => Some(Span {
+            file,
+            lo: found.span.start,
+            hi: found.span.end,
+        }),
+        ImportImportName::NamespaceObject | ImportImportName::Default(_) => None,
+    };
+    out.push(NamedImportFact {
+        symbol,
+        scope,
+        local,
+        imported: imported_name(entry),
+        specifier: entry.module_request.name.to_string(),
+        span: Span {
+            file,
+            lo: entry.local_name.span.start,
+            hi: entry.local_name.span.end,
+        },
+        imported_span,
+        specifier_span: Span {
+            file,
+            lo: entry.module_request.span.start,
+            hi: entry.module_request.span.end,
+        },
+        is_type: entry.is_type,
+    });
+}
+
+/// Records one local export entry: `export const X`, `export { X }`,
+/// `export { Y as X }`.
+///
+/// Default exports (`export default …`) record no fact: default imports are
+/// outside the subset, so nothing downstream could resolve them.
+fn record_local_export(
+    file: FileId,
+    entry: &oxc_syntax::module_record::ExportEntry<'_>,
+    out: &mut Vec<LocalExportFact>,
+) {
+    let ExportExportName::Name(exported) = &entry.export_name else {
+        return;
+    };
+    let local = match &entry.local_name {
+        ExportLocalName::Name(found) => found.name.to_string(),
+        ExportLocalName::Default(_) | ExportLocalName::Null => return,
+    };
+    out.push(LocalExportFact {
+        exported: exported.name.to_string(),
+        local,
+        span: Span {
+            file,
+            lo: exported.span.start,
+            hi: exported.span.end,
+        },
+    });
+}
+
+/// Records one indirect (`export … from`) entry.
+///
+/// Named re-exports carry both names; `export *` carries neither; `export *
+/// as ns` carries only the namespace name (a namespace object: outside the
+/// subset, declined driver-side). Entries with no module specifier (only
+/// possible with recovery from parse errors) are skipped rather than
+/// invented.
+fn record_indirect_export(
+    file: FileId,
+    entry: &oxc_syntax::module_record::ExportEntry<'_>,
+    out: &mut Vec<ReExportFact>,
+) {
+    let Some(request) = entry.module_request.as_ref() else {
+        return;
+    };
+    let specifier = request.name.to_string();
+    let span = Span {
+        file,
+        lo: entry.span.start,
+        hi: entry.span.end,
+    };
+    match (&entry.export_name, &entry.import_name) {
+        (ExportExportName::Name(exported), ExportImportName::Name(imported)) => {
+            out.push(ReExportFact {
+                exported: Some(exported.name.to_string()),
+                imported: Some(imported.name.to_string()),
+                specifier,
+                span,
+            });
+        }
+        (ExportExportName::Name(exported), ExportImportName::All) => {
+            out.push(ReExportFact {
+                exported: Some(exported.name.to_string()),
+                imported: None,
+                specifier,
+                span,
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Maps the ESM module record to Pith-owned module facts.
+///
+/// Import bindings link `(local name, local-name start)` to the per-file
+/// symbol index built above (see [`record_named_import`]); exports carry
+/// names only (drivers resolve them through the cross-file graph, never by
+/// symbol). Fact order follows the module record, so sequences are
+/// deterministic.
+fn collect_module_facts(
+    file: FileId,
+    record: &ModuleRecord<'_>,
+    symbols: &[SymbolFact],
+) -> ModuleFacts {
+    let mut index_of = std::collections::HashMap::new();
+    for symbol in symbols {
+        index_of.insert(
+            (symbol.name.clone(), symbol.span.lo),
+            (symbol.index, symbol.scope),
+        );
+    }
+    let mut named_imports = Vec::new();
+    for entry in &record.import_entries {
+        record_named_import(file, entry, &index_of, &mut named_imports);
+    }
+    let mut local_exports = Vec::new();
+    for entry in &record.local_export_entries {
+        record_local_export(file, entry, &mut local_exports);
+    }
+    let mut reexports = Vec::new();
+    for entry in &record.indirect_export_entries {
+        record_indirect_export(file, entry, &mut reexports);
+    }
+    for entry in &record.star_export_entries {
+        let Some(request) = entry.module_request.as_ref() else {
+            continue;
+        };
+        reexports.push(ReExportFact {
+            exported: None,
+            imported: None,
+            specifier: request.name.to_string(),
+            span: Span {
+                file,
+                lo: entry.span.start,
+                hi: entry.span.end,
+            },
+        });
+    }
+    ModuleFacts {
+        named_imports,
+        local_exports,
+        reexports,
     }
 }
 
@@ -2177,6 +2461,158 @@ export function f(a: string): string { return a + b; }
         assert_eq!(pf.imports.len(), 1);
         assert_eq!(pf.imports[0].specifier, "./b");
         assert_eq!(pf.imports[0].span.file, FileId(0));
+    }
+
+    #[test]
+    fn module_facts_name_import_bindings_with_spans() {
+        // Offsets hand-counted: `L` at [18, 19), `ADD` at [21, 24), the
+        // specifier string at [32, 43).
+        let source = "import { LIMIT as L, ADD } from \"./shared\";\n";
+        let pf = parse_module(FileId(0), "main.ts", source);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.named_imports.len(), 2);
+        let first = &pf.named_imports[0];
+        assert_eq!(first.local, "L");
+        assert_eq!(first.imported, ImportedName::Named("LIMIT".to_owned()));
+        assert_eq!(first.specifier, "./shared");
+        assert_eq!(
+            first.span,
+            Span {
+                file: FileId(0),
+                lo: 18,
+                hi: 19
+            }
+        );
+        assert_eq!(first.specifier_span.file, FileId(0));
+        assert!(first.specifier_span.lo < first.specifier_span.hi);
+        let sliced = source
+            .get(
+                usize::try_from(first.specifier_span.lo).expect("small span")
+                    ..usize::try_from(first.specifier_span.hi).expect("small span"),
+            )
+            .unwrap_or("");
+        assert!(
+            sliced.contains("./shared"),
+            "specifier span slices the specifier: {sliced:?}"
+        );
+        assert!(!first.is_type);
+        assert_eq!(
+            first.imported_span,
+            Some(Span {
+                file: FileId(0),
+                lo: 9,
+                hi: 14
+            })
+        );
+        let symbol = &pf.symbols[usize::try_from(first.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "L");
+        assert_eq!(symbol.scope, first.scope);
+        let second = &pf.named_imports[1];
+        assert_eq!(second.local, "ADD");
+        assert_eq!(second.imported, ImportedName::Named("ADD".to_owned()));
+        assert_eq!(
+            second.span,
+            Span {
+                file: FileId(0),
+                lo: 21,
+                hi: 24
+            }
+        );
+        let symbol = &pf.symbols[usize::try_from(second.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "ADD");
+    }
+
+    #[test]
+    fn module_facts_mark_type_default_and_namespace_imports() {
+        let source = "import type { P } from \"./t\";\n\
+                      import D from \"./d\";\n\
+                      import * as ns from \"./n\";\n";
+        let pf = parse_module(FileId(0), "main.ts", source);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.named_imports.len(), 3);
+        let kinds: Vec<(String, ImportedName, bool)> = pf
+            .named_imports
+            .iter()
+            .map(|fact| (fact.local.clone(), fact.imported.clone(), fact.is_type))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("P".to_owned(), ImportedName::Named("P".to_owned()), true),
+                ("D".to_owned(), ImportedName::Default, false),
+                ("ns".to_owned(), ImportedName::Namespace, false),
+            ]
+        );
+        for fact in &pf.named_imports {
+            assert_eq!(fact.span.file, FileId(0));
+            assert!(fact.span.lo < fact.span.hi);
+            let symbol = &pf.symbols[usize::try_from(fact.symbol).expect("dense symbol index")];
+            assert_eq!(symbol.name, fact.local);
+        }
+    }
+
+    #[test]
+    fn module_facts_list_local_exports() {
+        let source = "export const X: number = 1;\n\
+                      const Y: number = 2;\n\
+                      export { Y as Z };\n";
+        let pf = parse_module(FileId(0), "shared.ts", source);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let mut exported: Vec<(String, String)> = pf
+            .local_exports
+            .iter()
+            .map(|fact| (fact.exported.clone(), fact.local.clone()))
+            .collect();
+        exported.sort();
+        assert_eq!(
+            exported,
+            [
+                ("X".to_owned(), "X".to_owned()),
+                ("Z".to_owned(), "Y".to_owned()),
+            ]
+        );
+        for fact in &pf.local_exports {
+            assert_eq!(fact.span.file, FileId(0));
+            assert!(fact.span.lo < fact.span.hi);
+        }
+    }
+
+    #[test]
+    fn module_facts_list_reexports_and_skip_default_exports() {
+        let source = "export { A as B } from \"./m\";\n\
+                      export * from \"./s\";\n\
+                      export * as helpers from \"./h\";\n\
+                      export default 42;\n";
+        let pf = parse_module(FileId(0), "mid.ts", source);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let reexports: Vec<(Option<String>, Option<String>, String)> = pf
+            .reexports
+            .iter()
+            .map(|fact| {
+                (
+                    fact.exported.clone(),
+                    fact.imported.clone(),
+                    fact.specifier.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reexports,
+            [
+                (Some("B".to_owned()), Some("A".to_owned()), "./m".to_owned()),
+                (Some("helpers".to_owned()), None, "./h".to_owned()),
+                (None, None, "./s".to_owned()),
+            ]
+        );
+        for fact in &pf.reexports {
+            assert_eq!(fact.span.file, FileId(0));
+            assert!(fact.span.lo < fact.span.hi);
+        }
+        assert!(
+            pf.local_exports.is_empty(),
+            "default exports record no local facts: {:?}",
+            pf.local_exports
+        );
     }
 
     #[test]
