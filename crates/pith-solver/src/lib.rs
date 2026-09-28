@@ -106,6 +106,38 @@
 //!   whole calls over one identifier argument would forfeit decidable arity
 //!   verdicts.
 //!
+//! Interface-typed consts (P017, probed on tsc 7.0.2
+//! `--strict --pretty false`):
+//!
+//! - Member checks reuse the object path, so families match: wrong members
+//!   diagnose per-member `TS2322` (`Type 'string' is not assignable to type
+//!   'number'.`), one missing member `TS2741`, several `TS2739`, first
+//!   excess `TS2353` — with the wrong > excess > missing priority intact.
+//! - Missing/excess/cross-shape elaborations spell the INTERFACE NAME, never
+//!   expanded members: `Property 'label' is missing in type '{ x: number; }'
+//!   but required in type 'Point'.`, `... 'extra' does not exist in type
+//!   'Point'.`, `Type 'number' is not assignable to type 'Point'.`
+//! - `readonly` needs no special case: assignability ignores it (clean when
+//!   members match, plain `TS2322` when wrong).
+//! - Heritage clauses, generic parameter lists, methods, index/call/
+//!   construct signatures, and optional members decline with per-member
+//!   reasons (pinned oracle-clean divergences: tsc checks all of these).
+//! - Merged pairs (`interface Foo {}` + `const Foo = …`) share one
+//!   [`SymbolId`]: oxc pre-merges same-scope redeclarations (so the
+//!   frontend emits one fact), and the P005 binder law covers any residual
+//!   split — annotation names resolve through the [`Binder`] exactly like
+//!   values, so both meanings stay reachable and diagnostics anchor at the
+//!   first-declaration span.
+//!
+//! [`check_interfaces`] resolves each non-primitive, non-union annotation
+//! through the [`Binder`] to an [`InterfaceShape`] (driver-mapped from the
+//! adapter's interface facts) and runs the shared object comparison with
+//! the interface name as the expected-type spelling — a thin wrapper, no
+//! duplicated verdict logic. Unknown names diagnose `PITH2304` exactly like
+//! [`check_one`]; names that resolve to a symbol no shape claims decline
+//! (type aliases, classes, and driver skew are all non-interface targets —
+//! recorded, never verdict).
+//!
 //! Design law (H-002): literal freshness and every other per-occurrence
 //! verdict lives in query-side tables keyed by occurrence
 //! ([`NodeId`], see [`FreshnessTable`] plus the [`QueryDb`] memo entries),
@@ -2658,12 +2690,6 @@ struct CheckCtx<'a> {
 /// rest (union/complex shapes) before any shape comparison; the shape
 /// comparison itself fires exactly one diagnostic family per declaration
 /// (wrong > excess > missing). See the module-level object rules.
-/// Object annotation (`{ a: number; ... }`) against any initializer.
-///
-/// Member-type failures diagnose unknown names (`TS2304`) or decline the
-/// rest (union/complex shapes) before any shape comparison; the shape
-/// comparison itself fires exactly one diagnostic family per declaration
-/// (wrong > excess > missing). See the module-level object rules.
 fn check_object(decl: &ConstDecl, span: Span, annotation: &str, ctx: &mut CheckCtx<'_>) {
     let Some(parsed) = parse_object_members(annotation, span, ctx) else {
         return;
@@ -2671,7 +2697,6 @@ fn check_object(decl: &ConstDecl, span: Span, annotation: &str, ctx: &mut CheckC
     let Some(expected) = classify_expected(&parsed, span, ctx) else {
         return;
     };
-    memoize_object_shape(&expected, ctx);
     let expected_text = object_type_text(
         &expected
             .iter()
@@ -2682,10 +2707,27 @@ fn check_object(decl: &ConstDecl, span: Span, annotation: &str, ctx: &mut CheckC
             .map(|(_, _, ty)| ty.as_str())
             .collect::<Vec<&str>>(),
     );
+    finish_object_check(decl, span, &expected, &expected_text, ctx);
+}
+
+/// Shared object-literal comparison tail: memoizes the shape, then fires
+/// the single-family comparison (or the non-object-init path) with
+/// `expected_text` as the expected-type spelling — the `{...}` expansion
+/// for inline annotations, the bare interface name for
+/// [`check_interface_shape`] (probed tsc 7.0.2: interface elaborations
+/// spell the name, never expanded members).
+fn finish_object_check(
+    decl: &ConstDecl,
+    span: Span,
+    expected: &[ExpectedMember],
+    expected_text: &str,
+    ctx: &mut CheckCtx<'_>,
+) {
+    memoize_object_shape(expected, ctx);
     match decl.init_object.as_ref() {
-        None => check_object_annotation_non_object_init(decl, span, &expected_text, ctx),
+        None => check_object_annotation_non_object_init(decl, span, expected_text, ctx),
         Some(init_object) => {
-            compare_object_members(span, &expected, &expected_text, init_object, ctx);
+            compare_object_members(span, expected, expected_text, init_object, ctx);
         }
     }
 }
@@ -2992,6 +3034,298 @@ fn check_object_annotation_non_object_init(
     });
 }
 
+/// One heritage parent of an interface: name plus span.
+///
+/// Driver-mapped from the adapter's `InterfaceHeritageFact` (mechanical
+/// field copy). Names feed decline reasons only — heritage is outside the
+/// subset, so no verdict ever reads them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceHeritage {
+    /// Parent name as written (`"Base"`).
+    pub name: String,
+    /// Span of the heritage clause.
+    pub span: Span,
+}
+
+/// One interface member: name plus annotation text.
+///
+/// Driver-mapped from the adapter's `InterfaceMemberFact` (mechanical field
+/// copy). `complex_reason` carries the adapter's decline marker verbatim;
+/// checkable members carry the raw annotation text for
+/// [`classify_expected`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceMember {
+    /// Member name as written.
+    pub name: String,
+    /// Raw annotation text (`Some("number")`); `None` when absent.
+    pub annotation_text: Option<String>,
+    /// Span of the member signature.
+    pub span: Span,
+    /// Adapter decline marker; `Some` means the interface declines.
+    pub complex_reason: Option<String>,
+}
+
+/// One `interface` declaration available as an annotation target.
+///
+/// Driver-mapped from the adapter's `InterfaceFact` (mechanical field copy,
+/// plus the binder [`SymbolId`] resolved from the same [`Binder`] used for
+/// checking — the linkage that makes merged interface+value pairs resolve).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceShape {
+    /// Interface name as written.
+    pub name: String,
+    /// Per-file scope index of the declaration (from the adapter's facts).
+    pub scope: u32,
+    /// Exact binder identity resolved from the checking [`Binder`]; shapes
+    /// with `None` never match (the driver must link — asserted in tests).
+    pub symbol: Option<SymbolId>,
+    /// Whole-declaration span.
+    pub span: Span,
+    /// Member facts in source order.
+    pub members: Vec<InterfaceMember>,
+    /// Heritage parents; non-empty declines.
+    pub heritage: Vec<InterfaceHeritage>,
+    /// `true` when the interface declares type parameters: declines.
+    pub has_type_params: bool,
+}
+
+/// Checks `const`/`let` declarators whose annotations may name interfaces.
+///
+/// Same [`ConstDecl`] seam as [`check_file`] (spans/scopes from adapter
+/// facts, shapes hand-fed until the adapter emits member facts); plus
+/// `interfaces`, driver-mapped from the adapter's interface facts (shapes
+/// ARE adapter-fed here — only the const side stays hand-fed). Each
+/// declaration routes on its annotation text: `{...}`/primitive/union
+/// spellings delegate to [`check_one`] unchanged, while any other name
+/// resolves scope-sensitively through the [`Binder`] to an
+/// [`InterfaceShape`] and runs the shared object comparison with the
+/// interface name as the expected spelling. See the module-level interface
+/// rules for families, name-spelled elaborations, and declines.
+#[must_use]
+pub fn check_interfaces(
+    file: FileId,
+    decls: &[ConstDecl],
+    interfaces: &[InterfaceShape],
+    binder: &Binder,
+    db: &mut QueryDb,
+) -> FileReport {
+    let mut freshness = FreshnessTable::default();
+    for (index, decl) in decls.iter().enumerate() {
+        if let Some(init) = decl.init_object.as_ref() {
+            freshness
+                .fresh
+                .insert((file, occurrence_node(index)), init.fresh);
+        }
+    }
+    let mut report = FileReport::default();
+    for (index, decl) in decls.iter().enumerate() {
+        let mut route = InterfaceDeclCtx {
+            file,
+            node: occurrence_node(index),
+            decl,
+            interfaces,
+            binder,
+            db: &mut *db,
+            freshness: &freshness,
+            report: &mut report,
+        };
+        route_declaration(&mut route);
+    }
+    sort_report(&mut report);
+    report
+}
+
+/// Routing state for one [`check_interfaces`] declaration, bundled so the
+/// per-decl helpers stay lean (pedantic arity discipline, mirroring
+/// [`GenericCallCtx`]).
+struct InterfaceDeclCtx<'a, 'b> {
+    file: FileId,
+    node: NodeId,
+    decl: &'a ConstDecl,
+    interfaces: &'b [InterfaceShape],
+    binder: &'a Binder,
+    db: &'a mut QueryDb,
+    freshness: &'a FreshnessTable,
+    report: &'a mut FileReport,
+}
+
+impl InterfaceDeclCtx<'_, '_> {
+    /// Plain spellings (and missing annotations) keep [`check_one`]'s
+    /// verdicts by construction.
+    fn delegate(&mut self) {
+        check_one(
+            self.file,
+            self.node,
+            self.decl,
+            self.binder,
+            &mut *self.db,
+            self.freshness,
+            &mut *self.report,
+        );
+    }
+
+    /// Resolves an interface-named annotation to its shape: unknown names
+    /// diagnose `PITH2304` exactly like [`check_one`]; resolved names no
+    /// shape claims decline (non-interface targets — recorded, never
+    /// verdict).
+    fn resolve_shape(&mut self, span: Span, annotation: &str) {
+        let Some(id) = self.binder.resolve(self.file, self.decl.scope, annotation) else {
+            self.report.diagnostics.push(PithDiagnostic {
+                code: CODE_UNKNOWN_ANNOTATION.to_owned(),
+                file: self.file,
+                span,
+                message: format!("Cannot find name '{annotation}'."),
+            });
+            return;
+        };
+        let Some(index) = self
+            .interfaces
+            .iter()
+            .position(|shape| shape.symbol == Some(id))
+        else {
+            self.report.unsupported.push(UnsupportedDecl {
+                file: self.file,
+                span,
+                reason: format!(
+                    "annotation '{annotation}' is not an interface: outside the subset"
+                ),
+            });
+            return;
+        };
+        let mut tail = CheckCtx {
+            file: self.file,
+            node: self.node,
+            db: &mut *self.db,
+            freshness: self.freshness,
+            report: &mut *self.report,
+        };
+        check_interface_shape(
+            self.decl,
+            span,
+            annotation,
+            &self.interfaces[index],
+            &mut tail,
+        );
+    }
+}
+
+/// Routes one declaration: unannotated and plain-spelling annotations
+/// delegate; any other name resolves to an interface shape.
+fn route_declaration(route: &mut InterfaceDeclCtx<'_, '_>) {
+    let decl = route.decl;
+    let Some(annotation) = decl.annotation.as_deref().map(str::trim) else {
+        route.delegate();
+        return;
+    };
+    if annotation.starts_with('{')
+        || annotation.contains('|')
+        || annotation_type(annotation).is_some()
+    {
+        route.delegate();
+        return;
+    }
+    let span = binder_span(route.binder, route.file, decl);
+    route.resolve_shape(span, annotation);
+}
+
+/// Gates one resolved interface shape, then runs the shared object
+/// comparison with the interface name as the expected spelling.
+///
+/// Gate order is structural-first (contradictory facts, heritage, generics,
+/// complex members — first complex member wins so reasons stay single);
+/// member-type classification and literal comparison reuse
+/// [`classify_expected`] plus [`finish_object_check`], so verdicts match
+/// the `{...}` path by construction. Annotation-less members past the
+/// complex gate are unreachable on real paths (the adapter marks them
+/// complex) and decline rather than panic.
+fn check_interface_shape(
+    decl: &ConstDecl,
+    span: Span,
+    annotation: &str,
+    shape: &InterfaceShape,
+    ctx: &mut CheckCtx<'_>,
+) {
+    if decl.init.is_some() && decl.init_object.is_some() {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: "contradictory initializer facts: primitive kind with object members"
+                .to_owned(),
+        });
+        return;
+    }
+    if !shape.heritage.is_empty() {
+        let parents = shape
+            .heritage
+            .iter()
+            .map(|parent| parent.name.as_str())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: if parents.is_empty() {
+                format!(
+                    "interface '{}' has a heritage clause: heritage is outside the subset",
+                    shape.name
+                )
+            } else {
+                format!(
+                    "interface '{}' extends {parents}: heritage is outside the subset",
+                    shape.name
+                )
+            },
+        });
+        return;
+    }
+    if shape.has_type_params {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: format!("generic interface '{}' is outside the subset", shape.name),
+        });
+        return;
+    }
+    if let Some(member) = shape
+        .members
+        .iter()
+        .find(|member| member.complex_reason.is_some())
+    {
+        let detail = member
+            .complex_reason
+            .as_deref()
+            .unwrap_or("outside the subset");
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: format!(
+                "interface '{}': member '{}': {detail}",
+                shape.name, member.name
+            ),
+        });
+        return;
+    }
+    let mut parsed = Vec::with_capacity(shape.members.len());
+    for member in &shape.members {
+        let Some(text) = member.annotation_text.as_deref() else {
+            ctx.report.unsupported.push(UnsupportedDecl {
+                file: ctx.file,
+                span,
+                reason: format!(
+                    "interface '{}': member '{}' has no comparable annotation: outside the subset",
+                    shape.name, member.name
+                ),
+            });
+            return;
+        };
+        parsed.push((member.name.clone(), text.to_owned()));
+    }
+    let Some(expected) = classify_expected(&parsed, span, ctx) else {
+        return;
+    };
+    finish_object_check(decl, span, &expected, annotation, ctx);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3077,6 +3411,385 @@ mod tests {
                 fresh: true,
             }),
         }
+    }
+
+    /// One interface shape bound to `binder`: the symbol resolves from the
+    /// same binder used for checking, mirroring the e2e driver contract.
+    fn interface_shape(
+        binder: &Binder,
+        name: &str,
+        scope: u32,
+        members: Vec<(&str, &str)>,
+    ) -> InterfaceShape {
+        InterfaceShape {
+            name: name.to_owned(),
+            scope,
+            symbol: binder.resolve(FILE, scope, name),
+            span: span(0, 1),
+            members: members
+                .into_iter()
+                .map(|(member, ty)| InterfaceMember {
+                    name: member.to_owned(),
+                    annotation_text: Some(ty.to_owned()),
+                    span: span(0, 1),
+                    complex_reason: None,
+                })
+                .collect(),
+            heritage: Vec::new(),
+            has_type_params: false,
+        }
+    }
+
+    #[test]
+    fn interface_correct_is_silent() {
+        let binder = binder_with(&[("Point", span(0, 5)), ("v", span(6, 16))]);
+        let shapes = [interface_shape(
+            &binder,
+            "Point",
+            0,
+            vec![("x", "number"), ("label", "string")],
+        )];
+        let decls = [object_decl(
+            "v",
+            6,
+            16,
+            "Point",
+            vec![
+                ("x", ObjectMemberKind::Number),
+                ("label", ObjectMemberKind::String),
+            ],
+        )];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &shapes, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn interface_wrong_member_is_pith2322() {
+        let binder = binder_with(&[("Point", span(0, 5)), ("v", span(6, 16))]);
+        let shapes = [interface_shape(
+            &binder,
+            "Point",
+            0,
+            vec![("x", "number"), ("label", "string")],
+        )];
+        let decls = [object_decl(
+            "v",
+            6,
+            16,
+            "Point",
+            vec![
+                ("x", ObjectMemberKind::String),
+                ("label", ObjectMemberKind::String),
+            ],
+        )];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &shapes, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn interface_missing_member_names_interface() {
+        let binder = binder_with(&[("User", span(0, 4)), ("v", span(5, 15))]);
+        let shapes = [interface_shape(
+            &binder,
+            "User",
+            0,
+            vec![("name", "string"), ("age", "number")],
+        )];
+        let decls = [object_decl(
+            "v",
+            5,
+            15,
+            "User",
+            vec![("name", ObjectMemberKind::String)],
+        )];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &shapes, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISSING_MEMBER);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Property 'age' is missing in type '{ name: string; }' but required in type 'User'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn interface_missing_many_names_interface() {
+        let binder = binder_with(&[("Triple", span(0, 6)), ("v", span(7, 17))]);
+        let shapes = [interface_shape(
+            &binder,
+            "Triple",
+            0,
+            vec![("a", "number"), ("b", "string"), ("c", "boolean")],
+        )];
+        let decls = [object_decl(
+            "v",
+            7,
+            17,
+            "Triple",
+            vec![("a", ObjectMemberKind::Number)],
+        )];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &shapes, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISSING_MANY);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type '{ a: number; }' is missing the following properties from type 'Triple': b, c"
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn interface_excess_names_interface() {
+        let binder = binder_with(&[("Point", span(0, 5)), ("v", span(6, 16))]);
+        let shapes = [interface_shape(&binder, "Point", 0, vec![("x", "number")])];
+        let decls = [object_decl(
+            "v",
+            6,
+            16,
+            "Point",
+            vec![
+                ("x", ObjectMemberKind::Number),
+                ("extra", ObjectMemberKind::String),
+            ],
+        )];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &shapes, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_EXCESS_MEMBER);
+        assert_eq!(
+            report.diagnostics[0].message,
+            concat!(
+                "Object literal may only specify known properties, ",
+                "and 'extra' does not exist in type 'Point'."
+            )
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn interface_unknown_annotation_is_pith2304() {
+        let binder = binder_with(&[("v", span(5, 15))]);
+        let decls = [object_decl(
+            "v",
+            5,
+            15,
+            "Nope",
+            vec![("a", ObjectMemberKind::Number)],
+        )];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &[], &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_UNKNOWN_ANNOTATION);
+        assert_eq!(report.diagnostics[0].message, "Cannot find name 'Nope'.");
+        assert_eq!(report.diagnostics[0].span, span(5, 15));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn interface_resolved_non_interface_declines() {
+        let binder = binder_with(&[("Alias", span(0, 5)), ("v", span(6, 16))]);
+        let decls = [object_decl(
+            "v",
+            6,
+            16,
+            "Alias",
+            vec![("a", ObjectMemberKind::Number)],
+        )];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &[], &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("not an interface"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn interface_structural_gates_decline_in_order() {
+        let binder = binder_with(&[
+            ("H", span(0, 10)),
+            ("G", span(11, 21)),
+            ("M", span(22, 32)),
+            ("h", span(33, 43)),
+            ("g", span(44, 54)),
+            ("m", span(55, 65)),
+        ]);
+        let mut heritage = interface_shape(&binder, "H", 0, vec![("a", "number")]);
+        heritage.heritage.push(InterfaceHeritage {
+            name: "Base".to_owned(),
+            span: span(0, 1),
+        });
+        // Heritage, generics, AND a complex member: heritage wins.
+        heritage.has_type_params = true;
+        heritage.members.push(InterfaceMember {
+            name: "run".to_owned(),
+            annotation_text: None,
+            span: span(0, 1),
+            complex_reason: Some("method signature 'run' is outside the subset".to_owned()),
+        });
+        let mut generic = interface_shape(&binder, "G", 0, vec![("a", "number")]);
+        generic.has_type_params = true;
+        let mut method = interface_shape(&binder, "M", 0, vec![("a", "number")]);
+        method.members.push(InterfaceMember {
+            name: "run".to_owned(),
+            annotation_text: None,
+            span: span(0, 1),
+            complex_reason: Some("method signature 'run' is outside the subset".to_owned()),
+        });
+        let shapes = [heritage, generic, method];
+        let decls = [
+            object_decl("h", 33, 43, "H", vec![("a", ObjectMemberKind::Number)]),
+            object_decl("g", 44, 54, "G", vec![("a", ObjectMemberKind::Number)]),
+            object_decl("m", 55, 65, "M", vec![("a", ObjectMemberKind::Number)]),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &shapes, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 3);
+        assert!(
+            report.unsupported[0].reason.contains("extends Base"),
+            "heritage first: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("generic interface"),
+            "generics second: {}",
+            report.unsupported[1].reason
+        );
+        assert!(
+            report.unsupported[2].reason.contains("method signature"),
+            "complex member third: {}",
+            report.unsupported[2].reason
+        );
+    }
+
+    #[test]
+    fn interface_merged_pair_shares_identity() {
+        // Two declarations, one identity: the P005 merge path. The `Foo`
+        // declarator's own span is the fallback, but the merged symbol's
+        // first-declaration span wins — diagnostics anchor there.
+        let first = span(10, 13);
+        let mut binder = Binder::new();
+        binder.build_file(
+            FILE,
+            &[ScopeInput {
+                index: 0,
+                parent: u32::MAX,
+            }],
+            &[
+                SymbolInput {
+                    scope: 0,
+                    name: "Foo".to_owned(),
+                    span: first,
+                    flags: 8,
+                },
+                SymbolInput {
+                    scope: 0,
+                    name: "Foo".to_owned(),
+                    span: span(35, 38),
+                    flags: 4,
+                },
+                SymbolInput {
+                    scope: 0,
+                    name: "ok".to_owned(),
+                    span: span(50, 52),
+                    flags: 0,
+                },
+            ],
+            &[],
+        );
+        let merged = binder.resolve(FILE, 0, "Foo").expect("merged Foo");
+        assert_eq!(
+            binder
+                .store()
+                .get(merged)
+                .expect("interned")
+                .declarations
+                .len(),
+            2
+        );
+        let shapes = [InterfaceShape {
+            name: "Foo".to_owned(),
+            scope: 0,
+            symbol: Some(merged),
+            span: first,
+            members: vec![InterfaceMember {
+                name: "a".to_owned(),
+                annotation_text: Some("string".to_owned()),
+                span: first,
+                complex_reason: None,
+            }],
+            heritage: Vec::new(),
+            has_type_params: false,
+        }];
+        let decls = [
+            // The merged declarator itself: unannotated, so the verdict is
+            // the no-annotation note — anchored at the FIRST declaration.
+            ConstDecl {
+                name: "Foo".to_owned(),
+                span: span(35, 38),
+                scope: 0,
+                symbol: None,
+                kind: DeclKind::Const,
+                annotation: None,
+                init: Some(InitKind::Number),
+                init_object: None,
+            },
+            // An interface-annotated use resolves through the merged id.
+            object_decl("ok", 50, 52, "Foo", vec![("a", ObjectMemberKind::Number)]),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &shapes, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].span, first);
+    }
+
+    #[test]
+    fn interface_plain_spellings_delegate_to_check_one() {
+        let binder = binder_with(&[("v", span(0, 10)), ("w", span(11, 21)), ("u", span(22, 32))]);
+        let decls = [
+            object_decl(
+                "v",
+                0,
+                10,
+                "{ a: number }",
+                vec![("a", ObjectMemberKind::Number)],
+            ),
+            decl("w", 11, 21, "number", InitKind::Number),
+            decl("u", 22, 32, "number | string", InitKind::Number),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &[], &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("union annotation"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
     }
 
     #[test]
