@@ -13,5 +13,10 @@ pith-types = { path = "../pith-types" }
 pith-symbols = { path = "../pith-symbols" }
 pith-queries = { path = "../pith-queries" }
 
+[dev-dependencies]
+# Test-only, mirroring pith-symbols: the e2e driver adapts ParsedFile facts
+# into binder inputs + ConstDecls. Never a runtime dep (boundary law).
+pith-frontend = { path = "../pith-frontend" }
+
 [lints]
 workspace = true

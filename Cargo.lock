@@ -544,6 +544,7 @@ dependencies = [
 name = "pith-solver"
 version = "0.1.0"
 dependencies = [
+ "pith-frontend",
  "pith-ids",
  "pith-queries",
  "pith-symbols",
