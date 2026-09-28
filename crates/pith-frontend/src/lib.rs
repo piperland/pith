@@ -30,15 +30,39 @@
 //! cost is one linear visitor pass. Destructured bindings (`const {a} = …`)
 //! bind many symbols per declarator and are skipped — outside the solver
 //! subset, never silently mis-keyed.
+//!
+//! Function facts (P013): [`ParsedFile::functions`] carries one
+//! [`FunctionFact`] per named `function` declaration (including
+//! `export function` and overload signatures, plus `declare function`).
+//! Linkage reuses the `(name, binding start)` symbol keying and
+//! declarator-scope threading of [`DeclFact`]. Each fact records identifier
+//! parameter names with their annotated-ness ([`FunctionParamFact`]; names
+//! only — patterns that are not plain identifiers set `params_complex`
+//! instead of mis-keying), the return annotation text + span
+//! ([`AnnotationFact`], `None` when unannotated), and the body shape
+//! ([`FunctionBodyFact`]). Only straight-line single-`return` bodies with an
+//! argument are checkable: their literal kind + span (plus member facts for
+//! returned `{ ... }` literals) feed the solver; bodies without a node are
+//! [`FunctionBodyFact::NoBody`], statement-less bodies are
+//! [`FunctionBodyFact::Empty`], and everything else (multiple returns,
+//! branches, loops, bare or missing `return`) is
+//! [`FunctionBodyFact::Complex`] for the solver to decline. Out of scope, no
+//! facts: function expressions, arrow functions, object and class methods,
+//! accessors, constructors. Anonymous `export default function …` has no
+//! binding and is skipped. `this` parameters are not listed in `params`;
+//! parenthesized returns (`return (1)`) classify
+//! [`ReturnKind::NonLiteral`], exactly like const initializers; directives
+//! do not count as statements for [`FunctionBodyFact::Empty`].
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, Expression, Program, VariableDeclaration, VariableDeclarationKind,
+    BindingPattern, Expression, Function, FunctionBody, FunctionType, ObjectPropertyKind, Program,
+    PropertyKey, PropertyKind, Statement, VariableDeclaration, VariableDeclarationKind,
     VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
-use oxc_semantic::SemanticBuilder;
+use oxc_semantic::{ScopeFlags, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
 use pith_ids::{FileId, Span};
 
@@ -157,6 +181,116 @@ pub struct DeclFact {
     pub init: Option<InitFact>,
 }
 
+/// One `function` declaration's declaration facts, keyed to its symbol.
+///
+/// `symbol`/`scope` link exactly like [`DeclFact`]: the per-file index of
+/// the [`SymbolFact`] for the function name (matched on name + binding
+/// start) plus that symbol's owning scope. Overload signatures merge into
+/// the first declaration's symbol, so every overload of one name shares one
+/// symbol index (diagnostics anchor at the first declaration — a documented
+/// precision limit, never a silent skip). Only named declarations produce
+/// facts (see the module-level scope note).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionFact {
+    /// Per-file symbol index of the function name binding.
+    pub symbol: u32,
+    /// Owning scope (per-file scope index) of [`FunctionFact::symbol`].
+    pub scope: u32,
+    /// Identifier parameters in source order, up to the first
+    /// unrepresentable pattern (see `params_complex`).
+    pub params: Vec<FunctionParamFact>,
+    /// `true` when the parameter list holds a pattern no name can represent
+    /// (destructured or non-identifier rest): `params` is then a prefix and
+    /// the solver declines instead of checking it.
+    pub params_complex: bool,
+    /// Raw return annotation text + span; `None` means unannotated.
+    pub return_annotation: Option<AnnotationFact>,
+    /// Body shape; only [`FunctionBodyFact::SingleReturn`] is checkable.
+    pub body: FunctionBodyFact,
+}
+
+/// One identifier parameter: its name plus whether it carries a type
+/// annotation.
+///
+/// `annotated` is what the solver gates on (unannotated parameters are
+/// outside the subset); the annotation text itself is not needed downstream
+/// and is not recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionParamFact {
+    /// Parameter name as written.
+    pub name: String,
+    /// Whether the parameter carries a type annotation.
+    pub annotated: bool,
+}
+
+/// Literal kind of a straight-line `return <expr>;`, mirroring [`InitKind`].
+///
+/// A separate type so the boolean payload rides along: tsc spells fresh
+/// boolean members literally (`{ done: false; }`) in missing-member
+/// elaborations while every other kind widens, so return-object member
+/// facts need the value (same probe as the const object subset).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnKind {
+    /// A numeric literal (`1`, `0x10`, …).
+    Number,
+    /// A string literal (`"ok"`, …).
+    String,
+    /// `true` / `false` (payload is the literal value).
+    Boolean(bool),
+    /// `null`.
+    Null,
+    /// The `undefined` identifier.
+    Undefined,
+    /// Any non-literal return (identifier, call, parenthesized, …).
+    NonLiteral,
+}
+
+/// One `{ ... }` member of a returned object literal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReturnMemberFact {
+    /// Member name (identifier keys only; anything else makes the body
+    /// [`FunctionBodyFact::Complex`]).
+    pub name: String,
+    /// Literal kind of the member value.
+    pub kind: ReturnKind,
+    /// Span of the member value expression.
+    pub span: Span,
+}
+
+/// A straight-line `return <expr>;`: literal kind + span, plus member facts
+/// when the returned expression is an object literal (literal order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SingleReturnFact {
+    /// Literal kind of the returned expression (`NonLiteral` for object
+    /// literals, whose shape lives in `members`).
+    pub kind: ReturnKind,
+    /// Span of the returned expression.
+    pub span: Span,
+    /// Member facts iff the returned expression is `{ ... }`.
+    pub members: Option<Vec<ReturnMemberFact>>,
+}
+
+/// Body shape of one function declaration.
+///
+/// Only [`FunctionBodyFact::SingleReturn`] feeds the solver; every other
+/// shape declines to a solver `UnsupportedDecl` with a distinct reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FunctionBodyFact {
+    /// Exactly one statement, `return <expr>;` with an argument.
+    SingleReturn(SingleReturnFact),
+    /// No body node: `declared` tells `declare function` apart from an
+    /// overload signature.
+    NoBody {
+        /// `true` for `declare function` (ambient, never has a body).
+        declared: bool,
+    },
+    /// A body with no statements (directives do not count).
+    Empty,
+    /// Anything else: multiple returns, branches, loops, bare or missing
+    /// `return`, spreads/methods/computed keys in a returned literal.
+    Complex,
+}
+
 /// Everything Pith owns after a frontend pass. Arenas are dropped on return.
 #[derive(Clone, Debug)]
 pub struct ParsedFile {
@@ -168,6 +302,9 @@ pub struct ParsedFile {
     /// One fact per `const` declarator (identifier bindings only), in
     /// source order. Empty when the file declares no consts.
     pub decls: Vec<DeclFact>,
+    /// One fact per named `function` declaration, in source (visitor) order.
+    /// Empty when the file declares no functions.
+    pub functions: Vec<FunctionFact>,
     /// Parser + semantic diagnostics as plain strings (codes deferred to P008).
     pub errors: Vec<String>,
 }
@@ -184,7 +321,7 @@ fn slice_at(source: &str, span: oxc_span::Span) -> Option<&str> {
     source.get(lo..hi)
 }
 
-/// Targeted `const`-declarator collector: a syntactic [`Visit`] pass, so no
+/// Targeted declarator collector: a syntactic [`Visit`] pass, so no
 /// `AstNodes` store is built (see the module-level build-mode note). All
 /// facts are Pith-owned; nothing borrowed escapes the pass.
 #[derive(Debug)]
@@ -200,6 +337,154 @@ struct DeclCollector<'a> {
     /// carried so each [`DeclFact`] records its declarator scope directly).
     scopes: std::collections::HashMap<u32, u32>,
     decls: Vec<DeclFact>,
+    functions: Vec<FunctionFact>,
+}
+
+/// Builds the colon-stripped annotation fact for a `TSTypeAnnotation` span
+/// (`: number` -> `"number"`), or `None` when the span does not slice (only
+/// possible with recovery from parse errors).
+fn annotation_fact(source: &str, file: FileId, span: oxc_span::Span) -> Option<AnnotationFact> {
+    let raw = slice_at(source, span)?;
+    Some(AnnotationFact {
+        text: raw.trim_start_matches(':').trim().to_owned(),
+        span: Span {
+            file,
+            lo: span.start,
+            hi: span.end,
+        },
+    })
+}
+
+/// Nearest same-name symbol at or before `start`: the overload-merge owner.
+///
+/// Oxc folds overload signatures into the first declaration's symbol, whose
+/// span precedes every merged overload. Callers try the exact
+/// `(name, start)` key first: shadowing never reaches here (each shadow has
+/// its own exact-span symbol), so a hit here is a merged redeclaration.
+/// Returns `None` when no same-name symbol precedes — then the caller skips
+/// rather than inventing.
+fn nearest_preceding_symbol(
+    symbols: &std::collections::HashMap<(String, u32), u32>,
+    name: &str,
+    start: u32,
+) -> Option<u32> {
+    symbols
+        .iter()
+        .filter(|((candidate, _), _)| candidate.as_str() == name)
+        .filter_map(|((_, candidate_start), index)| {
+            (*candidate_start <= start).then_some((*candidate_start, *index))
+        })
+        .max_by_key(|(candidate_start, _)| *candidate_start)
+        .map(|(_, index)| index)
+}
+
+/// Classifies one returned/member value expression into its literal kind.
+///
+/// Only plain literals classify; identifiers other than `undefined`,
+/// parenthesized expressions, and every other shape are [`ReturnKind::NonLiteral`]
+/// (expression facts the adapter does not emit yet) — exactly like const
+/// initializer classification.
+fn return_kind(source: &str, expression: &Expression<'_>) -> ReturnKind {
+    match expression {
+        Expression::NumericLiteral(_) => ReturnKind::Number,
+        Expression::StringLiteral(_) => ReturnKind::String,
+        Expression::BooleanLiteral(literal) => ReturnKind::Boolean(literal.value),
+        Expression::NullLiteral(_) => ReturnKind::Null,
+        Expression::Identifier(ident) => {
+            if slice_at(source, ident.span).is_some_and(|text| text == "undefined") {
+                ReturnKind::Undefined
+            } else {
+                ReturnKind::NonLiteral
+            }
+        }
+        _ => ReturnKind::NonLiteral,
+    }
+}
+
+/// Classifies a returned `{ ... }` literal into member facts (literal
+/// order), or `None` when a member is unrepresentable (spread, method,
+/// accessor, computed or non-identifier key): the caller marks the body
+/// [`FunctionBodyFact::Complex`] instead of mis-keying.
+fn return_members(
+    source: &str,
+    file: FileId,
+    properties: &[ObjectPropertyKind<'_>],
+) -> Option<Vec<ReturnMemberFact>> {
+    let mut members = Vec::with_capacity(properties.len());
+    for property in properties {
+        let ObjectPropertyKind::ObjectProperty(member) = property else {
+            return None;
+        };
+        if member.method || member.computed || member.kind != PropertyKind::Init {
+            return None;
+        }
+        let PropertyKey::StaticIdentifier(key) = &member.key else {
+            return None;
+        };
+        let name = slice_at(source, key.span)?;
+        let span = member.value.span();
+        members.push(ReturnMemberFact {
+            name: name.to_owned(),
+            kind: return_kind(source, &member.value),
+            span: Span {
+                file,
+                lo: span.start,
+                hi: span.end,
+            },
+        });
+    }
+    Some(members)
+}
+
+/// Classifies one function body into its [`FunctionBodyFact`].
+///
+/// `declared` is the `declare` modifier off the `Function` node (ambient
+/// declarations never carry a body node); it only surfaces on
+/// [`FunctionBodyFact::NoBody`].
+fn function_body_fact(
+    source: &str,
+    file: FileId,
+    body: Option<&FunctionBody<'_>>,
+    declared: bool,
+) -> FunctionBodyFact {
+    let Some(body) = body else {
+        return FunctionBodyFact::NoBody { declared };
+    };
+    if body.statements.is_empty() {
+        return FunctionBodyFact::Empty;
+    }
+    if body.statements.len() != 1 {
+        return FunctionBodyFact::Complex;
+    }
+    let Statement::ReturnStatement(ret) = &body.statements[0] else {
+        return FunctionBodyFact::Complex;
+    };
+    let Some(argument) = ret.argument.as_ref() else {
+        // Bare `return;`: no literal kind to record.
+        return FunctionBodyFact::Complex;
+    };
+    let span = argument.span();
+    let span = Span {
+        file,
+        lo: span.start,
+        hi: span.end,
+    };
+    if let Expression::ObjectExpression(object) = argument {
+        let Some(members) = return_members(source, file, &object.properties) else {
+            return FunctionBodyFact::Complex;
+        };
+        FunctionBodyFact::SingleReturn(SingleReturnFact {
+            kind: ReturnKind::NonLiteral,
+            span,
+            members: Some(members),
+        })
+    } else {
+        FunctionBodyFact::SingleReturn(SingleReturnFact {
+            kind: return_kind(source, argument),
+            span,
+            members: None,
+        })
+    }
 }
 
 impl DeclCollector<'_> {
@@ -217,17 +502,10 @@ impl DeclCollector<'_> {
             return;
         };
 
-        let annotation = declarator.type_annotation.as_ref().and_then(|ann| {
-            let raw = slice_at(self.source, ann.span)?;
-            Some(AnnotationFact {
-                text: raw.trim_start_matches(':').trim().to_owned(),
-                span: Span {
-                    file: self.file,
-                    lo: ann.span.start,
-                    hi: ann.span.end,
-                },
-            })
-        });
+        let annotation = declarator
+            .type_annotation
+            .as_ref()
+            .and_then(|ann| annotation_fact(self.source, self.file, ann.span));
 
         let init = declarator.init.as_ref().map(|expression| {
             let span = expression.span();
@@ -262,6 +540,88 @@ impl DeclCollector<'_> {
             init,
         });
     }
+
+    /// Records one function when it is a named function declaration.
+    ///
+    /// Function expressions, arrows, and methods never reach a fact (the
+    /// `FunctionType` gate); anonymous default exports have no binding to
+    /// key on. Identifier parameters record name + annotated-ness; any
+    /// other pattern (including a non-identifier rest element) sets
+    /// `params_complex` and stops the list rather than mis-keying.
+    fn record_function(&mut self, func: &Function<'_>) {
+        if !matches!(
+            func.r#type,
+            FunctionType::FunctionDeclaration | FunctionType::TSDeclareFunction
+        ) {
+            return;
+        }
+        let Some(id) = func.id.as_ref() else {
+            return;
+        };
+        let name = slice_at(self.source, id.span);
+        let Some(name) = name else { return };
+        let Some(symbol) = self
+            .symbols
+            .get(&(name.to_owned(), id.span.start))
+            .copied()
+            .or_else(|| nearest_preceding_symbol(&self.symbols, name, id.span.start))
+        else {
+            // No matching symbol (only possible with recovery from parse
+            // errors): skip rather than invent a key.
+            return;
+        };
+
+        let mut params = Vec::new();
+        let mut params_complex = false;
+        for item in &func.params.items {
+            let BindingPattern::BindingIdentifier(binding) = &item.pattern else {
+                params_complex = true;
+                break;
+            };
+            let Some(param) = slice_at(self.source, binding.span) else {
+                params_complex = true;
+                break;
+            };
+            params.push(FunctionParamFact {
+                name: param.to_owned(),
+                annotated: item.type_annotation.is_some(),
+            });
+        }
+        if !params_complex {
+            if let Some(rest) = func.params.rest.as_ref() {
+                match &rest.rest.argument {
+                    BindingPattern::BindingIdentifier(binding) => {
+                        match slice_at(self.source, binding.span) {
+                            Some(param) => params.push(FunctionParamFact {
+                                name: param.to_owned(),
+                                annotated: rest.type_annotation.is_some(),
+                            }),
+                            None => {
+                                params_complex = true;
+                            }
+                        }
+                    }
+                    _ => {
+                        params_complex = true;
+                    }
+                }
+            }
+        }
+
+        let return_annotation = func
+            .return_type
+            .as_ref()
+            .and_then(|ann| annotation_fact(self.source, self.file, ann.span));
+        let body = function_body_fact(self.source, self.file, func.body.as_deref(), func.declare);
+        self.functions.push(FunctionFact {
+            symbol,
+            scope: self.scopes.get(&symbol).copied().unwrap_or(u32::MAX),
+            params,
+            params_complex,
+            return_annotation,
+            body,
+        });
+    }
 }
 
 impl<'a> Visit<'a> for DeclCollector<'a> {
@@ -274,6 +634,13 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
         // Keep walking: initializers may nest functions/blocks that declare
         // their own consts (`const f = () => { const y = 1; … }`).
         walk::walk_variable_declaration(self, it);
+    }
+
+    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        self.record_function(it);
+        // Keep walking: bodies nest consts and further function declarations
+        // (`function o() { const y = 1; function i() { return y; } … }`).
+        walk::walk_function(self, it, flags);
     }
 }
 
@@ -370,7 +737,7 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         })
         .collect();
 
-    let decls = collect_decls(file, source, &parse.program, &symbols);
+    let (decls, functions) = collect_decls(file, source, &parse.program, &symbols);
     ParsedFile {
         file,
         scopes,
@@ -378,21 +745,22 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         unresolved,
         imports,
         decls,
+        functions,
         errors,
     }
 }
 
-/// Runs the targeted `const`-declarator walk and returns owned facts.
+/// Runs the targeted declarator walk and returns owned facts.
 ///
 /// Symbol linkage resolves each declarator's `(name, binding start)` to the
 /// per-file [`SymbolFact`] index built above; facts come out in source
-/// (visitor) order, so the sequence is deterministic.
+/// (visitor) order, so the sequences are deterministic.
 fn collect_decls<'a>(
     file: FileId,
     source: &'a str,
     program: &Program<'a>,
     symbols: &[SymbolFact],
-) -> Vec<DeclFact> {
+) -> (Vec<DeclFact>, Vec<FunctionFact>) {
     let mut index_of = std::collections::HashMap::new();
     let mut scope_of = std::collections::HashMap::new();
     for symbol in symbols {
@@ -409,9 +777,10 @@ fn collect_decls<'a>(
         symbols: index_of,
         scopes: scope_of,
         decls: Vec::new(),
+        functions: Vec::new(),
     };
     collector.visit_program(program);
-    collector.decls
+    (collector.decls, collector.functions)
 }
 
 #[cfg(test)]
@@ -875,5 +1244,210 @@ export function f(a: string): string { return a + b; }
         assert_eq!((second_symbol.span.lo, second_symbol.span.hi), (39, 40));
         assert!(second.annotation.is_none());
         assert!(second.init.is_none());
+    }
+
+    /// Slices `src` at a fact span (the roundtrip every span below must satisfy).
+    fn slice_of(src: &str, span: Span) -> &str {
+        &src[span.lo as usize..span.hi as usize]
+    }
+
+    #[test]
+    fn function_facts_single_return_exact_spans() {
+        let src = "function add(a: number): number {\n  return 1;\n}\n";
+        let pf = parse_module(FileId(0), "f.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        let fact = &pf.functions[0];
+        let symbol = &pf.symbols[usize::try_from(fact.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "add");
+        assert_eq!((symbol.span.lo, symbol.span.hi), (9, 12));
+        assert_eq!(symbol.span.file, FileId(0));
+        assert_eq!(fact.scope, symbol.scope);
+        assert!(!fact.params_complex);
+        assert_eq!(fact.params.len(), 1);
+        assert_eq!(fact.params[0].name, "a");
+        assert!(fact.params[0].annotated);
+        let annotation = fact.return_annotation.as_ref().expect("annotated");
+        assert_eq!(annotation.text, "number");
+        assert_eq!(slice_of(src, annotation.span), ": number");
+        assert_eq!(annotation.span.file, FileId(0));
+        let FunctionBodyFact::SingleReturn(ret) = &fact.body else {
+            panic!("expected single return, got {:?}", fact.body);
+        };
+        assert_eq!(ret.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, ret.span), "1");
+        assert!(ret.members.is_none());
+    }
+
+    #[test]
+    fn function_facts_export_overload_declare_empty() {
+        let src = "export function greet(name: string): string {\n  return \"ok\";\n}\n\
+                   function empty(): void {}\n\
+                   declare function ambient(a: number): number;\n\
+                   function over(a: number): number;\n\
+                   function over(a: string): string {\n  return \"ok\";\n}\n";
+        let pf = parse_module(FileId(0), "o.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 5);
+        let names: Vec<&str> = pf
+            .functions
+            .iter()
+            .map(|fact| {
+                pf.symbols[usize::try_from(fact.symbol).expect("dense symbol index")]
+                    .name
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(names, ["greet", "empty", "ambient", "over", "over"]);
+        // Exported declarations are still declarations.
+        let greet = &pf.functions[0];
+        assert_eq!(greet.params.len(), 1);
+        assert_eq!(greet.params[0].name, "name");
+        assert!(greet.params[0].annotated);
+        let greet_ann = greet.return_annotation.as_ref().expect("annotated");
+        assert_eq!(greet_ann.text, "string");
+        assert_eq!(slice_of(src, greet_ann.span), ": string");
+        let FunctionBodyFact::SingleReturn(ret) = &greet.body else {
+            panic!("expected single return, got {:?}", greet.body);
+        };
+        assert_eq!(ret.kind, ReturnKind::String);
+        assert_eq!(slice_of(src, ret.span), "\"ok\"");
+        // Statement-less bodies are empty, not complex.
+        assert_eq!(pf.functions[1].body, FunctionBodyFact::Empty);
+        let empty_ann = pf.functions[1]
+            .return_annotation
+            .as_ref()
+            .expect("annotated");
+        assert_eq!(empty_ann.text, "void");
+        // Ambient declarations carry the flag on a body-less fact.
+        assert_eq!(
+            pf.functions[2].body,
+            FunctionBodyFact::NoBody { declared: true }
+        );
+        // Overload signatures are body-less without the flag; the
+        // implementation is a normal single return.
+        assert_eq!(
+            pf.functions[3].body,
+            FunctionBodyFact::NoBody { declared: false }
+        );
+        let FunctionBodyFact::SingleReturn(over) = &pf.functions[4].body else {
+            panic!("expected single return, got {:?}", pf.functions[4].body);
+        };
+        assert_eq!(over.kind, ReturnKind::String);
+    }
+
+    #[test]
+    fn function_facts_complex_shapes() {
+        let src = "function multi(n: number): number {\n  return 1;\n  return 2;\n}\n\
+                   function branch(flag: boolean): number {\n  if (flag) {\n    return 1;\n  }\n  return 2;\n}\n\
+                   function bare(n: number): void {\n  return;\n}\n\
+                   function silent(n: number): void {\n  console.log(n);\n}\n\
+                   function ident(n: number): number {\n  return n;\n}\n\
+                   function outer(): number {\n  function inner(): number {\n    return 2;\n  }\n  return 1;\n}\n";
+        let pf = parse_module(FileId(0), "c.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        // Visitor order is pre-order: `inner` follows its enclosing `outer`.
+        assert_eq!(pf.functions.len(), 7);
+        let names: Vec<&str> = pf
+            .functions
+            .iter()
+            .map(|fact| {
+                pf.symbols[usize::try_from(fact.symbol).expect("dense symbol index")]
+                    .name
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["multi", "branch", "bare", "silent", "ident", "outer", "inner"]
+        );
+        for fact in pf.functions.iter().take(4) {
+            assert_eq!(fact.body, FunctionBodyFact::Complex);
+        }
+        // A single non-literal return stays a single return (the solver, not
+        // the adapter, declines it).
+        let FunctionBodyFact::SingleReturn(ident) = &pf.functions[4].body else {
+            panic!("expected single return, got {:?}", pf.functions[4].body);
+        };
+        assert_eq!(ident.kind, ReturnKind::NonLiteral);
+        assert_eq!(slice_of(src, ident.span), "n");
+        assert!(ident.members.is_none());
+        // An inner declaration is a statement: the outer body is complex
+        // while the nested declaration still gets its own fact.
+        assert_eq!(pf.functions[5].body, FunctionBodyFact::Complex);
+        let FunctionBodyFact::SingleReturn(inner) = &pf.functions[6].body else {
+            panic!("expected single return, got {:?}", pf.functions[6].body);
+        };
+        assert_eq!(inner.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, inner.span), "2");
+    }
+
+    #[test]
+    fn function_facts_object_return_members() {
+        let src = "function point(): { x: number; done: boolean } {\n  return { x: 1, done: false };\n}\n";
+        let pf = parse_module(FileId(0), "p.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        let fact = &pf.functions[0];
+        assert!(fact.params.is_empty());
+        assert!(!fact.params_complex);
+        let annotation = fact.return_annotation.as_ref().expect("annotated");
+        assert_eq!(annotation.text, "{ x: number; done: boolean }");
+        assert_eq!(
+            slice_of(src, annotation.span),
+            ": { x: number; done: boolean }"
+        );
+        let FunctionBodyFact::SingleReturn(ret) = &fact.body else {
+            panic!("expected single return, got {:?}", fact.body);
+        };
+        // Object returns park the shape in `members`, not `kind`.
+        assert_eq!(ret.kind, ReturnKind::NonLiteral);
+        assert_eq!(slice_of(src, ret.span), "{ x: 1, done: false }");
+        let members = ret.members.as_ref().expect("object members");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].name, "x");
+        assert_eq!(members[0].kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, members[0].span), "1");
+        assert_eq!(members[1].name, "done");
+        assert_eq!(members[1].kind, ReturnKind::Boolean(false));
+        assert_eq!(slice_of(src, members[1].span), "false");
+    }
+
+    #[test]
+    fn function_facts_object_spread_is_complex() {
+        let src =
+            "function spread(base: { x: number }): { x: number } {\n  return { ...base };\n}\n";
+        let pf = parse_module(FileId(0), "s.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        assert_eq!(pf.functions[0].body, FunctionBodyFact::Complex);
+    }
+
+    #[test]
+    fn function_facts_params_and_excluded_shapes() {
+        let src = "function mixed(a: number, b, ...rest: string[]): number {\n  return 1;\n}\n\
+                   function destructured({x}: { x: number }): number {\n  return 1;\n}\n\
+                   const arrow = (n: number): number => n;\n\
+                   let expr = function named(n: number): number {\n  return n;\n};\n\
+                   const obj = { pick(n: number): number { return n; } };\n\
+                   class Box { get(n: number): number { return n; } }\n";
+        let pf = parse_module(FileId(0), "x.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        // Arrows, function expressions, and methods bind symbols but emit no
+        // function facts.
+        assert_eq!(pf.functions.len(), 2);
+        let mixed = &pf.functions[0];
+        assert!(!mixed.params_complex);
+        let names: Vec<&str> = mixed
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b", "rest"]);
+        let annotated: Vec<bool> = mixed.params.iter().map(|param| param.annotated).collect();
+        assert_eq!(annotated, [true, false, true]);
+        let destructured = &pf.functions[1];
+        assert!(destructured.params_complex);
+        assert!(destructured.params.is_empty());
     }
 }
