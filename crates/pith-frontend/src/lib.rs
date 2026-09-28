@@ -1,16 +1,45 @@
 //! Pith frontend adapter (Oxc boundary).
 //!
-//! Provenance: Oxc 0.152.0 (MIT), oxc-project/oxc. Re-check latest 0.15x at
-//! each kickoff; exact pins + Cargo.lock committed.
+//! Provenance: Oxc 0.152.0 (MIT), oxc-project/oxc. Re-checked 2026-09-28:
+//! 0.152.0 is still the latest 0.15x on crates.io, so no bump. Exact `=`
+//! pins + Cargo.lock committed.
 //!
 //! Boundary law: everything Oxc-typed dies inside [`parse_module`]. Callers
 //! receive only Pith-owned facts keyed by [`FileId`]. No `oxc_*` type may
 //! appear in any other `pith-*` crate's public API.
+//!
+//! Declaration facts (P010): [`ParsedFile::decls`] carries one [`DeclFact`]
+//! per `const` declarator with a simple identifier binding, pairing the
+//! annotation text and span ([`AnnotationFact`]) with the initializer
+//! literal kind and span ([`InitFact`]/[`InitKind`]). Each fact keys to its
+//! owning [`SymbolFact`] by per-file symbol index. These replace the
+//! solver's hand-fed `ConstDecl` seam (the `DeclAnnotationFact` plus
+//! `InitLiteralFact` BLOCKER in `pith-solver`).
+//!
+//! Build-mode decision (P010): the declarator walk uses
+//! `oxc_ast_visit::Visit` over the already-parsed program — NOT
+//! `SemanticBuilder::with_build_nodes(true)`. Rationale: declarators are
+//! purely syntactic, so the visitor reaches every one (top level, nested
+//! blocks/functions, `export const`, `for(const ... of ...)`) with a single
+//! O(n) pass and zero change to the semantic build; enabling `AstNodes`
+//! would materialize a node arena plus parent maps for every file just to
+//! rediscover the same declarators. Measurement: no local Rust toolchain is
+//! available to this task (CTO verifies remotely on E2B), so the
+//! with/without-`AstNodes` semantic-build delta is recorded as unknown; the
+//! semantic-build configuration is unchanged by this task, and the added
+//! cost is one linear visitor pass. Destructured bindings (`const {a} = …`)
+//! bind many symbols per declarator and are skipped — outside the solver
+//! subset, never silently mis-keyed.
 
 use oxc_allocator::Allocator;
+use oxc_ast::ast::{
+    BindingPattern, Expression, Program, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
+};
+use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 use pith_ids::{FileId, Span};
 
 /// Saturating `usize` -> `u32` for per-file fact indices (files never approach
@@ -63,6 +92,67 @@ pub struct ImportFact {
     pub span: Span,
 }
 
+/// Annotation on one `const` declarator: raw type text plus its span.
+///
+/// `span` is the raw `TSTypeAnnotation` range (colon-inclusive: `: number`
+/// spans the colon through the type). `text` is the source slice of that
+/// range with the leading colon stripped (`"number"`, `"number | string"`),
+/// so it feeds the solver's annotation map (and its `'|'` union check)
+/// directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnotationFact {
+    pub text: String,
+    pub span: Span,
+}
+
+/// Initializer literal kind, mirroring the solver's subset.
+///
+/// Only primitive literals are classifiable. Anything else (`other`,
+/// `{...}`, `f()`, `` `tpl` ``, `-1`, …) is [`InitKind::NonLiteral`] —
+/// expression facts the adapter does not emit yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitKind {
+    /// A numeric literal (`1`, `0x10`, …).
+    Number,
+    /// A string literal (`"ok"`, …).
+    String,
+    /// `true` / `false`.
+    Boolean,
+    /// `null`.
+    Null,
+    /// The `undefined` identifier.
+    Undefined,
+    /// Any non-literal initializer (identifier, object, call, …).
+    NonLiteral,
+}
+
+/// Initializer on one `const` declarator: literal kind plus span.
+///
+/// `span` is the initializer expression's own range (`None` on
+/// [`DeclFact::init`] means no initializer at all, e.g. `declare const`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitFact {
+    pub kind: InitKind,
+    pub span: Span,
+}
+
+/// One `const` declarator's declaration facts, keyed to its symbol.
+///
+/// `symbol` is the per-file index into [`ParsedFile::symbols`] of the
+/// [`SymbolFact`] for the same declarator (matched on binding name +
+/// binding start; declaration order in [`ParsedFile::decls`] is source
+/// order). Only simple-identifier bindings produce facts; destructured
+/// declarators are skipped (see the module-level build-mode note).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclFact {
+    /// Per-file symbol index of the declarator's binding.
+    pub symbol: u32,
+    /// Raw annotation text + span; `None` means unannotated.
+    pub annotation: Option<AnnotationFact>,
+    /// Initializer literal kind + span; `None` means no initializer.
+    pub init: Option<InitFact>,
+}
+
 /// Everything Pith owns after a frontend pass. Arenas are dropped on return.
 #[derive(Clone, Debug)]
 pub struct ParsedFile {
@@ -71,12 +161,113 @@ pub struct ParsedFile {
     pub symbols: Vec<SymbolFact>,
     pub unresolved: Vec<UnresolvedFact>,
     pub imports: Vec<ImportFact>,
+    /// One fact per `const` declarator (identifier bindings only), in
+    /// source order. Empty when the file declares no consts.
+    pub decls: Vec<DeclFact>,
     /// Parser + semantic diagnostics as plain strings (codes deferred to P008).
     pub errors: Vec<String>,
 }
 
-// Gap (P005): per-reference spans need AstNodes; v1 records counts + names.
+// Gap (P005, narrowed by P010): declaration facts (`decls`) are now present;
+// per-reference spans still need AstNodes — v1 records counts + names.
 // Freshness-relevant occurrence identity will key off NodeId in P005/P006.
+
+// Byte slice of `source` at an Oxc span, or `None` when out of bounds
+// (defensive only: spans the parser hands us always slice cleanly).
+fn slice_at(source: &str, span: oxc_span::Span) -> Option<&str> {
+    let lo = usize::try_from(span.start).ok()?;
+    let hi = usize::try_from(span.end).ok()?;
+    source.get(lo..hi)
+}
+
+/// Targeted `const`-declarator collector: a syntactic [`Visit`] pass, so no
+/// `AstNodes` store is built (see the module-level build-mode note). All
+/// facts are Pith-owned; nothing borrowed escapes the pass.
+#[derive(Debug)]
+struct DeclCollector<'a> {
+    file: FileId,
+    source: &'a str,
+    /// `(binding name, binding start)` -> per-file symbol index. Keyed on
+    /// the start (not the full span) so ESTree-style annotation-extended
+    /// ranges can never mis-key; `(name, start)` is injective — one token,
+    /// one binding.
+    symbols: std::collections::HashMap<(String, u32), u32>,
+    decls: Vec<DeclFact>,
+}
+
+impl DeclCollector<'_> {
+    /// Records one declarator when it is a `const` identifier binding.
+    /// Destructured patterns bind many symbols and are skipped.
+    fn record_declarator(&mut self, declarator: &VariableDeclarator<'_>) {
+        let BindingPattern::BindingIdentifier(binding) = &declarator.id else {
+            return;
+        };
+        let name = slice_at(self.source, binding.span);
+        let Some(name) = name else { return };
+        let Some(&symbol) = self.symbols.get(&(name.to_owned(), binding.span.start)) else {
+            // No matching symbol (only possible with recovery from parse
+            // errors): skip rather than invent a key.
+            return;
+        };
+
+        let annotation = declarator.type_annotation.as_ref().and_then(|ann| {
+            let raw = slice_at(self.source, ann.span)?;
+            Some(AnnotationFact {
+                text: raw.trim_start_matches(':').trim().to_owned(),
+                span: Span {
+                    file: self.file,
+                    lo: ann.span.start,
+                    hi: ann.span.end,
+                },
+            })
+        });
+
+        let init = declarator.init.as_ref().map(|expression| {
+            let span = expression.span();
+            let kind = match expression {
+                Expression::NumericLiteral(_) => InitKind::Number,
+                Expression::StringLiteral(_) => InitKind::String,
+                Expression::BooleanLiteral(_) => InitKind::Boolean,
+                Expression::NullLiteral(_) => InitKind::Null,
+                Expression::Identifier(ident) => {
+                    if slice_at(self.source, ident.span).is_some_and(|text| text == "undefined") {
+                        InitKind::Undefined
+                    } else {
+                        InitKind::NonLiteral
+                    }
+                }
+                _ => InitKind::NonLiteral,
+            };
+            InitFact {
+                kind,
+                span: Span {
+                    file: self.file,
+                    lo: span.start,
+                    hi: span.end,
+                },
+            }
+        });
+
+        self.decls.push(DeclFact {
+            symbol,
+            annotation,
+            init,
+        });
+    }
+}
+
+impl<'a> Visit<'a> for DeclCollector<'a> {
+    fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+        if matches!(it.kind, VariableDeclarationKind::Const) {
+            for declarator in &it.declarations {
+                self.record_declarator(declarator);
+            }
+        }
+        // Keep walking: initializers may nest functions/blocks that declare
+        // their own consts (`const f = () => { const y = 1; … }`).
+        walk::walk_variable_declaration(self, it);
+    }
+}
 
 /// Parse TypeScript source into Pith-owned facts.
 ///
@@ -168,14 +359,45 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         })
         .collect();
 
+    let decls = collect_decls(file, source, &parse.program, &symbols);
     ParsedFile {
         file,
         scopes,
         symbols,
         unresolved,
         imports,
+        decls,
         errors,
     }
+}
+
+/// Runs the targeted `const`-declarator walk and returns owned facts.
+///
+/// Symbol linkage resolves each declarator's `(name, binding start)` to the
+/// per-file [`SymbolFact`] index built above; facts come out in source
+/// (visitor) order, so the sequence is deterministic.
+fn collect_decls<'a>(
+    file: FileId,
+    source: &'a str,
+    program: &Program<'a>,
+    symbols: &[SymbolFact],
+) -> Vec<DeclFact> {
+    let mut index_of = std::collections::HashMap::new();
+    for symbol in symbols {
+        let previous = index_of.insert((symbol.name.clone(), symbol.span.lo), symbol.index);
+        debug_assert!(
+            previous.is_none(),
+            "duplicate (name, binding-start) symbol key"
+        );
+    }
+    let mut collector = DeclCollector {
+        file,
+        source,
+        symbols: index_of,
+        decls: Vec::new(),
+    };
+    collector.visit_program(program);
+    collector.decls
 }
 
 #[cfg(test)]
