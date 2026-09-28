@@ -22,12 +22,18 @@
 //! by name. Rebuilding the same facts into a fresh [`Binder`] therefore yields
 //! identical iteration order.
 //!
+//! Cross-file module resolution lives in [`multifile`]: specifiers to
+//! [`FileId`]s, imports to declaring files, over driver-adapted module facts.
+//!
 //! Scope-index convention: per-file scope indices come from the frontend with
 //! the root at 0. A parent of `u32::MAX` means "no parent" (the root).
 
 use std::collections::{BTreeMap, HashMap};
 
 use pith_ids::{FileId, Span, SymbolId};
+
+/// Cross-file module resolution (specifiers to files, imports to declarations).
+pub mod multifile;
 
 /// Converts a `u32` per-file index into a `usize` position for `Vec` lookup.
 ///
