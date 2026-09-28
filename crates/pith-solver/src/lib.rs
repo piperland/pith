@@ -138,6 +138,76 @@
 //! (type aliases, classes, and driver skew are all non-interface targets —
 //! recorded, never verdict).
 //!
+//! Enums as types (P018, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p018-probes/`):
+//!
+//! - Numeric literals check by VALUE against the enum's numeric members:
+//!   `const a: Color = 1` is clean when a member holds `1`, while `5`
+//!   diagnoses `TS2322: Type '5' is not assignable to type 'Color'.`
+//!   (literal-type spelling, values not source text: `0x2` against
+//!   `{ A = 0, B = 1 }` spells `Type '2'`; `1.0` matches `1`).
+//! - String literals NEVER match, even member values: `const g: Str = "a"`
+//!   diagnoses `TS2322: Type '"a"' is not assignable to type 'Str'.`
+//!   (double-quote spelling — fixtures stay double-quoted). Booleans spell
+//!   literally (`Type 'true'`); `null`/`undefined` spell widened.
+//! - Member accesses (`Color.Red`, `Color["Red"]`) are clean in tsc but
+//!   inexpressible without expression facts: non-literal initializers
+//!   decline (the largest pinned oracle-clean divergence here).
+//! - Object literals diagnose compositionally (`Type '{}' is not assignable
+//!   to type 'Color'.`); missing initializers decline with the usual reason.
+//! - `const enum` behaves identically (probed: `0` clean, `7` errors) —
+//!   noted, never forked. Ambient (`declare`) enums accept every literal in
+//!   tsc, so the solver declines them (pinned oracle-clean divergence).
+//! - Computed members (identifiers, `-1`, calls, cross-references like
+//!   `B = A`) decline the whole enum: tsc folds computed values in, which
+//!   needs const-eval the subset refuses. Auto-increment past numeric
+//!   literals is facts; anything else unknowable declines at the member.
+//!
+//! Namespaces as scope containers (P018, probed on tsc 7.0.2):
+//!
+//! - Qualified annotations resolve through binder scopes: `NS.Dir` checks
+//!   like `Dir` but spells the SHORT name (`Type '9' is not assignable to
+//!   type 'Dir'.`); `NS.Point` runs the interface path spelling `Point`
+//!   (`TS2741`/`TS2353`/`TS2322` families intact, wrong > excess >
+//!   missing). The display rule is uniform: the annotation minus its leading
+//!   namespace qualification (`NS.Dir.Up` spells `Dir.Up`, `Color.Red`
+//!   spells `Color.Red` — each probed).
+//! - Missing AND non-exported members both diagnose `TS2694: Namespace 'NS'
+//!   has no exported member 'Nope'.` (the qualifier names the full resolved
+//!   prefix: `NS.Dir.Nope` spells `Namespace 'NS.Dir'`, `Color.Nope` spells
+//!   `Namespace 'Color'` — each probed). Export visibility is facts
+//!   (`exported`, plus `exported_members` for values), except inside ambient
+//!   namespaces where every member shows (probed tsc 7.0.2).
+//! - A bare namespace as a type diagnoses `TS2709: Cannot use namespace 'NS'
+//!   as a type.` — single-name only (probed, even for value-only
+//!   namespaces). A TRAILING namespace in a qualified path instead diagnoses
+//!   `TS2749: 'WithTypes.Inner' refers to a value, but is being used as a
+//!   type here. Did you mean 'typeof WithTypes.Inner'?` (probed: the rule is
+//!   positional, so the solver mirrors each position exactly).
+//! - Qualifying past an interface diagnoses `TS2713: Cannot access 'Point.X'
+//!   because 'Point' is a type, but not a namespace. …` (probed; mirrored
+//!   for one leftover segment, deeper leftovers decline).
+//! - Exported non-type members (`NS.VAL` as a type) error `TS2749` in tsc,
+//!   but the subset cannot tell values from type aliases without value
+//!   facts, so they decline instead (pinned divergence — never a wrong
+//!   `TS2694`, which would claim the member is hidden). Trailing
+//!   NAMESPACES still mirror `TS2749`: their identity is a shape fact, so
+//!   no confusion is possible.
+//! - An unresolvable head already tracked as an unresolved reference skips
+//!   silently (the [`check_calls`] precedent: tracked once, never
+//!   double-diagnosed — tsc's `TS2503` is the folded differential).
+//! - Value positions (`NS.VAL` initializers, `NS.Dir.Up` uses) are clean in
+//!   tsc but inexpressible without expression facts: non-literal declines
+//!   (pinned oracle-clean divergences).
+//!
+//! [`check_enums`] routes each declaration: `{...}`/primitive/union
+//! spellings delegate to [`check_one`] unchanged; other names resolve to
+//! enum/interface shapes (single or namespace-qualified) and run the shared
+//! object/enum comparisons with the short-name spelling. Enum declarations
+//! skip the [`QueryDb`] memo (no [`TypeData`](pith_types::TypeData) shape
+//! exists for enums — the union precedent); interface/plain paths memoize
+//! exactly like before.
+//!
 //! Design law (H-002): literal freshness and every other per-occurrence
 //! verdict lives in query-side tables keyed by occurrence
 //! ([`NodeId`], see [`FreshnessTable`] plus the [`QueryDb`] memo entries),
@@ -165,6 +235,14 @@ pub const CODE_EXCESS_MEMBER: &str = "PITH2353";
 pub const CODE_ARITY: &str = "PITH2554";
 /// Code for call-site argument-type mismatches (oracle `TS2345`).
 pub const CODE_ARG_TYPE: &str = "PITH2345";
+/// Code for namespace member misses (oracle `TS2694`).
+pub const CODE_NO_EXPORTED_MEMBER: &str = "PITH2694";
+/// Code for namespaces used as types (oracle `TS2709`).
+pub const CODE_NAMESPACE_AS_TYPE: &str = "PITH2709";
+/// Code for values used as types (oracle `TS2749`).
+pub const CODE_VALUE_AS_TYPE: &str = "PITH2749";
+/// Code for qualifying past a type (oracle `TS2713`).
+pub const CODE_TYPE_NOT_NAMESPACE: &str = "PITH2713";
 
 /// One solver verdict: machine-comparable code plus anchored span.
 ///
@@ -2513,6 +2591,10 @@ fn classify_member_type(ty: &str) -> Result<TypeId, bool> {
 /// literal order for actual types).
 fn object_type_text(names: &[&str], types: &[&str]) -> String {
     debug_assert_eq!(names.len(), types.len());
+    if names.is_empty() {
+        // tsc spells the empty object type `{}` (probed 7.0.2), never `{ }`.
+        return "{}".to_owned();
+    }
     let mut text = String::from("{");
     for (name, ty) in names.iter().zip(types.iter()) {
         text.push(' ');
@@ -3087,6 +3169,127 @@ pub struct InterfaceShape {
     pub heritage: Vec<InterfaceHeritage>,
     /// `true` when the interface declares type parameters: declines.
     pub has_type_params: bool,
+    /// Whether the declaration was exported (gates qualified visibility,
+    /// except inside ambient namespaces).
+    pub exported: bool,
+}
+
+/// One enum member's constant value: literal values feed membership checks;
+/// computed members decline the whole enum with their reason.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EnumMemberValue {
+    /// A numeric literal initializer: the parsed value.
+    Number(f64),
+    /// A string literal initializer: the unescaped value (never matches a
+    /// literal — probed tsc 7.0.2 — but rides along for shape fidelity).
+    String(String),
+    /// Any non-literal initializer, missing increment base, or computed
+    /// member name: the solver declines enums holding one of these.
+    Computed {
+        /// Why no value is recorded (from the adapter's fact).
+        reason: String,
+    },
+}
+
+/// One enum member: name plus constant value.
+///
+/// Driver-mapped from the adapter's `EnumMemberFact` (mechanical field copy).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumMember {
+    /// Member name as written.
+    pub name: String,
+    /// Constant value, or the decline reason when uncomputable.
+    pub value: EnumMemberValue,
+    /// Span of the whole member.
+    pub span: Span,
+}
+
+/// One `enum` declaration available as an annotation target.
+///
+/// Driver-mapped from the adapter's `EnumFact` (mechanical field copy, plus
+/// the binder [`SymbolId`] resolved from the same [`Binder`] used for
+/// checking). `is_const` never forks checking (probed identical);
+/// `declared` (ambient) declines; `exported` gates qualified visibility.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumShape {
+    /// Enum name as written.
+    pub name: String,
+    /// Per-file scope index of the declaration (from the adapter's facts).
+    pub scope: u32,
+    /// Exact binder identity resolved from the checking [`Binder`]; shapes
+    /// with `None` never match (the driver must link — asserted in tests).
+    pub symbol: Option<SymbolId>,
+    /// Whole-declaration span.
+    pub span: Span,
+    /// Member facts in source order.
+    pub members: Vec<EnumMember>,
+    /// `true` for `const enum` (recorded only: checking is identical).
+    pub is_const: bool,
+    /// `true` for `declare enum` (ambient): the solver declines.
+    pub declared: bool,
+    /// Whether the declaration was exported (gates qualified visibility,
+    /// except inside ambient namespaces).
+    pub exported: bool,
+}
+
+/// One `namespace`/`module` block available as a qualification head.
+///
+/// Driver-mapped from the adapter's `NamespaceFact` (mechanical field copy,
+/// plus the binder [`SymbolId`] resolved from the same [`Binder`] used for
+/// checking). Tail members resolve from `body_scope` through the
+/// [`Binder`]; `declared` (ambient) lifts the export gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceShape {
+    /// Block name as written.
+    pub name: String,
+    /// Per-file scope index of the declaration (from the adapter's facts).
+    pub scope: u32,
+    /// Exact binder identity resolved from the checking [`Binder`]; shapes
+    /// with `None` never match (the driver must link — asserted in tests).
+    pub symbol: Option<SymbolId>,
+    /// Whole-declaration span.
+    pub span: Span,
+    /// Per-file scope index of the block's member scope (`u32::MAX` when
+    /// unknown: tail resolution from it always misses).
+    pub body_scope: u32,
+    /// `true` for `declare namespace` (ambient): the export gate lifts.
+    pub declared: bool,
+    /// Whether the block was exported (gates nested qualification).
+    pub exported: bool,
+    /// Names directly exported from this block (from the adapter's fact):
+    /// resolves the hidden (`TS2694`) vs exported-non-type (declined)
+    /// split for members no shape claims.
+    pub exported_members: Vec<String>,
+}
+
+/// One enum-annotated declaration to check: the [`ConstDecl`] seam plus a
+/// hand-fed literal-text seam.
+///
+/// `init_text` is the source slice of the initializer span (driver-sliced at
+/// the adapter's fact span, asserted in tests): numeric spellings parse to
+/// membership values, string/boolean spellings render verbatim. `None` for
+/// missing, non-literal, and object initializers (those paths never read
+/// it) — the same hand-fed seam as M1's `compute` closures and the
+/// [`GenericCall`] explicit type arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumDecl {
+    /// The declaration (spans/scopes/shapes as in [`check_file`]).
+    pub decl: ConstDecl,
+    /// Source slice of the initializer span for literal spellings.
+    pub init_text: Option<String>,
+}
+
+/// The shape tables one [`check_enums`] run resolves against, bundled so
+/// the per-decl helpers stay lean (pedantic arity discipline, mirroring
+/// [`GenericCallCtx`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumInput<'a> {
+    /// Enum shapes driver-mapped from adapter facts.
+    pub enums: &'a [EnumShape],
+    /// Interface shapes driver-mapped from adapter facts.
+    pub interfaces: &'a [InterfaceShape],
+    /// Namespace shapes driver-mapped from adapter facts.
+    pub namespaces: &'a [NamespaceShape],
 }
 
 /// Checks `const`/`let` declarators whose annotations may name interfaces.
@@ -3326,6 +3529,758 @@ fn check_interface_shape(
     finish_object_check(decl, span, &expected, annotation, ctx);
 }
 
+/// Checks `const`/`let` declarators whose annotations may name enums,
+/// interfaces, or namespace-qualified members.
+///
+/// Same [`ConstDecl`] seam as [`check_file`] (spans/scopes from adapter
+/// facts, shapes hand-fed until the adapter emits member facts), plus the
+/// hand-fed literal-text seam ([`EnumDecl::init_text`]) and the
+/// adapter-fed shape tables ([`EnumInput`]: enums, interfaces, and
+/// namespaces driver-mapped from facts with binder identities resolved from
+/// the checking [`Binder`]). Each declaration routes on its annotation text:
+/// `{...}`/primitive/union spellings delegate to [`check_one`] unchanged,
+/// while any other name resolves to a shape — single or
+/// namespace-qualified — and runs the enum comparison or the shared object
+/// comparison with the short-name spelling. See the module-level enum and
+/// namespace rules for families, spellings, and declines.
+#[must_use]
+pub fn check_enums(
+    file: FileId,
+    decls: &[EnumDecl],
+    input: &EnumInput<'_>,
+    binder: &Binder,
+    db: &mut QueryDb,
+) -> FileReport {
+    let mut freshness = FreshnessTable::default();
+    for (index, decl) in decls.iter().enumerate() {
+        if let Some(init) = decl.decl.init_object.as_ref() {
+            freshness
+                .fresh
+                .insert((file, occurrence_node(index)), init.fresh);
+        }
+    }
+    let mut report = FileReport::default();
+    for (index, decl) in decls.iter().enumerate() {
+        let mut route = EnumDeclCtx {
+            file,
+            node: occurrence_node(index),
+            decl,
+            input,
+            binder,
+            db: &mut *db,
+            freshness: &freshness,
+            report: &mut report,
+        };
+        route_enum_declaration(&mut route);
+    }
+    sort_report(&mut report);
+    report
+}
+
+/// Routing state for one [`check_enums`] declaration, bundled so the
+/// per-decl helpers stay lean (pedantic arity discipline, mirroring
+/// [`InterfaceDeclCtx`]).
+struct EnumDeclCtx<'a, 'b> {
+    file: FileId,
+    node: NodeId,
+    decl: &'a EnumDecl,
+    input: &'a EnumInput<'b>,
+    binder: &'a Binder,
+    db: &'a mut QueryDb,
+    freshness: &'a FreshnessTable,
+    report: &'a mut FileReport,
+}
+
+impl EnumDeclCtx<'_, '_> {
+    /// Plain spellings (and missing annotations) keep [`check_one`]'s
+    /// verdicts by construction.
+    fn delegate(&mut self) {
+        check_one(
+            self.file,
+            self.node,
+            &self.decl.decl,
+            self.binder,
+            &mut *self.db,
+            self.freshness,
+            &mut *self.report,
+        );
+    }
+
+    /// Pushes one [`UnsupportedDecl`] at `span`.
+    fn unsupported(&mut self, span: Span, reason: String) {
+        self.report.unsupported.push(UnsupportedDecl {
+            file: self.file,
+            span,
+            reason,
+        });
+    }
+
+    /// Pushes one [`PithDiagnostic`] at `span`.
+    fn diagnose(&mut self, span: Span, code: &str, message: String) {
+        self.report.diagnostics.push(PithDiagnostic {
+            code: code.to_owned(),
+            file: self.file,
+            span,
+            message,
+        });
+    }
+
+    /// Runs the shared object comparison for a resolved interface shape
+    /// with `display` as the expected-type spelling (the short name for
+    /// qualified annotations — probed tsc 7.0.2).
+    fn check_named_interface(&mut self, span: Span, display: &str, shape: &InterfaceShape) {
+        let mut tail = CheckCtx {
+            file: self.file,
+            node: self.node,
+            db: &mut *self.db,
+            freshness: self.freshness,
+            report: &mut *self.report,
+        };
+        check_interface_shape(&self.decl.decl, span, display, shape, &mut tail);
+    }
+
+    /// Resolves a single-name annotation: enums check, interfaces run the
+    /// shared object path, bare namespaces diagnose `PITH2709`, and
+    /// anything else declines (type aliases, classes, values — recorded,
+    /// never verdict). Unknown names delegate to [`check_one`], which
+    /// diagnoses `PITH2304` exactly like tsc's `TS2304`.
+    fn resolve_single(&mut self, span: Span, annotation: &str) {
+        let input = self.input;
+        let scope = self.decl.decl.scope;
+        let Some(id) = self.binder.resolve(self.file, scope, annotation) else {
+            self.delegate();
+            return;
+        };
+        let mut found = input.enums.iter().filter(|shape| shape.symbol == Some(id));
+        let Some(shape) = found.next() else {
+            self.resolve_single_non_enum(span, annotation, id);
+            return;
+        };
+        if found.next().is_some() {
+            self.unsupported(
+                span,
+                format!(
+                    "multiple enum declarations for '{annotation}': merging is outside the subset"
+                ),
+            );
+            return;
+        }
+        self.check_enum_shape(span, annotation, shape);
+    }
+
+    /// Single names that resolve past the enum set: interfaces check with
+    /// the full name, namespaces diagnose `PITH2709`, the rest decline.
+    fn resolve_single_non_enum(&mut self, span: Span, annotation: &str, id: SymbolId) {
+        let input = self.input;
+        if let Some(shape) = input
+            .interfaces
+            .iter()
+            .find(|shape| shape.symbol == Some(id))
+        {
+            self.check_named_interface(span, annotation, shape);
+        } else if input
+            .namespaces
+            .iter()
+            .any(|shape| shape.symbol == Some(id))
+        {
+            self.diagnose(
+                span,
+                CODE_NAMESPACE_AS_TYPE,
+                format!("Cannot use namespace '{annotation}' as a type."),
+            );
+        } else {
+            self.unsupported(
+                span,
+                format!(
+                    "annotation '{annotation}' is not an enum or interface: outside the subset"
+                ),
+            );
+        }
+    }
+
+    /// Resolves a qualified annotation: namespace heads walk
+    /// ([`resolve_ns_tail`]), enum heads collapse member accesses
+    /// ([`resolve_enum_head`]), anything else declines. Unresolvable heads
+    /// already tracked as unresolved references skip silently (the
+    /// [`check_calls`] precedent: tracked once, never double-diagnosed).
+    fn resolve_qualified(&mut self, span: Span, annotation: &str) {
+        let Some(segments) = split_qualified(annotation) else {
+            self.unsupported(
+                span,
+                format!("qualified annotation '{annotation}' is outside the subset"),
+            );
+            return;
+        };
+        let input = self.input;
+        let scope = self.decl.decl.scope;
+        let Some(head) = self.binder.resolve(self.file, scope, segments[0]) else {
+            if !self
+                .binder
+                .unresolved()
+                .iter()
+                .any(|entry| entry.file == self.file && entry.name == segments[0])
+            {
+                self.unsupported(
+                    span,
+                    format!(
+                        "qualified head '{}' resolves to nothing: driver skew",
+                        segments[0]
+                    ),
+                );
+            }
+            return;
+        };
+        if input
+            .namespaces
+            .iter()
+            .any(|shape| shape.symbol == Some(head))
+        {
+            self.resolve_ns_tail(span, annotation, &segments, head);
+        } else if input.enums.iter().any(|shape| shape.symbol == Some(head)) {
+            self.resolve_enum_head(span, &segments, head);
+        } else {
+            self.unsupported(
+                span,
+                format!(
+                    "name '{}' is not a namespace: qualified annotations need a namespace head",
+                    segments[0]
+                ),
+            );
+        }
+    }
+
+    /// Walks `segments[1..]` from namespace `head`: namespaces descend,
+    /// enums collapse (member or self), tail interfaces check, exported
+    /// non-types decline, and misses diagnose `TS2694` naming the resolved
+    /// prefix. A trailing namespace diagnoses `TS2749` on the full path
+    /// (probed: the rule is positional — single names get `TS2709`).
+    fn resolve_ns_tail(&mut self, span: Span, annotation: &str, segments: &[&str], head: SymbolId) {
+        let mut current = head;
+        let mut index = 1;
+        while index < segments.len() {
+            match self.lookup_member(current, segments[index]) {
+                MemberLookup::Absent => {
+                    self.diagnose(
+                        span,
+                        CODE_NO_EXPORTED_MEMBER,
+                        format!(
+                            "Namespace '{}' has no exported member '{}'.",
+                            segments[..index].join("."),
+                            segments[index]
+                        ),
+                    );
+                    return;
+                }
+                MemberLookup::Unclaimed => {
+                    self.unsupported(
+                        span,
+                        format!(
+                            "member '{}' of '{}' is not an enum or interface: outside the subset",
+                            segments[index],
+                            segments[..index].join(".")
+                        ),
+                    );
+                    return;
+                }
+                MemberLookup::Found { id, claimed } => match claimed {
+                    Claimed::Namespace => {
+                        current = id;
+                        index += 1;
+                    }
+                    Claimed::Enum(enum_index) => {
+                        self.resolve_enum_tail(span, segments, index, enum_index);
+                        return;
+                    }
+                    Claimed::Interface(iface_index) => {
+                        if index == segments.len() - 1 {
+                            let display = segments[index..].join(".");
+                            let input = self.input;
+                            self.check_named_interface(
+                                span,
+                                &display,
+                                &input.interfaces[iface_index],
+                            );
+                        } else if index == segments.len() - 2 {
+                            // `NS.Point.X` (probed TS2713).
+                            let access = segments[index..].join(".");
+                            self.diagnose(
+                                span,
+                                CODE_TYPE_NOT_NAMESPACE,
+                                format!(
+                                    "Cannot access '{access}' because '{}' is a type, but not a namespace. Did you mean to retrieve the type of the property '{}' in '{}' with '{}[\"{}\"]'?",
+                                    segments[index],
+                                    segments[index + 1],
+                                    segments[index],
+                                    segments[index],
+                                    segments[index + 1]
+                                ),
+                            );
+                        } else {
+                            self.unsupported(
+                                span,
+                                format!(
+                                    "member '{}' is an interface: further qualification is outside the subset",
+                                    segments[index]
+                                ),
+                            );
+                        }
+                        return;
+                    }
+                },
+            }
+        }
+        self.diagnose(
+            span,
+            CODE_VALUE_AS_TYPE,
+            format!(
+                "'{annotation}' refers to a value, but is being used as a type here. Did you mean 'typeof {annotation}'?"
+            ),
+        );
+    }
+
+    /// Resolves an enum-headed annotation (`Color.Red`, possibly deeper):
+    /// the member collapses to its enum (probed tsc 7.0.2); anything else
+    /// diagnoses `TS2694` naming the resolved prefix (probed `Color.Nope`).
+    fn resolve_enum_head(&mut self, span: Span, segments: &[&str], head: SymbolId) {
+        let input = self.input;
+        let Some(enum_index) = input
+            .enums
+            .iter()
+            .position(|shape| shape.symbol == Some(head))
+        else {
+            self.unsupported(
+                span,
+                format!("enum head '{}' links no shape: driver skew", segments[0]),
+            );
+            return;
+        };
+        self.resolve_enum_tail(span, segments, 0, enum_index);
+    }
+
+    /// Checks an enum reached at `segments[enum_pos]`: the bare enum and a
+    /// trailing member access both check with the namespace-stripped display
+    /// (probed: `NS.Dir` spells `Dir`, `NS.Dir.Up` spells `Dir.Up`,
+    /// `Color.Red` spells `Color.Red`); misses diagnose `TS2694` on the
+    /// resolved prefix (probed `NS.Dir.Nope`, `Color.Nope`).
+    fn resolve_enum_tail(
+        &mut self,
+        span: Span,
+        segments: &[&str],
+        enum_pos: usize,
+        enum_index: usize,
+    ) {
+        let input = self.input;
+        let shape = &input.enums[enum_index];
+        if input
+            .enums
+            .iter()
+            .filter(|candidate| candidate.symbol == shape.symbol)
+            .count()
+            > 1
+        {
+            self.unsupported(
+                span,
+                format!(
+                    "multiple enum declarations for '{}': merging is outside the subset",
+                    shape.name
+                ),
+            );
+            return;
+        }
+        let member_matched = if enum_pos == segments.len() - 1 {
+            let display = segments[enum_pos..].join(".");
+            self.check_enum_shape(span, &display, shape);
+            return;
+        } else {
+            shape
+                .members
+                .iter()
+                .any(|member| member.name == segments[enum_pos + 1])
+        };
+        if member_matched && enum_pos == segments.len() - 2 {
+            let display = segments[enum_pos..].join(".");
+            self.check_enum_shape(span, &display, shape);
+        } else if member_matched {
+            self.diagnose(
+                span,
+                CODE_NO_EXPORTED_MEMBER,
+                format!(
+                    "Namespace '{}' has no exported member '{}'.",
+                    segments[..=enum_pos + 1].join("."),
+                    segments[enum_pos + 2]
+                ),
+            );
+        } else {
+            self.diagnose(
+                span,
+                CODE_NO_EXPORTED_MEMBER,
+                format!(
+                    "Namespace '{}' has no exported member '{}'.",
+                    segments[..=enum_pos].join("."),
+                    segments[enum_pos + 1]
+                ),
+            );
+        }
+    }
+
+    /// Resolves one qualification segment inside namespace `current`.
+    ///
+    /// Export visibility is facts: claimed members need their own
+    /// `exported` flag (lifted when the enclosing namespace is ambient —
+    /// probed tsc 7.0.2); unclaimed members consult the enclosing
+    /// `exported_members` list, so hidden values diagnose `TS2694` (probed
+    /// `NS.Hid`) while exported non-types decline (tsc's `TS2749` is the
+    /// pinned divergence — kind is unknowable without value facts). The
+    /// scope-membership guard rejects binder walk-up hits outside the block:
+    /// they name an outer declaration, not the member.
+    fn lookup_member(&self, current: SymbolId, segment: &str) -> MemberLookup {
+        let input = self.input;
+        let mut unclaimed = false;
+        for shape in input
+            .namespaces
+            .iter()
+            .filter(|shape| shape.symbol == Some(current))
+        {
+            let Some(id) = self.binder.resolve(self.file, shape.body_scope, segment) else {
+                continue;
+            };
+            if !self.member_in_block(current, id) {
+                continue;
+            }
+            let listed = shape.exported_members.iter().any(|name| name == segment);
+            match self.claim(id) {
+                Some((claimed, exported)) if shape.declared || exported => {
+                    return MemberLookup::Found { id, claimed };
+                }
+                None if shape.declared || listed => {
+                    unclaimed = true;
+                }
+                _ => {}
+            }
+        }
+        if unclaimed {
+            MemberLookup::Unclaimed
+        } else {
+            MemberLookup::Absent
+        }
+    }
+
+    /// The owning scope of one interned symbol, if any.
+    fn symbol_scope(&self, id: SymbolId) -> Option<u32> {
+        self.binder.store().get(id).map(|symbol| symbol.scope.index)
+    }
+
+    /// Whether `id` names a declaration inside one of `current`'s blocks:
+    /// the symbol's owning scope must be a tried body scope, so walk-up
+    /// hits from outer scopes never match.
+    fn member_in_block(&self, current: SymbolId, id: SymbolId) -> bool {
+        let Some(scope) = self.symbol_scope(id) else {
+            return false;
+        };
+        self.input
+            .namespaces
+            .iter()
+            .filter(|shape| shape.symbol == Some(current))
+            .any(|shape| shape.body_scope == scope)
+    }
+
+    /// Claims a resolved symbol for the first shape holding its identity,
+    /// with that shape's own `exported` flag: enums before interfaces
+    /// (merged enum+interface pairs are illegal in tsc), namespaces last.
+    /// `None` means no shape claims it (values, type aliases, classes).
+    fn claim(&self, id: SymbolId) -> Option<(Claimed, bool)> {
+        let input = self.input;
+        if let Some(index) = input
+            .enums
+            .iter()
+            .position(|shape| shape.symbol == Some(id))
+        {
+            return Some((Claimed::Enum(index), input.enums[index].exported));
+        }
+        if let Some(index) = input
+            .interfaces
+            .iter()
+            .position(|shape| shape.symbol == Some(id))
+        {
+            return Some((Claimed::Interface(index), input.interfaces[index].exported));
+        }
+        if input
+            .namespaces
+            .iter()
+            .any(|shape| shape.symbol == Some(id))
+        {
+            let exported = input
+                .namespaces
+                .iter()
+                .filter(|shape| shape.symbol == Some(id))
+                .any(|shape| shape.exported);
+            return Some((Claimed::Namespace, exported));
+        }
+        None
+    }
+
+    /// Checks one enum-annotated declaration against its shape.
+    ///
+    /// Gate order is structural-first (contradictory facts, ambient enums,
+    /// computed members — the first computed member in source order wins so
+    /// reasons stay single), then the initializer shape: objects diagnose
+    /// compositionally against the display name, missing and non-literal
+    /// initializers decline, and literals check membership (see
+    /// [`check_enum_literal`]).
+    fn check_enum_shape(&mut self, span: Span, display: &str, shape: &EnumShape) {
+        let file = self.file;
+        let decl = &self.decl.decl;
+        let text = self.decl.init_text.as_deref();
+        if decl.init.is_some() && decl.init_object.is_some() {
+            self.unsupported(
+                span,
+                "contradictory initializer facts: primitive kind with object members".to_owned(),
+            );
+            return;
+        }
+        if shape.declared {
+            self.unsupported(
+                span,
+                format!(
+                    "ambient enum '{}' has unknown member values: outside the subset",
+                    shape.name
+                ),
+            );
+            return;
+        }
+        if let Some(member) = shape
+            .members
+            .iter()
+            .find(|member| matches!(&member.value, EnumMemberValue::Computed { .. }))
+        {
+            let detail = match &member.value {
+                EnumMemberValue::Computed { reason } => reason.clone(),
+                EnumMemberValue::Number(_) | EnumMemberValue::String(_) => {
+                    "outside the subset".to_owned()
+                }
+            };
+            self.unsupported(
+                span,
+                format!("enum '{}': member '{}': {detail}", shape.name, member.name),
+            );
+            return;
+        }
+        if let Some(init_object) = decl.init_object.as_ref() {
+            check_primitive_annotation_object_init(file, span, display, init_object, self.report);
+            return;
+        }
+        let Some(init) = decl.init else {
+            self.unsupported(
+                span,
+                "missing initializer: nothing to check against".to_owned(),
+            );
+            return;
+        };
+        if init == InitKind::NonLiteral {
+            self.unsupported(
+                span,
+                "non-literal initializer is outside the subset".to_owned(),
+            );
+            return;
+        }
+        self.check_enum_literal(span, display, shape, init, text);
+    }
+
+    /// Checks one literal initializer against an enum shape: numerics test
+    /// membership by value; every other literal diagnoses (probed tsc 7.0.2:
+    /// strings never match — even member values — booleans spell
+    /// literally, `null`/`undefined` spell widened).
+    fn check_enum_literal(
+        &mut self,
+        span: Span,
+        display: &str,
+        shape: &EnumShape,
+        init: InitKind,
+        text: Option<&str>,
+    ) {
+        match init {
+            InitKind::Number => {
+                let Some(value) = text.and_then(parse_enum_number) else {
+                    self.unsupported(
+                        span,
+                        match text {
+                            Some(found) => format!(
+                                "non-decimal numeric literal '{found}' is outside the subset"
+                            ),
+                            None => "missing literal text for a numeric initializer: driver skew"
+                                .to_owned(),
+                        },
+                    );
+                    return;
+                };
+                // Bitwise equality is exact here: compared values are small
+                // integers (parsed literals and auto-incremented member
+                // values), exactly representable in f64 with no rounding;
+                // hex and non-decimal inits decline before this compare.
+                let known = shape.members.iter().any(|member| {
+                    matches!(&member.value, EnumMemberValue::Number(found) if found.to_bits() == value.to_bits())
+                });
+                if !known {
+                    self.diagnose(
+                        span,
+                        CODE_MISMATCH,
+                        format!(
+                            "Type '{}' is not assignable to type '{display}'.",
+                            spell_number(value)
+                        ),
+                    );
+                }
+            }
+            InitKind::String => {
+                let Some(found) = text else {
+                    self.unsupported(
+                        span,
+                        "missing literal text for a string initializer: driver skew".to_owned(),
+                    );
+                    return;
+                };
+                self.diagnose(
+                    span,
+                    CODE_MISMATCH,
+                    format!("Type '{found}' is not assignable to type '{display}'."),
+                );
+            }
+            InitKind::Boolean => {
+                let spelling = text.unwrap_or("boolean");
+                self.diagnose(
+                    span,
+                    CODE_MISMATCH,
+                    format!("Type '{spelling}' is not assignable to type '{display}'."),
+                );
+            }
+            InitKind::Null | InitKind::Undefined => {
+                self.diagnose(
+                    span,
+                    CODE_MISMATCH,
+                    format!(
+                        "Type '{}' is not assignable to type '{display}'.",
+                        init.name()
+                    ),
+                );
+            }
+            InitKind::NonLiteral => {
+                self.unsupported(
+                    span,
+                    "non-literal initializer is outside the subset".to_owned(),
+                );
+            }
+        }
+    }
+}
+
+/// Routes one declaration: unannotated and plain-spelling annotations
+/// delegate to [`check_one`]; any other name resolves single or qualified.
+fn route_enum_declaration(route: &mut EnumDeclCtx<'_, '_>) {
+    let annotation = route.decl.decl.annotation.as_deref().map(str::trim);
+    let Some(annotation) = annotation else {
+        route.delegate();
+        return;
+    };
+    if annotation.starts_with('{')
+        || annotation.contains('|')
+        || annotation_type(annotation).is_some()
+    {
+        route.delegate();
+        return;
+    }
+    let span = binder_span(route.binder, route.file, &route.decl.decl);
+    if annotation.contains('.') {
+        route.resolve_qualified(span, annotation);
+        return;
+    }
+    route.resolve_single(span, annotation);
+}
+
+/// One tail-segment lookup inside a namespace: the resolved symbol plus its
+/// shape claim when a shape holds its identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemberLookup {
+    /// A shape-claimed, visible member (enum, interface, or namespace).
+    Found {
+        /// Resolved binder identity.
+        id: SymbolId,
+        /// Which shape claims it (index into the input tables).
+        claimed: Claimed,
+    },
+    /// Resolved and visible, but no shape claims it (values, type aliases,
+    /// classes): the caller declines — kind is unknowable without facts.
+    Unclaimed,
+    /// Absent, hidden, or outside the block: the caller diagnoses `TS2694`.
+    Absent,
+}
+
+/// Which shape table claims a resolved member identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Claimed {
+    /// An enum shape (index into [`EnumInput::enums`]).
+    Enum(usize),
+    /// An interface shape (index into [`EnumInput::interfaces`]).
+    Interface(usize),
+    /// A namespace shape (index unneeded: names come from segments).
+    Namespace,
+}
+
+/// Splits `NS.Dir` into segments, or `None` for unparseable qualification
+/// (empty parts, non-identifier parts): the caller declines, never verdicts.
+fn split_qualified(annotation: &str) -> Option<Vec<&str>> {
+    let segments: Vec<&str> = annotation.split('.').map(str::trim).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    if segments.iter().any(|segment| !is_name_segment(segment)) {
+        return None;
+    }
+    Some(segments)
+}
+
+/// Coarse identifier check (mirrors the union-member name test):
+/// alphanumerics plus `_`/`$`, non-empty. Degenerate shapes decline upstream.
+fn is_name_segment(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Parses a plain-decimal numeric literal slice to its value (`1`, `2.5`,
+/// `1e2`, `.5` parse via [`str::parse`]; `1_0` parses after tsc's
+/// numeric-separator rule is applied); hex/octal/binary and anything else
+/// decline — full literal grammars are const-eval the subset refuses
+/// (pinned oracle-clean divergences, e.g. `0x0` is clean in tsc).
+fn parse_enum_number(text: &str) -> Option<f64> {
+    let text = text.trim();
+    // tsc separators sit strictly between digits (`_1`, `1_`, `1__0` all
+    // error in tsc); Rust's float parser rejects every underscore, so strip
+    // only validated ones instead of trusting either side blindly.
+    if text.as_bytes().contains(&b'_') {
+        let bytes = text.as_bytes();
+        for (index, _) in bytes.iter().enumerate().filter(|(_, byte)| **byte == b'_') {
+            let left = index.checked_sub(1).and_then(|at| bytes.get(at));
+            let right = bytes.get(index + 1);
+            if !matches!(left, Some(b'0'..=b'9')) || !matches!(right, Some(b'0'..=b'9')) {
+                return None;
+            }
+        }
+        return text.replace('_', "").parse::<f64>().ok();
+    }
+    text.parse::<f64>().ok()
+}
+
+/// Spells a numeric value the way tsc literal types do: Rust's float
+/// `Display` already spells integral values bare (`5`, `0`) and fractions
+/// shortest round-trip (`2.5`) — exactly tsc's spellings over the probed
+/// range (`0x2` against `{ A = 0, B = 1 }` spells `Type '2'`). Exotic
+/// magnitudes may diverge textually (documented fold); membership stays
+/// exact.
+fn spell_number(value: f64) -> String {
+    format!("{value}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3437,6 +4392,7 @@ mod tests {
                 .collect(),
             heritage: Vec::new(),
             has_type_params: false,
+            exported: false,
         }
     }
 
@@ -3742,6 +4698,7 @@ mod tests {
             }],
             heritage: Vec::new(),
             has_type_params: false,
+            exported: false,
         }];
         let decls = [
             // The merged declarator itself: unannotated, so the verdict is
@@ -6255,5 +7212,589 @@ mod tests {
         assert_eq!(los, [0, 40]);
         let repeat = generics_report(&decls, &[], &binder);
         assert_eq!(report, repeat);
+    }
+
+    fn enum_member_named(name: &str, value: EnumMemberValue) -> EnumMember {
+        EnumMember {
+            name: name.to_owned(),
+            value,
+            span: span(0, 1),
+        }
+    }
+
+    /// One enum shape bound to `binder`, mirroring the e2e driver contract.
+    fn check_enum_shape_for(
+        binder: &Binder,
+        name: &str,
+        scope: u32,
+        members: Vec<EnumMember>,
+    ) -> EnumShape {
+        EnumShape {
+            name: name.to_owned(),
+            scope,
+            symbol: binder.resolve(FILE, scope, name),
+            span: span(0, 1),
+            members,
+            is_const: false,
+            declared: false,
+            exported: true,
+        }
+    }
+
+    fn namespace_shape_for(
+        binder: &Binder,
+        name: &str,
+        scope: u32,
+        body_scope: u32,
+        exported: bool,
+        exported_members: Vec<&str>,
+    ) -> NamespaceShape {
+        NamespaceShape {
+            name: name.to_owned(),
+            scope,
+            symbol: binder.resolve(FILE, scope, name),
+            span: span(0, 1),
+            body_scope,
+            declared: false,
+            exported,
+            exported_members: exported_members.into_iter().map(str::to_owned).collect(),
+        }
+    }
+
+    fn enum_decl_for(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        annotation: &str,
+        init: InitKind,
+        text: Option<&str>,
+    ) -> EnumDecl {
+        EnumDecl {
+            decl: ConstDecl {
+                name: name.to_owned(),
+                span: span(lo, hi),
+                scope: 0,
+                symbol: None,
+                kind: DeclKind::Const,
+                annotation: Some(annotation.to_owned()),
+                init: Some(init),
+                init_object: None,
+            },
+            init_text: text.map(str::to_owned),
+        }
+    }
+
+    /// A binder with namespace body scopes: scope 1 hangs off root 0, and
+    /// scope 2 hangs off scope 1 (two-level nesting).
+    fn enum_binder(declared: &[(&str, u32, Span)], unresolved: &[&str]) -> Binder {
+        let mut binder = Binder::new();
+        let symbols: Vec<SymbolInput> = declared
+            .iter()
+            .map(|(name, scope, decl_span)| SymbolInput {
+                scope: *scope,
+                name: (*name).to_owned(),
+                span: *decl_span,
+                flags: 0,
+            })
+            .collect();
+        let missing: Vec<UnresolvedInput> = unresolved
+            .iter()
+            .map(|name| UnresolvedInput {
+                name: (*name).to_owned(),
+                count: 1,
+            })
+            .collect();
+        binder.build_file(
+            FILE,
+            &[
+                ScopeInput {
+                    index: 0,
+                    parent: u32::MAX,
+                },
+                ScopeInput {
+                    index: 1,
+                    parent: 0,
+                },
+                ScopeInput {
+                    index: 2,
+                    parent: 1,
+                },
+            ],
+            &symbols,
+            &missing,
+        );
+        binder
+    }
+
+    fn color_shape(binder: &Binder) -> EnumShape {
+        check_enum_shape_for(
+            binder,
+            "Color",
+            0,
+            vec![
+                enum_member_named("Red", EnumMemberValue::Number(0.0)),
+                enum_member_named("Green", EnumMemberValue::Number(1.0)),
+                enum_member_named("Blue", EnumMemberValue::Number(2.0)),
+            ],
+        )
+    }
+
+    fn enums_report(decls: &[EnumDecl], input: &EnumInput<'_>, binder: &Binder) -> FileReport {
+        let mut db = QueryDb::new();
+        check_enums(FILE, decls, input, binder, &mut db)
+    }
+
+    #[test]
+    fn enum_numeric_literals_check_membership_by_value() {
+        let binder = binder_with(&[
+            ("Color", span(0, 5)),
+            ("a", span(6, 16)),
+            ("b", span(17, 27)),
+        ]);
+        let shape = color_shape(&binder);
+        let input = EnumInput {
+            enums: &[shape],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let decls = [
+            enum_decl_for("a", 6, 16, "Color", InitKind::Number, Some("1")),
+            enum_decl_for("b", 17, 27, "Color", InitKind::Number, Some("5")),
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type '5' is not assignable to type 'Color'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(17, 27));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn enum_string_literals_never_match() {
+        let binder = binder_with(&[("Str", span(0, 3)), ("g", span(4, 14)), ("t", span(15, 25))]);
+        let shape = check_enum_shape_for(
+            &binder,
+            "Str",
+            0,
+            vec![
+                enum_member_named("A", EnumMemberValue::String("a".to_owned())),
+                enum_member_named("B", EnumMemberValue::String("b".to_owned())),
+            ],
+        );
+        let input = EnumInput {
+            enums: &[shape],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let decls = [
+            enum_decl_for("g", 4, 14, "Str", InitKind::String, Some("\"a\"")),
+            enum_decl_for("t", 15, 25, "Str", InitKind::Boolean, Some("true")),
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type '\"a\"' is not assignable to type 'Str'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'true' is not assignable to type 'Str'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn enum_spellings_parse_and_render_values() {
+        assert_eq!(parse_enum_number("5"), Some(5.0));
+        assert_eq!(parse_enum_number("  2.5  "), Some(2.5));
+        assert_eq!(parse_enum_number("1_0"), Some(10.0));
+        assert_eq!(parse_enum_number("0x11"), None);
+        assert_eq!(parse_enum_number(""), None);
+        assert_eq!(spell_number(5.0), "5");
+        assert_eq!(spell_number(2.5), "2.5");
+        assert_eq!(spell_number(0.0), "0");
+    }
+
+    #[test]
+    fn enum_computed_ambient_and_merged_decline() {
+        let binder = binder_with(&[
+            ("Comp", span(0, 4)),
+            ("Amb", span(5, 8)),
+            ("Dup", span(9, 12)),
+            ("a", span(13, 23)),
+            ("b", span(24, 34)),
+            ("c", span(35, 45)),
+        ]);
+        let computed = check_enum_shape_for(
+            &binder,
+            "Comp",
+            0,
+            vec![enum_member_named(
+                "X",
+                EnumMemberValue::Computed {
+                    reason: "non-literal initializer is outside the subset".to_owned(),
+                },
+            )],
+        );
+        let mut ambient = check_enum_shape_for(
+            &binder,
+            "Amb",
+            0,
+            vec![enum_member_named("A", EnumMemberValue::Number(0.0))],
+        );
+        ambient.declared = true;
+        let first = check_enum_shape_for(
+            &binder,
+            "Dup",
+            0,
+            vec![enum_member_named("X", EnumMemberValue::Number(0.0))],
+        );
+        let second = check_enum_shape_for(
+            &binder,
+            "Dup",
+            0,
+            vec![enum_member_named("Y", EnumMemberValue::Number(1.0))],
+        );
+        let input = EnumInput {
+            enums: &[computed, ambient, first, second],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let decls = [
+            enum_decl_for("a", 13, 23, "Comp", InitKind::Number, Some("0")),
+            enum_decl_for("b", 24, 34, "Amb", InitKind::Number, Some("0")),
+            enum_decl_for("c", 35, 45, "Dup", InitKind::Number, Some("0")),
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 3);
+        assert!(
+            report.unsupported[0].reason.contains("member 'X'"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("ambient enum"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+        assert!(
+            report.unsupported[2]
+                .reason
+                .contains("multiple enum declarations"),
+            "reason: {}",
+            report.unsupported[2].reason
+        );
+    }
+
+    #[test]
+    fn enum_object_missing_and_non_literal_decline_or_diagnose() {
+        let binder = binder_with(&[
+            ("Color", span(0, 5)),
+            ("o", span(6, 16)),
+            ("m", span(17, 27)),
+        ]);
+        let shape = color_shape(&binder);
+        let input = EnumInput {
+            enums: &[shape],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let mut objected = enum_decl_for("o", 6, 16, "Color", InitKind::Number, None);
+        objected.decl.init = None;
+        objected.decl.init_object = Some(ObjectInit {
+            members: Vec::new(),
+            fresh: true,
+        });
+        let mut missing = enum_decl_for("m", 17, 27, "Color", InitKind::Number, None);
+        missing.decl.init = None;
+        let report = enums_report(&[objected, missing], &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type '{}' is not assignable to type 'Color'."
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("missing initializer"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn qualified_enums_resolve_with_short_names() {
+        let binder = enum_binder(
+            &[
+                ("NS", 0, span(0, 2)),
+                ("Dir", 1, span(10, 13)),
+                ("w", 0, span(20, 30)),
+                ("bad", 0, span(31, 44)),
+                ("deep", 0, span(45, 60)),
+            ],
+            &[],
+        );
+        let dir = check_enum_shape_for(
+            &binder,
+            "Dir",
+            1,
+            vec![
+                enum_member_named("Up", EnumMemberValue::Number(0.0)),
+                enum_member_named("Down", EnumMemberValue::Number(1.0)),
+            ],
+        );
+        let ns = namespace_shape_for(&binder, "NS", 0, 1, false, vec!["Dir"]);
+        let input = EnumInput {
+            enums: &[dir],
+            interfaces: &[],
+            namespaces: &[ns],
+        };
+        let decls = [
+            enum_decl_for("w", 20, 30, "NS.Dir", InitKind::Number, Some("0")),
+            enum_decl_for("bad", 31, 44, "NS.Dir", InitKind::Number, Some("9")),
+            enum_decl_for("deep", 45, 60, "NS.Dir.Up", InitKind::Number, Some("5")),
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type '9' is not assignable to type 'Dir'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type '5' is not assignable to type 'Dir.Up'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn qualified_misses_diagnose_ts2694_and_hidden_matches() {
+        let binder = enum_binder(
+            &[
+                ("NS", 0, span(0, 2)),
+                ("Hidden", 1, span(10, 16)),
+                ("Hid", 1, span(17, 20)),
+                ("a", 0, span(21, 35)),
+                ("b", 0, span(36, 52)),
+            ],
+            &[],
+        );
+        let mut hidden = check_enum_shape_for(
+            &binder,
+            "Hidden",
+            1,
+            vec![enum_member_named("A", EnumMemberValue::Number(0.0))],
+        );
+        hidden.exported = false;
+        let ns = namespace_shape_for(&binder, "NS", 0, 1, false, vec![]);
+        let input = EnumInput {
+            enums: &[hidden],
+            interfaces: &[],
+            namespaces: &[ns],
+        };
+        let decls = [
+            enum_decl_for("a", 21, 35, "NS.Nope", InitKind::Number, Some("1")),
+            enum_decl_for("b", 36, 52, "NS.Hidden", InitKind::Number, Some("0")),
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        for diagnostic in &report.diagnostics {
+            assert_eq!(diagnostic.code, CODE_NO_EXPORTED_MEMBER);
+        }
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Namespace 'NS' has no exported member 'Nope'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Namespace 'NS' has no exported member 'Hidden'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn qualified_walk_up_hits_and_unclaimed_members_split() {
+        // `NS.Nope` where a root `Nope` exists must NOT match the outer
+        // declaration (scope-membership guard); `NS.VAL` (an exported value)
+        // declines instead of mis-diagnosing (kind is unknowable).
+        let binder = enum_binder(
+            &[
+                ("NS", 0, span(0, 2)),
+                ("Nope", 0, span(3, 7)),
+                ("VAL", 1, span(10, 13)),
+                ("a", 0, span(21, 35)),
+                ("b", 0, span(36, 50)),
+            ],
+            &[],
+        );
+        let ns = namespace_shape_for(&binder, "NS", 0, 1, false, vec!["VAL"]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[ns],
+        };
+        let decls = [
+            enum_decl_for("a", 21, 35, "NS.Nope", InitKind::Number, Some("1")),
+            enum_decl_for("b", 36, 50, "NS.VAL", InitKind::Number, Some("1")),
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_NO_EXPORTED_MEMBER);
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("not an enum or interface"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn qualified_unresolved_heads_skip_and_namespaces_as_types_diagnose() {
+        let binder = enum_binder(
+            &[
+                ("NS", 0, span(0, 2)),
+                ("a", 0, span(3, 17)),
+                ("b", 0, span(18, 30)),
+            ],
+            &["NS2"],
+        );
+        let ns = namespace_shape_for(&binder, "NS", 0, 1, false, vec![]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[ns],
+        };
+        let decls = [
+            enum_decl_for("a", 3, 17, "NS2.Foo", InitKind::Number, Some("1")),
+            enum_decl_for("b", 18, 30, "NS", InitKind::Number, Some("1")),
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_NAMESPACE_AS_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Cannot use namespace 'NS' as a type."
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unresolved head skips silently"
+        );
+    }
+
+    #[test]
+    fn single_names_route_interfaces_namespaces_and_unknowns() {
+        let binder = binder_with(&[
+            ("Point", span(0, 5)),
+            ("NS", span(6, 8)),
+            ("v", span(9, 19)),
+            ("w", span(20, 30)),
+            ("u", span(31, 41)),
+        ]);
+        let mut point = interface_shape(&binder, "Point", 0, vec![("x", "number")]);
+        point.exported = true;
+        let ns = NamespaceShape {
+            name: "NS".to_owned(),
+            scope: 0,
+            symbol: binder.resolve(FILE, 0, "NS"),
+            span: span(0, 1),
+            body_scope: u32::MAX,
+            declared: false,
+            exported: false,
+            exported_members: Vec::new(),
+        };
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[point],
+            namespaces: &[ns],
+        };
+        let good = EnumDecl {
+            decl: object_decl("v", 9, 19, "Point", vec![("x", ObjectMemberKind::Number)]),
+            init_text: None,
+        };
+        let as_type = enum_decl_for("w", 20, 30, "NS", InitKind::Number, Some("1"));
+        let unknown = enum_decl_for("u", 31, 41, "Nope", InitKind::Number, Some("1"));
+        let report = enums_report(&[good, as_type, unknown], &input, &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_NAMESPACE_AS_TYPE);
+        assert_eq!(report.diagnostics[1].code, CODE_UNKNOWN_ANNOTATION);
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn qualified_trailing_namespace_mirrors_ts2749() {
+        // Positional rule (probed tsc 7.0.2): single names get `TS2709`,
+        // trailing qualified namespaces get `TS2749` on the full path.
+        let binder = enum_binder(
+            &[
+                ("Outer", 0, span(0, 5)),
+                ("Inner", 1, span(10, 15)),
+                ("m", 0, span(20, 30)),
+            ],
+            &[],
+        );
+        let inner = namespace_shape_for(&binder, "Inner", 1, 2, true, vec![]);
+        let outer = namespace_shape_for(&binder, "Outer", 0, 1, false, vec!["Inner"]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[outer, inner],
+        };
+        let decls = [enum_decl_for(
+            "m",
+            20,
+            30,
+            "Outer.Inner",
+            InitKind::Number,
+            Some("1"),
+        )];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_VALUE_AS_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "'Outer.Inner' refers to a value, but is being used as a type here. Did you mean 'typeof Outer.Inner'?"
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn qualified_past_interface_mirrors_ts2713() {
+        let binder = enum_binder(
+            &[
+                ("NS", 0, span(0, 2)),
+                ("Point", 1, span(10, 15)),
+                ("q", 0, span(20, 30)),
+            ],
+            &[],
+        );
+        let mut point = interface_shape(&binder, "Point", 1, vec![("x", "number")]);
+        point.exported = true;
+        let ns = namespace_shape_for(&binder, "NS", 0, 1, false, vec!["Point"]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[point],
+            namespaces: &[ns],
+        };
+        let decls = [enum_decl_for(
+            "q",
+            20,
+            30,
+            "NS.Point.X",
+            InitKind::Number,
+            Some("1"),
+        )];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_TYPE_NOT_NAMESPACE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Cannot access 'Point.X' because 'Point' is a type, but not a namespace. Did you mean to retrieve the type of the property 'X' in 'Point' with 'Point[\"X\"]'?"
+        );
+        assert!(report.unsupported.is_empty());
     }
 }

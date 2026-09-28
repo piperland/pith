@@ -157,6 +157,7 @@ fn shapes_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<InterfaceShape
                     })
                     .collect(),
                 has_type_params: fact.has_type_params,
+                exported: fact.exported,
             }
         })
         .collect()
