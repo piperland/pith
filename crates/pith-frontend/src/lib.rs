@@ -292,12 +292,15 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
     };
 
     // Scopes: descendants-from-root is root-first; re-index per file.
+    // (The counter must live outside the loop: indexing off `scopes.len()`
+    // here would pin every scope to 0, since pushes happen below.)
     let mut scope_index_of = std::collections::HashMap::new();
-    let mut scopes = Vec::new();
+    let mut next_scope: u32 = 0;
     for scope_id in scoping.scope_descendants_from_root() {
-        let index = sat_u32(scopes.len());
-        scope_index_of.insert(scope_id, index);
+        scope_index_of.insert(scope_id, next_scope);
+        next_scope = next_scope.saturating_add(1);
     }
+    let mut scopes = Vec::new();
     for scope_id in scoping.scope_descendants_from_root() {
         let index = scope_index_of[&scope_id];
         let parent = scoping
@@ -729,6 +732,15 @@ export function f(a: string): string { return a + b; }
         let pf = parse_module(FileId(4), "n.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
         let len = sat_u32(pf.scopes.len());
+        // indices are dense root-first: exactly 0..len, each once. (A
+        // constant-index bug here once pinned every scope to 0 and every
+        // other assertion below still passed.)
+        {
+            let mut seen: Vec<u32> = pf.scopes.iter().map(|scope| scope.index).collect();
+            seen.sort_unstable();
+            let want: Vec<u32> = (0..len).collect();
+            assert_eq!(seen, want);
+        }
         // every symbol points at a real scope; every parent resolves or is root
         for symbol in &pf.symbols {
             assert!(
