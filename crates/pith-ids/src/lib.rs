@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn ids_are_copy_and_indexable() {
         let f = FileId(3);
-        let n: NodeId = NodeId(f.index() as u32);
+        let n: NodeId = NodeId(u32::try_from(f.index()).expect("small index"));
         assert_eq!(n.index(), 3);
         assert_ne!(FileId::DUMMY, f);
     }

@@ -120,7 +120,8 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         });
     }
 
-    // Symbols + resolved references.
+    // Symbols + resolved references. Scope linkage uses the SAME per-file
+    // re-indexing as ScopeFact.index (never the raw Oxc ScopeId number).
     let mut symbols = Vec::new();
     for symbol_id in scoping.symbol_ids() {
         let refs = scoping.get_resolved_reference_ids(symbol_id);
@@ -130,13 +131,13 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
             .collect();
         names.sort();
         names.dedup();
+        let scope = scope_index_of
+            .get(&scoping.symbol_scope_id(symbol_id))
+            .copied()
+            .unwrap_or(u32::MAX);
         symbols.push(SymbolFact {
             index: sat_u32(symbols.len()),
-            scope: scoping
-                .symbol_scope_id(symbol_id)
-                .index()
-                .try_into()
-                .unwrap_or(u32::MAX),
+            scope,
             name: scoping.symbol_name(symbol_id).to_owned(),
             span: span_of(scoping.symbol_span(symbol_id)),
             flags: scoping.symbol_flags(symbol_id).bits(),
@@ -212,5 +213,48 @@ export function f(a: string): string { return a + b; }
         let names: Vec<&str> = pf.unresolved.iter().map(|u| u.name.as_str()).collect();
         assert!(names.contains(&"console"), "unresolved: {names:?}");
         assert!(names.contains(&"missing"), "unresolved: {names:?}");
+    }
+
+    #[test]
+    fn scope_indices_are_dense_and_linked() {
+        let src = "const x = 1;\nfunction f(a: string) {\n  const y = a + String(x);\n  function g() { return y; }\n}\n";
+        let pf = parse_module(FileId(4), "n.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let len = sat_u32(pf.scopes.len());
+        // every symbol points at a real scope; every parent resolves or is root
+        for symbol in &pf.symbols {
+            assert!(
+                symbol.scope < len,
+                "symbol {} scope {} out of {}",
+                symbol.name,
+                symbol.scope,
+                len
+            );
+        }
+        for scope in &pf.scopes {
+            assert!(
+                scope.parent == u32::MAX || scope.parent < len,
+                "scope {} parent {} out of {}",
+                scope.index,
+                scope.parent,
+                len
+            );
+        }
+        // parent chains terminate at the root within len steps
+        for scope in &pf.scopes {
+            let mut at = scope.index;
+            for _ in 0..len {
+                if at == u32::MAX {
+                    break;
+                }
+                at = pf.scopes[usize::try_from(at).expect("dense scope index")].parent;
+            }
+            assert_eq!(
+                at,
+                u32::MAX,
+                "scope {} chain does not terminate",
+                scope.index
+            );
+        }
     }
 }
