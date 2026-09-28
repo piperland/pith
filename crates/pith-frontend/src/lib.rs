@@ -101,6 +101,16 @@
 //! `const` targets cannot be reassigned, so straight-line refinement stays
 //! sound inside loop bodies.
 //!
+//! Type-parameter facts (P016): each [`FunctionFact`] additionally carries
+//! its declared type-parameter names in source order ([`TypeParamFact`],
+//! empty for non-generic functions). Only plain names feed the solver: any
+//! parameter with a constraint (`<T extends string>`), a default
+//! (`<T = number>`), or a variance/`const` modifier (`in`/`out`/`const T`)
+//! sets `type_params_complex` instead of mis-keying, and the solver declines
+//! those declarations (plus multi-parameter lists and nested `T` positions)
+//! with reasons. No other generic syntax facts: call-site type arguments,
+//! type references, and variance positions are out of scope.
+//!
 //! Probe basis (tsc 7.0.2 `--strict --pretty false`, recorded in the solver
 //! docs): simple `===`/`!==` typeof guards refine (then/else/after per
 //! negation), `==` narrows identically but is declined (subset pins
@@ -261,10 +271,30 @@ pub struct FunctionFact {
     /// (destructured or non-identifier rest): `params` is then a prefix and
     /// the solver declines instead of checking it.
     pub params_complex: bool,
+    /// Declared type-parameter names in source order (empty for non-generic
+    /// functions). Names record even when `type_params_complex` (the solver
+    /// declines on the flag, never on a miscount).
+    pub type_params: Vec<TypeParamFact>,
+    /// `true` when any type parameter carries a constraint, a default, or
+    /// an `in`/`out`/`const` modifier: the solver declines instead of
+    /// instantiating it.
+    pub type_params_complex: bool,
     /// Raw return annotation text + span; `None` means unannotated.
     pub return_annotation: Option<AnnotationFact>,
     /// Body shape; only [`FunctionBodyFact::SingleReturn`] is checkable.
     pub body: FunctionBodyFact,
+}
+
+/// One declared type parameter: its name as written (`T` in `id<T>`).
+///
+/// Only the name crosses the boundary (sliced off the parameter's binding
+/// span, exactly like value-parameter names). Constraints, defaults, and
+/// modifiers never become facts — any one of them sets
+/// [`FunctionFact::type_params_complex`] instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeParamFact {
+    /// Type-parameter name as written.
+    pub name: String,
 }
 
 /// One identifier parameter: its name plus whether it carries a type
@@ -556,6 +586,40 @@ fn param_annotation_text(
     annotation
         .and_then(|ann| annotation_fact(source, file, ann.span))
         .map(|fact| fact.text)
+}
+
+/// Collects one function's declared type-parameter names in source order.
+///
+/// Only plain names feed the solver: any parameter with a constraint
+/// (`<T extends string>`), a default (`<T = number>`), or an `in`/`out`/
+/// `const` modifier sets the complexity flag (the solver declines those
+/// instead of instantiating them). Names still record — the flag, never a
+/// miscount, drives the decline. An unsliceable name (only possible with
+/// recovery from parse errors) sets the flag and records nothing rather
+/// than inventing a key.
+fn type_param_facts(source: &str, func: &Function<'_>) -> (Vec<TypeParamFact>, bool) {
+    let Some(declared) = func.type_parameters.as_deref() else {
+        return (Vec::new(), false);
+    };
+    let mut params = Vec::with_capacity(declared.params.len());
+    let mut complex = false;
+    for param in &declared.params {
+        match slice_at(source, param.name.span) {
+            Some(name) => params.push(TypeParamFact {
+                name: name.to_owned(),
+            }),
+            None => complex = true,
+        }
+        if param.constraint.is_some()
+            || param.default.is_some()
+            || param.r#in
+            || param.out
+            || param.r#const
+        {
+            complex = true;
+        }
+    }
+    (params, complex)
 }
 
 /// Nearest same-name symbol at or before `start`: the overload-merge owner.
@@ -934,11 +998,14 @@ impl DeclCollector<'_> {
             .as_ref()
             .and_then(|ann| annotation_fact(self.source, self.file, ann.span));
         let body = function_body_fact(self.source, self.file, func.body.as_deref(), func.declare);
+        let (type_params, type_params_complex) = type_param_facts(self.source, func);
         self.functions.push(FunctionFact {
             symbol,
             scope: self.scopes.get(&symbol).copied().unwrap_or(u32::MAX),
             params,
             params_complex,
+            type_params,
+            type_params_complex,
             return_annotation,
             body,
         });
@@ -2000,6 +2067,64 @@ export function f(a: string): string { return a + b; }
             .collect();
         assert_eq!(texts, [Some("number"), Some("number"), Some("string")]);
         assert!(!fact.params.iter().any(|param| param.is_rest));
+    }
+
+    #[test]
+    fn function_facts_type_params_plain_single() {
+        // `id<T>` records its one plain name with a clear flag; the
+        // non-generic `plain` records nothing.
+        let src = "function id<T>(x: T): T {\n  return x;\n}\nfunction plain(a: number): number {\n  return 1;\n}\n";
+        let pf = parse_module(FileId(0), "g.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let generic = &pf.functions[0];
+        assert_eq!(
+            generic
+                .type_params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<&str>>(),
+            ["T"]
+        );
+        assert!(!generic.type_params_complex);
+        let plain = &pf.functions[1];
+        assert!(plain.type_params.is_empty());
+        assert!(!plain.type_params_complex);
+    }
+
+    #[test]
+    fn function_facts_type_params_complex_shapes() {
+        // Constraints, defaults, and `const`/`in`/`out` modifiers all set the
+        // flag while still recording their names; multi-parameter lists
+        // record every name (the solver declines on count, never miscount).
+        let src = "function constrained<T extends string>(x: T): T {\n  return x;\n}\n\
+                   function defaulted<T = number>(x: T): T {\n  return x;\n}\n\
+                   function consted<const T>(x: T): T {\n  return x;\n}\n\
+                   function pair<T, U>(x: T, y: U): T {\n  return x;\n}\n";
+        let pf = parse_module(FileId(0), "c.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 4);
+        let names: Vec<Vec<&str>> = pf
+            .functions
+            .iter()
+            .map(|fact| {
+                fact.type_params
+                    .iter()
+                    .map(|param| param.name.as_str())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(names, vec![vec!["T"], vec!["T"], vec!["T"], vec!["T", "U"]]);
+        for fact in &pf.functions[..3] {
+            assert!(
+                fact.type_params_complex,
+                "complex flag for {:?}",
+                fact.type_params
+            );
+        }
+        // Multi-parameter lists record every name without the flag: the
+        // solver declines on count, never miscount.
+        assert!(!pf.functions[3].type_params_complex);
     }
 
     #[test]
