@@ -438,6 +438,292 @@ export function f(a: string): string { return a + b; }
     }
 
     #[test]
+    fn decl_facts_annotated_literal_exact_spans() {
+        // Offsets hand-counted, cross-checked with the oxc parser
+        // (`const a: number = 1;`: `a` at 6, `:` at 7, `number` at 9..15,
+        // `1` at 18). Annotation span is the colon-inclusive
+        // TSTypeAnnotation range [7, 15).
+        let pf = parse_module(FileId(0), "a.ts", "const a: number = 1;\n");
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 1);
+        let decl = &pf.decls[0];
+        let symbol = &pf.symbols[usize::try_from(decl.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "a");
+        assert_eq!(
+            symbol.span,
+            Span {
+                file: FileId(0),
+                lo: 6,
+                hi: 7
+            }
+        );
+        let annotation = decl.annotation.as_ref().expect("annotated");
+        assert_eq!(annotation.text, "number");
+        assert_eq!(
+            annotation.span,
+            Span {
+                file: FileId(0),
+                lo: 7,
+                hi: 15
+            }
+        );
+        let init = decl.init.as_ref().expect("initialized");
+        assert_eq!(init.kind, InitKind::Number);
+        assert_eq!(
+            init.span,
+            Span {
+                file: FileId(0),
+                lo: 18,
+                hi: 19
+            }
+        );
+    }
+
+    #[test]
+    fn decl_facts_cover_all_literal_kinds() {
+        // Offsets cross-checked with the oxc parser; every annotation span
+        // below is the colon-inclusive TSTypeAnnotation range.
+        let src = "const u = 1;\n\
+                   const n = other;\n\
+                   const t: boolean = true;\n\
+                   const z: null = null;\n\
+                   const w: undefined = undefined;\n";
+        let pf = parse_module(FileId(0), "k.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 5);
+        // Source order is deterministic: unannotated, non-literal, then the
+        // boolean/null/undefined spellings.
+        let cases = [
+            ("u", (6, 7), None, (InitKind::Number, (10, 11))),
+            ("n", (19, 20), None, (InitKind::NonLiteral, (23, 28))),
+            (
+                "t",
+                (36, 37),
+                Some(("boolean", (37, 46))),
+                (InitKind::Boolean, (49, 53)),
+            ),
+            (
+                "z",
+                (61, 62),
+                Some(("null", (62, 68))),
+                (InitKind::Null, (71, 75)),
+            ),
+            (
+                "w",
+                (83, 84),
+                Some(("undefined", (84, 95))),
+                (InitKind::Undefined, (98, 107)),
+            ),
+        ];
+        for (decl, (name, binding, expected_ann, expected_init)) in pf.decls.iter().zip(cases) {
+            let symbol = &pf.symbols[usize::try_from(decl.symbol).expect("dense symbol index")];
+            assert_eq!(symbol.name, name);
+            assert_eq!((symbol.span.lo, symbol.span.hi), binding);
+            assert_eq!(symbol.span.file, FileId(0));
+            assert_eq!(decl.annotation.is_some(), expected_ann.is_some());
+            if let (Some(fact), Some((text, bounds))) = (decl.annotation.as_ref(), expected_ann) {
+                assert_eq!(fact.text, text, "annotation text for {name}");
+                assert_eq!((fact.span.lo, fact.span.hi), bounds);
+                assert_eq!(fact.span.file, FileId(0));
+            }
+            let init = decl.init.as_ref().expect("initialized");
+            assert_eq!(init.kind, expected_init.0, "init kind for {name}");
+            assert_eq!((init.span.lo, init.span.hi), expected_init.1);
+            assert_eq!(init.span.file, FileId(0));
+        }
+    }
+
+    #[test]
+    fn decl_facts_multi_declarator_link_each_symbol() {
+        // Mirrors corpus/check-const/multi-declarator.ts without its header
+        // comment; offsets cross-checked with the oxc parser.
+        let pf = parse_module(
+            FileId(0),
+            "m.ts",
+            "const first: number = 1, second: string = \"ok\", third: boolean = 42;\n",
+        );
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 3);
+        let cases = [
+            (
+                "first",
+                (6, 11),
+                "number",
+                (11, 19),
+                InitKind::Number,
+                (22, 23),
+            ),
+            (
+                "second",
+                (25, 31),
+                "string",
+                (31, 39),
+                InitKind::String,
+                (42, 46),
+            ),
+            (
+                "third",
+                (48, 53),
+                "boolean",
+                (53, 62),
+                InitKind::Number,
+                (65, 67),
+            ),
+        ];
+        for (decl, (name, binding, text, ann_bounds, kind, init_bounds)) in
+            pf.decls.iter().zip(cases)
+        {
+            let symbol = &pf.symbols[usize::try_from(decl.symbol).expect("dense symbol index")];
+            assert_eq!(symbol.name, name);
+            assert_eq!((symbol.span.lo, symbol.span.hi), binding);
+            let annotation = decl.annotation.as_ref().expect("annotated");
+            assert_eq!(annotation.text, text);
+            assert_eq!((annotation.span.lo, annotation.span.hi), ann_bounds);
+            let init = decl.init.as_ref().expect("initialized");
+            assert_eq!(init.kind, kind);
+            assert_eq!((init.span.lo, init.span.hi), init_bounds);
+        }
+    }
+
+    #[test]
+    fn decl_facts_skip_non_const_and_capture_nested() {
+        // `let`/`var` and functions bind symbols but emit no decl facts;
+        // a const nested in a function body is still captured (the visitor
+        // walks the whole program, not just top-level statements).
+        let pf = parse_module(
+            FileId(2),
+            "n.ts",
+            "function f(): void {\n  const inner: number = 2;\n  return inner;\n}\nlet l = 1;\nvar v = 2;\n",
+        );
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(!pf.symbols.is_empty());
+        assert_eq!(pf.decls.len(), 1);
+        let decl = &pf.decls[0];
+        let symbol = &pf.symbols[usize::try_from(decl.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "inner");
+        assert_eq!((symbol.span.lo, symbol.span.hi), (29, 34));
+        let annotation = decl.annotation.as_ref().expect("annotated");
+        assert_eq!(annotation.text, "number");
+        assert_eq!((annotation.span.lo, annotation.span.hi), (34, 42));
+        let init = decl.init.as_ref().expect("initialized");
+        assert_eq!(init.kind, InitKind::Number);
+        assert_eq!((init.span.lo, init.span.hi), (45, 46));
+    }
+
+    #[test]
+    fn decl_facts_empty_without_consts() {
+        let pf = parse_module(
+            FileId(3),
+            "e.ts",
+            "function f(a: string): string { return a; }\nlet l = 1;\nvar v = 2;\n",
+        );
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(!pf.symbols.is_empty());
+        assert!(pf.decls.is_empty());
+    }
+
+    #[test]
+    fn decl_facts_synth50_shared_has_no_consts() {
+        // Perf-corpus shape: parsing shared.ts must succeed with empty decls
+        // (interface-only file). Measurement of the walk itself is deferred
+        // to remote runs — no local Rust toolchain here.
+        let src = include_str!("../../../corpus/perf/synth-50/shared.ts");
+        let pf = parse_module(FileId(9), "shared.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(pf.decls.is_empty());
+    }
+
+    #[test]
+    fn decl_facts_cover_check_const_corpus() {
+        // The real const declarations the solver checks: every declarator in
+        // annotated-correct.ts links to its symbol with exact spans
+        // (offsets cross-checked with the oxc parser).
+        let src = include_str!("../../../corpus/check-const/annotated-correct.ts");
+        let pf = parse_module(FileId(0), "annotated-correct.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 5);
+        let cases = [
+            (
+                "aNumber",
+                (84, 91),
+                "number",
+                (91, 99),
+                InitKind::Number,
+                (102, 103),
+            ),
+            (
+                "aString",
+                (111, 118),
+                "string",
+                (118, 126),
+                InitKind::String,
+                (129, 133),
+            ),
+            (
+                "aBoolean",
+                (141, 149),
+                "boolean",
+                (149, 158),
+                InitKind::Boolean,
+                (161, 165),
+            ),
+            (
+                "aNull",
+                (173, 178),
+                "null",
+                (178, 184),
+                InitKind::Null,
+                (187, 191),
+            ),
+            (
+                "anUndefined",
+                (199, 210),
+                "undefined",
+                (210, 221),
+                InitKind::Undefined,
+                (224, 233),
+            ),
+        ];
+        for (decl, (name, binding, text, ann_bounds, kind, init_bounds)) in
+            pf.decls.iter().zip(cases)
+        {
+            let symbol = &pf.symbols[usize::try_from(decl.symbol).expect("dense symbol index")];
+            assert_eq!(symbol.name, name);
+            assert_eq!((symbol.span.lo, symbol.span.hi), binding);
+            let annotation = decl.annotation.as_ref().expect("annotated");
+            assert_eq!(annotation.text, text);
+            assert_eq!((annotation.span.lo, annotation.span.hi), ann_bounds);
+            let init = decl.init.as_ref().expect("initialized");
+            assert_eq!(init.kind, kind);
+            assert_eq!((init.span.lo, init.span.hi), init_bounds);
+        }
+
+        // Union text survives slicing (solver detects `|` itself); unknown
+        // names survive verbatim; unannotated decls carry `None`.
+        let union_src = include_str!("../../../corpus/check-const/union-annotation.ts");
+        let union_pf = parse_module(FileId(1), "union-annotation.ts", union_src);
+        assert_eq!(union_pf.decls.len(), 1);
+        let union_ann = union_pf.decls[0].annotation.as_ref().expect("annotated");
+        assert_eq!(union_ann.text, "number | string");
+        assert_eq!((union_ann.span.lo, union_ann.span.hi), (87, 104));
+
+        let unknown_src = include_str!("../../../corpus/check-const/unknown-annotation.ts");
+        let unknown_pf = parse_module(FileId(2), "unknown-annotation.ts", unknown_src);
+        assert_eq!(unknown_pf.decls.len(), 1);
+        let unknown_ann = unknown_pf.decls[0].annotation.as_ref().expect("annotated");
+        assert_eq!(unknown_ann.text, "Nope");
+        assert_eq!((unknown_ann.span.lo, unknown_ann.span.hi), (80, 86));
+
+        let plain_src = include_str!("../../../corpus/check-const/no-annotation.ts");
+        let plain_pf = parse_module(FileId(3), "no-annotation.ts", plain_src);
+        assert_eq!(plain_pf.decls.len(), 1);
+        assert!(plain_pf.decls[0].annotation.is_none());
+        let plain_init = plain_pf.decls[0].init.as_ref().expect("initialized");
+        assert_eq!(plain_init.kind, InitKind::Number);
+        assert_eq!((plain_init.span.lo, plain_init.span.hi), (85, 86));
+    }
+
+    #[test]
     fn scope_indices_are_dense_and_linked() {
         let src = "const x = 1;\nfunction f(a: string) {\n  const y = a + String(x);\n  function g() { return y; }\n}\n";
         let pf = parse_module(FileId(4), "n.ts", src);
@@ -478,5 +764,66 @@ export function f(a: string): string { return a + b; }
                 scope.index
             );
         }
+    }
+
+    #[test]
+    fn decl_facts_skip_destructured_bindings() {
+        // Destructured declarators bind symbols but emit no decl facts:
+        // only the plain `const c` below produces one, with no mis-keying
+        // onto the destructured names.
+        let pf = parse_module(
+            FileId(5),
+            "d.ts",
+            "const {a} = obj;\nconst [b] = arr;\nconst c: number = 3;\n",
+        );
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let bound: Vec<&str> = pf
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert!(bound.contains(&"a"), "symbols: {bound:?}");
+        assert!(bound.contains(&"b"), "symbols: {bound:?}");
+        assert_eq!(pf.decls.len(), 1);
+        let decl = &pf.decls[0];
+        let symbol = &pf.symbols[usize::try_from(decl.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "c");
+        assert_eq!((symbol.span.lo, symbol.span.hi), (40, 41));
+        let annotation = decl.annotation.as_ref().expect("annotated");
+        assert_eq!(annotation.text, "number");
+        assert_eq!((annotation.span.lo, annotation.span.hi), (41, 49));
+        let init = decl.init.as_ref().expect("initialized");
+        assert_eq!(init.kind, InitKind::Number);
+        assert_eq!((init.span.lo, init.span.hi), (52, 53));
+    }
+
+    #[test]
+    fn decl_facts_capture_export_and_for_of_consts() {
+        // `export const` behaves like a plain declarator; a `for(const k of …)`
+        // declarator has no initializer, so its fact carries `init: None`.
+        let pf = parse_module(
+            FileId(6),
+            "e.ts",
+            "export const e: number = 1;\nfor (const k of [1, 2]) { console.log(k); }\n",
+        );
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 2);
+        let first = &pf.decls[0];
+        let first_symbol = &pf.symbols[usize::try_from(first.symbol).expect("dense symbol index")];
+        assert_eq!(first_symbol.name, "e");
+        assert_eq!((first_symbol.span.lo, first_symbol.span.hi), (13, 14));
+        let first_ann = first.annotation.as_ref().expect("annotated");
+        assert_eq!(first_ann.text, "number");
+        assert_eq!((first_ann.span.lo, first_ann.span.hi), (14, 22));
+        let first_init = first.init.as_ref().expect("initialized");
+        assert_eq!(first_init.kind, InitKind::Number);
+        assert_eq!((first_init.span.lo, first_init.span.hi), (25, 26));
+        let second = &pf.decls[1];
+        let second_symbol =
+            &pf.symbols[usize::try_from(second.symbol).expect("dense symbol index")];
+        assert_eq!(second_symbol.name, "k");
+        assert_eq!((second_symbol.span.lo, second_symbol.span.hi), (39, 40));
+        assert!(second.annotation.is_none());
+        assert!(second.init.is_none());
     }
 }
