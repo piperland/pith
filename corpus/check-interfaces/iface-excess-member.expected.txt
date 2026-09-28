@@ -1,0 +1,1 @@
+iface-excess-member.ts:TS2353: Object literal may only specify known properties, and 'extra' does not exist in type 'Point'.

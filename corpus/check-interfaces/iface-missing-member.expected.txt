@@ -1,0 +1,1 @@
+iface-missing-member.ts:TS2741: Property 'age' is missing in type '{ name: string; }' but required in type 'User'.
