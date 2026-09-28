@@ -1,0 +1,2 @@
+missing-main.ts:TS2305: Module '"./missing-shared"' has no exported member 'NOPE'.
+missing-main.ts:TS2307: Cannot find module './missing-does-not-exist' or its corresponding type declarations.
