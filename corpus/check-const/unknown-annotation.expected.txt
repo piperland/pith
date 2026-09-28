@@ -1,0 +1,1 @@
+unknown-annotation.ts:TS2304: Cannot find name 'Nope'.
