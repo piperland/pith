@@ -1,0 +1,1 @@
+unannotated-param.ts:TS7006: Parameter 'value' implicitly has an 'any' type.
