@@ -83,17 +83,45 @@
 //! (`b?: number`, defaulted) and variadic (`...rest`) lists, and arg-type
 //! checking needs the annotated names — none of which name-only params can
 //! express. No other declaration-fact surface changes.
+//!
+//! Guard facts (P015): [`ParsedFile::guards`] carries one [`TypeofGuardFact`]
+//! per top-level `if (typeof x === "<lit>")` / `if (typeof x !== "<lit>")`
+//! statement, pairing the target identifier plus matched literal with the
+//! then/else statement spans that bound each refinement region. The
+//! early-return shape (`if (typeof x !== "<lit>") return;`, with `return
+//! <expr>;`, `throw`, and single-statement-block variants) sets
+//! [`TypeofGuardFact::early_return`]: the code after the statement refines.
+//! Everything else emits no guard fact, never a wrong one: `==`/`!=`,
+//! compound conditions, non-typeof tests, non-identifier/non-literal operands,
+//! and `else if` chains land in [`ParsedFile::decline_regions`] as
+//! [`DeclineRegionFact`]s (whole-statement spans with reasons), as do guards
+//! nested inside another `if`'s branches and function bodies nested inside
+//! another function (narrowing does not cross closures — probed tsc 7.0.2: a
+//! use inside a nested closure sees the full union). Loops need no regions:
+//! `const` targets cannot be reassigned, so straight-line refinement stays
+//! sound inside loop bodies.
+//!
+//! Probe basis (tsc 7.0.2 `--strict --pretty false`, recorded in the solver
+//! docs): simple `===`/`!==` typeof guards refine (then/else/after per
+//! negation), `==` narrows identically but is declined (subset pins
+//! `===`/`!==`), union members spell canonically
+//! (`string | number | boolean | null | undefined`, source order ignored),
+//! guard literals outside the union narrow to `never` (silent uses — the
+//! solver declines those regions), and literal-initialized `const`s do not
+//! narrow at all.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Expression, Function, FunctionBody, FunctionType,
-    ObjectPropertyKind, Program, PropertyKey, PropertyKind, Statement, TSTypeAnnotation,
-    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Expression, Function,
+    FunctionBody, FunctionType, IfStatement, ObjectPropertyKind, Program, PropertyKey,
+    PropertyKind, Statement, TSTypeAnnotation, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{ScopeFlags, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
+use oxc_syntax::operator::{BinaryOperator, UnaryOperator};
 use pith_ids::{FileId, Span};
 
 /// Saturating `usize` -> `u32` for per-file fact indices (files never approach
@@ -383,6 +411,57 @@ pub struct CallFact {
     pub args: Vec<CallArgFact>,
 }
 
+/// One straight-line `typeof` guard: `if (typeof x === "<lit>")` or
+/// `if (typeof x !== "<lit>")` at the top level of its statement list (never
+/// nested inside another `if`'s branches — those decline instead).
+///
+/// Only simple identifier-plus-string-literal comparisons emit facts: either
+/// operand order qualifies, and one layer of parentheses around the whole
+/// condition is transparent. Anything else (non-identifier targets,
+/// non-literal comparands, `==`, compound conditions, `else if` chains)
+/// emits no fact here — the statement lands in
+/// [`ParsedFile::decline_regions`] instead, never mis-recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeofGuardFact {
+    /// Target name as written in `typeof <target>`.
+    pub target: String,
+    /// Span of the target identifier occurrence.
+    pub target_span: Span,
+    /// Matched literal text (`"string"` for `typeof x === "string"`).
+    pub matched: String,
+    /// `true` for `!==` (regions flip), `false` for `===`.
+    pub negated: bool,
+    /// Statement span of the then branch (refines to `matched` for `===`).
+    pub then_span: Span,
+    /// Statement span of a plain `else` branch (refines to the complement);
+    /// `None` when absent (`else if` chains never reach facts — declined).
+    pub else_span: Option<Span>,
+    /// The exact early-exit shape with no `else`: the then branch diverges
+    /// (bare/valued `return`, `throw`, directly or in a single-statement
+    /// block), so the code after the statement refines (to `matched` for
+    /// `!==`, to the complement for `===`).
+    pub early_return: bool,
+    /// Whole `if` statement span (bounds the after-region when
+    /// [`TypeofGuardFact::early_return`]).
+    pub if_span: Span,
+}
+
+/// One statement span the narrowing subset refuses to reason inside.
+///
+/// Covers non-simple guard conditions, `else-if` chains, guards nested inside
+/// another guard's branches, and function bodies nested inside another
+/// function (closures reset narrowing — probed tsc 7.0.2). The solver
+/// declines identifier-uses inside these spans with the recorded reason
+/// instead of verdicting. Literal-initializer declarations inside are
+/// unaffected (they check as usual — only narrowing consults regions).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclineRegionFact {
+    /// Whole-statement span (the `if` statement, or the nested function).
+    pub span: Span,
+    /// Why narrowing declines here.
+    pub reason: String,
+}
+
 /// Everything Pith owns after a frontend pass. Arenas are dropped on return.
 #[derive(Clone, Debug)]
 pub struct ParsedFile {
@@ -400,6 +479,12 @@ pub struct ParsedFile {
     /// One fact per direct `f(...)` call expression, in visitor (pre-order)
     /// order. Empty when the file makes no direct calls.
     pub calls: Vec<CallFact>,
+    /// One fact per top-level simple `typeof` guard, in visitor (pre-order)
+    /// order. Empty when the file has no narrowable guards.
+    pub guards: Vec<TypeofGuardFact>,
+    /// One decline region per out-of-subset guard/function shape, in visitor
+    /// (pre-order) order. Empty when every guard is simple.
+    pub decline_regions: Vec<DeclineRegionFact>,
     /// Parser + semantic diagnostics as plain strings (codes deferred to P008).
     pub errors: Vec<String>,
 }
@@ -434,6 +519,15 @@ struct DeclCollector<'a> {
     decls: Vec<DeclFact>,
     functions: Vec<FunctionFact>,
     calls: Vec<CallFact>,
+    guards: Vec<TypeofGuardFact>,
+    declines: Vec<DeclineRegionFact>,
+    /// `if` statements enclosing the current visit point: anything above zero
+    /// means a nested guard (decline, never refine).
+    if_depth: u32,
+    /// Functions enclosing the current visit point: anything above zero
+    /// means a nested closure (its whole body declines — narrowing does not
+    /// cross closures, probed tsc 7.0.2).
+    fn_depth: u32,
 }
 
 /// Builds the colon-stripped annotation fact for a `TSTypeAnnotation` span
@@ -609,6 +703,92 @@ fn function_body_fact(
             span,
             members: None,
         })
+    }
+}
+
+/// Pushes one narrowing decline region onto the collector.
+fn decline_region(collector: &mut DeclCollector<'_>, span: Span, reason: &str) {
+    collector.declines.push(DeclineRegionFact {
+        span,
+        reason: reason.to_owned(),
+    });
+}
+
+/// The `typeof <ident>` side of a simple guard comparison: name plus span.
+#[must_use]
+fn typeof_operand(file: FileId, operand: &Expression<'_>) -> Option<(String, Span)> {
+    let Expression::UnaryExpression(unary) = operand else {
+        return None;
+    };
+    if unary.operator != UnaryOperator::Typeof {
+        return None;
+    }
+    let Expression::Identifier(ident) = &unary.argument else {
+        return None;
+    };
+    Some((
+        ident.name.to_string(),
+        Span {
+            file,
+            lo: ident.span.start,
+            hi: ident.span.end,
+        },
+    ))
+}
+
+/// The `"<lit>"` side of a simple guard comparison: literal text.
+#[must_use]
+fn string_operand(operand: &Expression<'_>) -> Option<String> {
+    let Expression::StringLiteral(literal) = operand else {
+        return None;
+    };
+    Some(literal.value.as_str().to_owned())
+}
+
+/// Classifies one `if` test as a simple typeof guard: `typeof x === "<lit>"`
+/// or `!==` in either operand order, transparent through one layer of
+/// parentheses around the whole condition. Returns target name/span, matched
+/// text, and negation. Anything else is `None` (the caller declines).
+#[must_use]
+fn classify_typeof_test(
+    file: FileId,
+    mut test: &Expression<'_>,
+) -> Option<(String, Span, String, bool)> {
+    if let Expression::ParenthesizedExpression(parenthesized) = test {
+        test = &parenthesized.expression;
+    }
+    let Expression::BinaryExpression(binary) = test else {
+        return None;
+    };
+    let negated = match binary.operator {
+        BinaryOperator::StrictEquality => false,
+        BinaryOperator::StrictInequality => true,
+        _ => return None,
+    };
+    if let (Some((target, target_span)), Some(matched)) = (
+        typeof_operand(file, &binary.left),
+        string_operand(&binary.right),
+    ) {
+        return Some((target, target_span, matched, negated));
+    }
+    if let (Some((target, target_span)), Some(matched)) = (
+        typeof_operand(file, &binary.right),
+        string_operand(&binary.left),
+    ) {
+        return Some((target, target_span, matched, negated));
+    }
+    None
+}
+
+/// Whether a branch diverges: bare/valued `return` or `throw`, directly or as
+/// the only statement of a block. Only these shapes mark a guard
+/// early-return (probed tsc 7.0.2: each refines the code after the `if`).
+#[must_use]
+fn is_divergent(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
+        Statement::BlockStatement(block) => block.body.len() == 1 && is_divergent(&block.body[0]),
+        _ => false,
     }
 }
 
@@ -816,6 +996,64 @@ impl DeclCollector<'_> {
             args,
         });
     }
+
+    /// Records one `if` statement: a [`TypeofGuardFact`] for top-level simple
+    /// typeof guards, otherwise a [`DeclineRegionFact`] over the whole
+    /// statement (never a wrong guard fact).
+    fn record_if(&mut self, it: &IfStatement<'_>) {
+        let file = self.file;
+        let if_span = Span {
+            file,
+            lo: it.span.start,
+            hi: it.span.end,
+        };
+        if self.if_depth > 0 {
+            decline_region(
+                self,
+                if_span,
+                "nested guard: narrowing inside another guard is outside the subset",
+            );
+            return;
+        }
+        let Some((target, target_span, matched, negated)) = classify_typeof_test(file, &it.test)
+        else {
+            decline_region(
+                self,
+                if_span,
+                "guard condition is not a simple typeof comparison: outside the subset",
+            );
+            return;
+        };
+        if matches!(&it.alternate, Some(Statement::IfStatement(_))) {
+            decline_region(
+                self,
+                if_span,
+                "else-if chain: narrowing across else-if is outside the subset",
+            );
+            return;
+        }
+        let then_span = it.consequent.span();
+        let else_span = it.alternate.as_ref().map(GetSpan::span);
+        let early_return = it.alternate.is_none() && is_divergent(&it.consequent);
+        self.guards.push(TypeofGuardFact {
+            target,
+            target_span,
+            matched,
+            negated,
+            then_span: Span {
+                file,
+                lo: then_span.start,
+                hi: then_span.end,
+            },
+            else_span: else_span.map(|span| Span {
+                file,
+                lo: span.start,
+                hi: span.end,
+            }),
+            early_return,
+            if_span,
+        });
+    }
 }
 
 impl<'a> Visit<'a> for DeclCollector<'a> {
@@ -832,9 +1070,51 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
 
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
         self.record_function(it);
+        if self.fn_depth > 0 {
+            decline_region(
+                self,
+                Span {
+                    file: self.file,
+                    lo: it.span.start,
+                    hi: it.span.end,
+                },
+                "nested function boundary: narrowing does not cross closures",
+            );
+        }
         // Keep walking: bodies nest consts and further function declarations
         // (`function o() { const y = 1; function i() { return y; } … }`).
+        self.fn_depth = self.fn_depth.saturating_add(1);
         walk::walk_function(self, it, flags);
+        self.fn_depth = self.fn_depth.saturating_sub(1);
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        if self.fn_depth > 0 {
+            decline_region(
+                self,
+                Span {
+                    file: self.file,
+                    lo: it.span.start,
+                    hi: it.span.end,
+                },
+                "nested function boundary: narrowing does not cross closures",
+            );
+        }
+        self.fn_depth = self.fn_depth.saturating_add(1);
+        walk::walk_arrow_function_expression(self, it);
+        self.fn_depth = self.fn_depth.saturating_sub(1);
+    }
+
+    fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+        self.record_if(it);
+        // Keep walking: branches nest consts and further guards (which
+        // decline as nested) alongside calls and declarations. Note a direct
+        // `else if` alternate visits at depth+1 like any nested `if`, so a
+        // chain carries both its whole-chain decline and one nested decline
+        // for the inner link: doubly covered, never reasoned about.
+        self.if_depth = self.if_depth.saturating_add(1);
+        walk::walk_if_statement(self, it);
+        self.if_depth = self.if_depth.saturating_sub(1);
     }
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
@@ -938,18 +1218,30 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         })
         .collect();
 
-    let (decls, functions, calls) = collect_decls(file, source, &parse.program, &symbols);
+    let collected = collect_decls(file, source, &parse.program, &symbols);
     ParsedFile {
         file,
         scopes,
         symbols,
         unresolved,
         imports,
-        decls,
-        functions,
-        calls,
+        decls: collected.decls,
+        functions: collected.functions,
+        calls: collected.calls,
+        guards: collected.guards,
+        decline_regions: collected.declines,
         errors,
     }
+}
+
+/// Owned fact collections from one frontend pass, bundled so the collector
+/// return stays lean.
+struct CollectedFacts {
+    decls: Vec<DeclFact>,
+    functions: Vec<FunctionFact>,
+    calls: Vec<CallFact>,
+    guards: Vec<TypeofGuardFact>,
+    declines: Vec<DeclineRegionFact>,
 }
 
 /// Runs the targeted declarator walk and returns owned facts.
@@ -962,7 +1254,7 @@ fn collect_decls<'a>(
     source: &'a str,
     program: &Program<'a>,
     symbols: &[SymbolFact],
-) -> (Vec<DeclFact>, Vec<FunctionFact>, Vec<CallFact>) {
+) -> CollectedFacts {
     let mut index_of = std::collections::HashMap::new();
     let mut scope_of = std::collections::HashMap::new();
     for symbol in symbols {
@@ -981,9 +1273,27 @@ fn collect_decls<'a>(
         decls: Vec::new(),
         functions: Vec::new(),
         calls: Vec::new(),
+        guards: Vec::new(),
+        declines: Vec::new(),
+        if_depth: 0,
+        fn_depth: 0,
     };
     collector.visit_program(program);
-    (collector.decls, collector.functions, collector.calls)
+    let DeclCollector {
+        decls,
+        functions,
+        calls,
+        guards,
+        declines,
+        ..
+    } = collector;
+    CollectedFacts {
+        decls,
+        functions,
+        calls,
+        guards,
+        declines,
+    }
 }
 
 #[cfg(test)]
@@ -1794,5 +2104,177 @@ export function f(a: string): string { return a + b; }
         let pf = parse_module(FileId(0), "s.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
         assert!(pf.calls.is_empty());
+    }
+
+    #[test]
+    fn guard_facts_simple_eq_with_else_exact_spans() {
+        // Offsets hand-counted: `x` at 11..12, `"string"` at 17..25, the
+        // then block at 27..51, the else block at 57..81.
+        let src =
+            "if (typeof x === \"string\") { const a: string = x; } else { const b: number = x; }\n";
+        let pf = parse_module(FileId(0), "g.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 2);
+        assert!(pf.decline_regions.is_empty());
+        assert_eq!(pf.guards.len(), 1);
+        let guard = &pf.guards[0];
+        assert_eq!(guard.target, "x");
+        assert_eq!((guard.target_span.lo, guard.target_span.hi), (11, 12));
+        assert_eq!(slice_of(src, guard.target_span), "x");
+        assert_eq!(guard.matched, "string");
+        assert!(!guard.negated);
+        assert_eq!((guard.then_span.lo, guard.then_span.hi), (27, 51));
+        assert_eq!(slice_of(src, guard.then_span), "{ const a: string = x; }");
+        let else_span = guard.else_span.expect("else branch");
+        assert_eq!((else_span.lo, else_span.hi), (57, 81));
+        assert_eq!(slice_of(src, else_span), "{ const b: number = x; }");
+        assert!(!guard.early_return);
+        assert_eq!((guard.if_span.lo, guard.if_span.hi), (0, 81));
+        assert_eq!(guard.if_span.file, FileId(0));
+    }
+
+    #[test]
+    fn guard_facts_early_return_exact_spans() {
+        // `if` at 23..57 inside `f`; the bare `return;` at 50..57 marks the
+        // early-return shape, so code after the statement refines.
+        let src = "function f(): void {\n  if (typeof x !== \"string\") return;\n}\n";
+        let pf = parse_module(FileId(0), "e.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        assert_eq!(pf.functions[0].body, FunctionBodyFact::Complex);
+        assert!(pf.decline_regions.is_empty());
+        assert_eq!(pf.guards.len(), 1);
+        let guard = &pf.guards[0];
+        assert_eq!(guard.target, "x");
+        assert_eq!((guard.target_span.lo, guard.target_span.hi), (34, 35));
+        assert_eq!(guard.matched, "string");
+        assert!(guard.negated);
+        assert_eq!((guard.then_span.lo, guard.then_span.hi), (50, 57));
+        assert_eq!(slice_of(src, guard.then_span), "return;");
+        assert!(guard.else_span.is_none());
+        assert!(guard.early_return);
+        assert_eq!((guard.if_span.lo, guard.if_span.hi), (23, 57));
+    }
+
+    #[test]
+    fn guard_facts_decline_complex_nested_loose_else_if() {
+        let src = "if (a && b) { const c = 1; }\n\
+                   if (typeof x === \"string\") { if (typeof y === \"number\") { const d = 1; } }\n\
+                   if (typeof x == \"string\") { const e = 1; }\n\
+                   if (typeof x === \"string\") { const f = 1; } else if (typeof x === \"number\") { const g = 1; }\n\
+                   if (typeof y.z === \"string\") { const h = 1; }\n\
+                   if (typeof x === y) { const i = 1; }\n";
+        let pf = parse_module(FileId(0), "d.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        // Only the outer nested guard refines; every other shape declines.
+        assert_eq!(pf.guards.len(), 1);
+        assert_eq!(pf.guards[0].target, "x");
+        assert!(pf.guards[0].else_span.is_none());
+        assert!(!pf.guards[0].early_return);
+        assert_eq!(pf.decline_regions.len(), 7);
+        let reasons: Vec<&str> = pf
+            .decline_regions
+            .iter()
+            .map(|region| region.reason.as_str())
+            .collect();
+        assert!(
+            reasons[0].contains("simple typeof"),
+            "complex condition: {}",
+            reasons[0]
+        );
+        assert!(
+            reasons[1].contains("nested guard"),
+            "nested guard: {}",
+            reasons[1]
+        );
+        assert!(
+            reasons[2].contains("simple typeof"),
+            "loose equality: {}",
+            reasons[2]
+        );
+        assert!(
+            reasons[3].contains("else-if"),
+            "else-if chain: {}",
+            reasons[3]
+        );
+        assert!(
+            reasons[4].contains("nested guard"),
+            "else-if inner link: {}",
+            reasons[4]
+        );
+        assert!(
+            reasons[5].contains("simple typeof"),
+            "member target: {}",
+            reasons[5]
+        );
+        assert!(
+            reasons[6].contains("simple typeof"),
+            "identifier comparand: {}",
+            reasons[6]
+        );
+        for region in &pf.decline_regions {
+            assert_eq!(region.span.file, FileId(0));
+            assert!(region.span.lo < region.span.hi);
+            assert!(slice_of(src, region.span).starts_with("if "));
+        }
+    }
+
+    #[test]
+    fn guard_facts_early_return_variants() {
+        // Swapped operands plus a block-wrapped valued return still mark
+        // early-return; so does a bare `throw` (both refine after, probed
+        // tsc 7.0.2).
+        let src = "function f(): void {\n  if (\"string\" !== typeof x) { return 1; }\n  if (typeof x !== \"string\") throw new Error();\n}\n";
+        let pf = parse_module(FileId(0), "v.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(pf.decline_regions.is_empty());
+        assert_eq!(pf.guards.len(), 2);
+        let first = &pf.guards[0];
+        assert_eq!(first.target, "x");
+        assert_eq!((first.target_span.lo, first.target_span.hi), (47, 48));
+        assert_eq!(first.matched, "string");
+        assert!(first.negated);
+        assert_eq!((first.then_span.lo, first.then_span.hi), (50, 63));
+        assert_eq!(slice_of(src, first.then_span), "{ return 1; }");
+        assert!(first.early_return);
+        assert_eq!((first.if_span.lo, first.if_span.hi), (23, 63));
+        let second = &pf.guards[1];
+        assert_eq!(second.target, "x");
+        assert_eq!((second.target_span.lo, second.target_span.hi), (77, 78));
+        assert!(second.negated);
+        assert_eq!(slice_of(src, second.then_span), "throw new Error();");
+        assert!(second.early_return);
+        assert_eq!((second.if_span.lo, second.if_span.hi), (66, 111));
+    }
+
+    #[test]
+    fn guard_facts_parenthesized_condition_refines() {
+        // One paren layer around the whole condition is transparent.
+        let src = "if ((typeof x === \"string\")) { const a = 1; }\n";
+        let pf = parse_module(FileId(0), "p.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(pf.decline_regions.is_empty());
+        assert_eq!(pf.guards.len(), 1);
+        assert_eq!(pf.guards[0].target, "x");
+        assert!(!pf.guards[0].negated);
+    }
+
+    #[test]
+    fn guard_facts_nested_function_boundary_declines() {
+        // `g` is nested in `f`: its whole body declines (closures reset
+        // narrowing — probed tsc 7.0.2), while no guard fact fires.
+        let src =
+            "function f(): void {\n  function g(): void {\n    const c: number = x;\n  }\n}\n";
+        let pf = parse_module(FileId(0), "n.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(pf.guards.is_empty());
+        assert_eq!(pf.decline_regions.len(), 1);
+        let region = &pf.decline_regions[0];
+        assert_eq!((region.span.lo, region.span.hi), (23, 72));
+        assert_eq!(
+            slice_of(src, region.span),
+            "function g(): void {\n    const c: number = x;\n  }"
+        );
+        assert!(region.reason.contains("closure"));
     }
 }
