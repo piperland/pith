@@ -137,6 +137,51 @@
 //! merged spans through the binder instead (see the solver's interface
 //! driver, which pins first-declaration anchoring in tests).
 //!
+//! Enum facts (P018): [`ParsedFile::enums`] carries one [`EnumFact`] per
+//! `enum` declaration (including `export`, `const`, and `declare` forms), in
+//! visitor (pre-order) order. Symbol linkage reuses the `(name, binding
+//! start)` keying of [`DeclFact`]. Each fact records member facts
+//! ([`EnumMemberFact`]: name plus [`EnumValueKind`]) in source order.
+//! Literal values only — const-eval stays minimal: numeric and string
+//! initializers record their values, while every other shape (identifiers,
+//! unary/binary expressions, member accesses, template literals, …) records
+//! [`EnumValueKind::Computed`] with a reason, so the solver declines those
+//! enums instead of mis-checking them. Missing initializers auto-increment
+//! (`Red, Green` is `0, 1`; `A = 5, B` is `5, 6`): the first defaults to
+//! `0`, later ones to one past the previous NUMERIC member; after a string
+//! or computed member (or a computed member name) the increment is
+//! unknowable, so the member is computed with a reason. Identifier and
+//! string-literal member names record verbatim; computed names decline the
+//! member. `const` enums behave identically for checking (probed tsc 7.0.2),
+//! so [`EnumFact::is_const`] is recorded only. Ambient (`declare`) enums
+//! accept every literal in tsc (probed 7.0.2), so the solver declines them —
+//! recorded via [`EnumFact::declared`], never skipped.
+//!
+//! Namespace facts (P018): [`ParsedFile::namespaces`] carries one
+//! [`NamespaceFact`] per `namespace`/`module` block (including `export` and
+//! `declare` forms; `module Foo {}` and `namespace Foo {}` behave
+//! identically for checking, probed tsc 7.0.2), in visitor (pre-order)
+//! order. Declarations inside are visited normally — consts, functions,
+//! interfaces, enums, and nested namespaces gain their real scopes, symbols,
+//! and facts — so the namespace body is a genuine scope container. Each
+//! fact links its own [`SymbolFact`] like [`DeclFact`] and records
+//! `body_scope`: the per-file scope index of the `TsModuleBlock` scope
+//! (resolved post-pass as the child of the owning scope holding
+//! span-contained member symbols; `u32::MAX` when indeterminable, e.g.
+//! empty blocks), which lets qualified `NS.Member` annotations resolve
+//! through binder scopes. `exported` (on enums, interfaces, and namespaces)
+//! records whether the declaration sat under an `export` wrapper: only
+//! exported members are visible through qualification in tsc (probed 7.0.2:
+//! `NS.Hidden` diagnoses `TS2694` exactly like `NS.Nope`), except inside
+//! ambient (`declare`) namespaces, where every member is visible (probed
+//! tsc 7.0.2). [`NamespaceFact::exported_members`] additionally names every
+//! directly exported member (consts, lets/vars, functions, classes, type
+//! aliases, and nested blocks included), so the solver tells hidden members
+//! (`TS2694`) apart from exported non-types (declined — kind is unknowable
+//! without value facts). `export { E }` specifier lists are not wrappers,
+//! so members exported only that way record `exported: false` and list
+//! nowhere (documented limit).
+//!
 //! Probe basis (tsc 7.0.2 `--strict --pretty false`, recorded in the solver
 //! docs): simple `===`/`!==` typeof guards refine (then/else/after per
 //! negation), `==` narrows identically but is declined (subset pins
@@ -148,10 +193,12 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Expression, Function,
-    FunctionBody, FunctionType, IfStatement, ObjectPropertyKind, Program, PropertyKey,
-    PropertyKind, Statement, TSInterfaceDeclaration, TSPropertySignature, TSSignature,
-    TSTypeAnnotation, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Class, ExportDeclaration,
+    ExportDefaultDeclaration, Expression, Function, FunctionBody, FunctionType, IfStatement,
+    ObjectPropertyKind, Program, PropertyKey, PropertyKind, Statement, TSEnumDeclaration,
+    TSEnumMemberName, TSInterfaceDeclaration, TSNamespaceDeclaration, TSPropertySignature,
+    TSSignature, TSTypeAliasDeclaration, TSTypeAnnotation, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -582,6 +629,111 @@ pub struct InterfaceFact {
     /// `true` when the interface declares type parameters: the solver
     /// declines instead of instantiating them.
     pub has_type_params: bool,
+    /// Whether the declaration sat under an `export` wrapper. Only exported
+    /// members are visible through namespace qualification (except inside
+    /// ambient namespaces); top-level uses ignore the flag.
+    pub exported: bool,
+}
+
+/// One member of an `enum` declaration: its constant value, when computable
+/// without full const-eval.
+///
+/// Numeric and string initializers record their values; everything else
+/// (identifiers, unary/binary expressions, member accesses, …) is
+/// [`EnumValueKind::Computed`] with a reason, so the solver declines those
+/// enums instead of mis-checking them. Missing initializers auto-increment
+/// past the previous numeric member (`0` for the first); after a string or
+/// computed member the increment is unknowable and also computed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EnumValueKind {
+    /// A numeric literal initializer (`1`, `0x10`, …): the parsed value.
+    Number(f64),
+    /// A string literal initializer (`"a"`, …): the unescaped value.
+    String(String),
+    /// Any non-literal initializer, missing increment base, or computed
+    /// member name: the solver declines enums holding one of these.
+    Computed {
+        /// Why no value is recorded (e.g. `"non-literal initializer"`).
+        reason: String,
+    },
+}
+
+/// One `enum` member: its name plus its constant value, if computable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumMemberFact {
+    /// Member name as written (identifier and string-literal names verbatim;
+    /// sliced key text for computed names, which always decline).
+    pub name: String,
+    /// Constant value, or the decline reason when uncomputable.
+    pub value: EnumValueKind,
+    /// Span of the whole member (`A = 1`, name included).
+    pub span: Span,
+}
+
+/// One `enum` declaration's declaration facts, keyed to its symbol.
+///
+/// `symbol`/`scope` link exactly like [`DeclFact`]: the per-file index of
+/// the [`SymbolFact`] for the enum name (matched on name + binding start)
+/// plus that symbol's owning scope. Merged pairs (`enum A { X }` plus
+/// `enum A { Y }`) share one symbol — each declaration links it with its
+/// own member list; the solver declines ambiguous multi-shape enums.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumFact {
+    /// Per-file symbol index of the enum name binding.
+    pub symbol: u32,
+    /// Owning scope (per-file scope index) of [`EnumFact::symbol`].
+    pub scope: u32,
+    /// Enum name as written.
+    pub name: String,
+    /// Span of the whole declaration.
+    pub span: Span,
+    /// Member facts in source order.
+    pub members: Vec<EnumMemberFact>,
+    /// `true` for `const enum`: checking is identical (probed tsc 7.0.2),
+    /// so the flag is recorded only.
+    pub is_const: bool,
+    /// `true` for `declare enum` (ambient): tsc accepts every literal, so
+    /// the solver declines instead of verifying.
+    pub declared: bool,
+    /// Whether the declaration sat under an `export` wrapper (gates
+    /// namespace-qualified visibility, except inside ambient namespaces).
+    pub exported: bool,
+}
+
+/// One `namespace`/`module` block's declaration facts, keyed to its symbol.
+///
+/// `symbol`/`scope` link exactly like [`DeclFact`]: the per-file index of
+/// the [`SymbolFact`] for the block name (matched on name + binding start)
+/// plus that symbol's owning scope. `namespace A.B { }` parses as nested
+/// declarations, so each level carries its own fact. `declare global { }`
+/// and `declare module "x" { }` carry no fact (different nodes); their inner
+/// declarations are still visited normally.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceFact {
+    /// Per-file symbol index of the block name binding.
+    pub symbol: u32,
+    /// Owning scope (per-file scope index) of [`NamespaceFact::symbol`].
+    pub scope: u32,
+    /// Block name as written.
+    pub name: String,
+    /// Span of the whole declaration.
+    pub span: Span,
+    /// Per-file scope index of the `TsModuleBlock` scope holding the
+    /// block's members (`u32::MAX` when indeterminable, e.g. empty blocks).
+    /// Qualified `NS.Member` annotations resolve `Member` from this scope
+    /// through the binder.
+    pub body_scope: u32,
+    /// `true` for `declare namespace` (ambient): every member is visible
+    /// through qualification, exported or not (probed tsc 7.0.2).
+    pub declared: bool,
+    /// Whether the declaration sat under an `export` wrapper (gates
+    /// qualification of nested namespaces).
+    pub exported: bool,
+    /// Names directly exported from this block (`export const X`,
+    /// `export enum E`, …, but not `export { X }` lists): the solver tells
+    /// hidden members (`TS2694`) apart from exported non-types (declined —
+    /// kind is unknowable without value facts). In visit order.
+    pub exported_members: Vec<String>,
 }
 
 /// Everything Pith owns after a frontend pass. Arenas are dropped on return.
@@ -610,6 +762,12 @@ pub struct ParsedFile {
     /// One fact per `interface` declaration, in visitor (pre-order) order.
     /// Empty when the file declares no interfaces.
     pub interfaces: Vec<InterfaceFact>,
+    /// One fact per `enum` declaration, in visitor (pre-order) order.
+    /// Empty when the file declares no enums.
+    pub enums: Vec<EnumFact>,
+    /// One fact per `namespace`/`module` block, in visitor (pre-order)
+    /// order. Empty when the file declares no namespaces.
+    pub namespaces: Vec<NamespaceFact>,
     /// Parser + semantic diagnostics as plain strings (codes deferred to P008).
     pub errors: Vec<String>,
 }
@@ -647,6 +805,8 @@ struct DeclCollector<'a> {
     guards: Vec<TypeofGuardFact>,
     declines: Vec<DeclineRegionFact>,
     interfaces: Vec<InterfaceFact>,
+    enums: Vec<EnumFact>,
+    namespaces: Vec<NamespaceFact>,
     /// `if` statements enclosing the current visit point: anything above zero
     /// means a nested guard (decline, never refine).
     if_depth: u32,
@@ -654,6 +814,15 @@ struct DeclCollector<'a> {
     /// means a nested closure (its whole body declines — narrowing does not
     /// cross closures, probed tsc 7.0.2).
     fn_depth: u32,
+    /// `export <declaration>` wrappers enclosing the current visit point:
+    /// anything above zero means the declaration is exported (gates
+    /// namespace-qualified visibility solver-side). Specifier lists
+    /// (`export { E }`) are not wrappers and do not count (documented limit).
+    export_depth: u32,
+    /// Innermost-enclosing namespace facts, as indices into `namespaces`:
+    /// exported declarations attribute their names to the stack top (see
+    /// [`NamespaceFact::exported_members`]).
+    ns_stack: Vec<u32>,
 }
 
 /// Builds the colon-stripped annotation fact for a `TSTypeAnnotation` span
@@ -833,6 +1002,114 @@ fn interface_member_fact(
             "construct signature".to_owned(),
             "construct signature is outside the subset".to_owned(),
         ),
+    }
+}
+
+/// Names one enum member: identifier and string-literal names verbatim
+/// plus a plain-key flag; computed names slice the key text
+/// (`"<unknown>"` only on skew) and clear the flag so the caller declines
+/// the member instead of mis-keying.
+fn enum_member_name(source: &str, id: &TSEnumMemberName<'_>) -> (String, bool) {
+    match id {
+        TSEnumMemberName::Identifier(found) => (found.name.to_string(), true),
+        TSEnumMemberName::String(literal) => (literal.value.as_str().to_owned(), true),
+        _ => {
+            let fallback = slice_at(source, id.span()).unwrap_or("<unknown>");
+            (fallback.to_owned(), false)
+        }
+    }
+}
+
+/// Auto-increment base threading through one enum's members.
+///
+/// The first member defaults to `0`; later missing initializers add one to
+/// the last numeric value; after a string or computed member there is no
+/// base (tsc itself rejects such members without initializers).
+#[derive(Clone, Copy)]
+enum IncrementBase {
+    /// No member seen yet: a missing initializer means `0`.
+    First,
+    /// Last member was numeric: a missing initializer means `base + 1`.
+    Numeric(f64),
+    /// Last member was string or computed: a missing initializer declines.
+    NonNumeric,
+}
+
+/// Classifies one enum member initializer into its value, threading the
+/// auto-increment base.
+///
+/// Returns the value plus the base for the next member. Numeric and string
+/// literals record values; everything else (identifiers, unary/binary
+/// expressions, member accesses, …) is computed with a reason, as is a
+/// missing initializer with no numeric base.
+fn enum_member_value(
+    initializer: Option<&Expression<'_>>,
+    base: IncrementBase,
+) -> (EnumValueKind, IncrementBase) {
+    let Some(expression) = initializer else {
+        return match base {
+            IncrementBase::First => (EnumValueKind::Number(0.0), IncrementBase::Numeric(0.0)),
+            IncrementBase::Numeric(found) => (
+                EnumValueKind::Number(found + 1.0),
+                IncrementBase::Numeric(found + 1.0),
+            ),
+            IncrementBase::NonNumeric => (
+                EnumValueKind::Computed {
+                    reason: "auto-increment after a non-numeric member is outside the subset"
+                        .to_owned(),
+                },
+                IncrementBase::NonNumeric,
+            ),
+        };
+    };
+    match expression {
+        Expression::NumericLiteral(literal) => (
+            EnumValueKind::Number(literal.value),
+            IncrementBase::Numeric(literal.value),
+        ),
+        Expression::StringLiteral(literal) => (
+            EnumValueKind::String(literal.value.as_str().to_owned()),
+            IncrementBase::NonNumeric,
+        ),
+        _ => (
+            EnumValueKind::Computed {
+                reason: "non-literal initializer is outside the subset".to_owned(),
+            },
+            IncrementBase::NonNumeric,
+        ),
+    }
+}
+
+/// Whether `inner` lies fully inside `outer` (same file, closed bounds).
+fn span_contains(outer: Span, inner: Span) -> bool {
+    outer.file == inner.file && outer.lo <= inner.lo && inner.hi <= outer.hi
+}
+
+/// Fills `body_scope` on each namespace fact: the child of the owning scope
+/// holding span-contained member symbols (see the module-level namespace
+/// note). Scopes arrive root-first, so the first match wins deterministically;
+/// facts whose owning scope missed stay `u32::MAX` (empty blocks).
+fn assign_namespace_body_scopes(
+    scopes: &[ScopeFact],
+    symbols: &[SymbolFact],
+    namespaces: &mut [NamespaceFact],
+) {
+    for namespace in namespaces.iter_mut() {
+        if namespace.scope == u32::MAX {
+            continue;
+        }
+        for scope in scopes {
+            if scope.parent != namespace.scope {
+                continue;
+            }
+            let owned = symbols.iter().any(|symbol| {
+                symbol.scope == scope.index && span_contains(namespace.span, symbol.span)
+            });
+            if owned {
+                namespace.body_scope = scope.index;
+                break;
+            }
+        }
     }
 }
 
@@ -1071,6 +1348,37 @@ fn is_divergent(statement: &Statement<'_>) -> bool {
 }
 
 impl DeclCollector<'_> {
+    /// Attributes `name` to the innermost enclosing namespace when declared
+    /// under an `export` wrapper (see [`NamespaceFact::exported_members`]).
+    /// Top-level declarations have no stack top and record nothing: their
+    /// own `exported` flags (read at record time) are what tail resolution
+    /// never consults.
+    fn note_exported(&mut self, name: &str) {
+        if self.export_depth == 0 {
+            return;
+        }
+        if let Some(&top) = self.ns_stack.last() {
+            if let Some(fact) = self
+                .namespaces
+                .get_mut(usize::try_from(top).unwrap_or(usize::MAX))
+            {
+                fact.exported_members.push(name.to_owned());
+            }
+        }
+    }
+
+    /// Attributes one variable declarator's name when it is a plain
+    /// identifier binding (destructured patterns bind many symbols and are
+    /// skipped, mirroring [`record_declarator`]).
+    fn note_declarator(&mut self, declarator: &VariableDeclarator<'_>) {
+        let BindingPattern::BindingIdentifier(binding) = &declarator.id else {
+            return;
+        };
+        if let Some(name) = slice_at(self.source, binding.span) {
+            self.note_exported(name);
+        }
+    }
+
     /// Records one declarator when it is a `const` identifier binding.
     /// Destructured patterns bind many symbols and are skipped.
     fn record_declarator(&mut self, declarator: &VariableDeclarator<'_>) {
@@ -1079,6 +1387,7 @@ impl DeclCollector<'_> {
         };
         let name = slice_at(self.source, binding.span);
         let Some(name) = name else { return };
+        self.note_exported(name);
         let Some(&symbol) = self.symbols.get(&(name.to_owned(), binding.span.start)) else {
             // No matching symbol (only possible with recovery from parse
             // errors): skip rather than invent a key.
@@ -1143,6 +1452,7 @@ impl DeclCollector<'_> {
         };
         let name = slice_at(self.source, id.span);
         let Some(name) = name else { return };
+        self.note_exported(name);
         let Some(symbol) = self
             .symbols
             .get(&(name.to_owned(), id.span.start))
@@ -1239,6 +1549,7 @@ impl DeclCollector<'_> {
         let Some(name) = slice_at(self.source, decl.id.span) else {
             return;
         };
+        self.note_exported(name);
         let Some(&symbol) = self.symbols.get(&(name.to_owned(), decl.id.span.start)) else {
             // No matching symbol (only possible with recovery from parse
             // errors): skip rather than invent a key.
@@ -1270,6 +1581,7 @@ impl DeclCollector<'_> {
             .map(|member| interface_member_fact(source, file, member))
             .collect();
         let span = decl.span;
+        let exported = self.export_depth > 0;
         self.interfaces.push(InterfaceFact {
             symbol,
             scope: self.scopes.get(&symbol).copied().unwrap_or(u32::MAX),
@@ -1282,6 +1594,108 @@ impl DeclCollector<'_> {
             members,
             heritage,
             has_type_params: decl.type_parameters.is_some(),
+            exported,
+        });
+    }
+
+    /// Records one enum declaration with its member facts.
+    ///
+    /// Symbol linkage reuses the `(name, binding start)` keying of
+    /// [`DeclFact`]; anonymous enums cannot occur. Member values thread the
+    /// auto-increment base in source order (see [`enum_member_value`]);
+    /// computed names decline their member. `exported` reads the enclosing
+    /// `export`-wrapper depth; `body_scope` is filled post-pass.
+    fn record_enum(&mut self, decl: &TSEnumDeclaration<'_>) {
+        let Some(name) = slice_at(self.source, decl.id.span) else {
+            return;
+        };
+        self.note_exported(name);
+        let Some(&symbol) = self.symbols.get(&(name.to_owned(), decl.id.span.start)) else {
+            // No matching symbol (only possible with recovery from parse
+            // errors): skip rather than invent a key.
+            return;
+        };
+        let source = self.source;
+        let file = self.file;
+        let mut base = IncrementBase::First;
+        let members = decl
+            .body
+            .members
+            .iter()
+            .map(|member| {
+                let span = Span {
+                    file,
+                    lo: member.span.start,
+                    hi: member.span.end,
+                };
+                let (member_name, plain) = enum_member_name(source, &member.id);
+                if !plain {
+                    base = IncrementBase::NonNumeric;
+                    return EnumMemberFact {
+                        name: member_name,
+                        value: EnumValueKind::Computed {
+                            reason: "computed member name is outside the subset".to_owned(),
+                        },
+                        span,
+                    };
+                }
+                let (value, next) = enum_member_value(member.initializer.as_ref(), base);
+                base = next;
+                EnumMemberFact {
+                    name: member_name,
+                    value,
+                    span,
+                }
+            })
+            .collect();
+        let span = decl.span;
+        self.enums.push(EnumFact {
+            symbol,
+            scope: self.scopes.get(&symbol).copied().unwrap_or(u32::MAX),
+            name: name.to_owned(),
+            span: Span {
+                file,
+                lo: span.start,
+                hi: span.end,
+            },
+            members,
+            is_const: decl.r#const,
+            declared: decl.declare,
+            exported: self.export_depth > 0,
+        });
+    }
+
+    /// Records one namespace/module block.
+    ///
+    /// Symbol linkage reuses the `(name, binding start)` keying of
+    /// [`DeclFact`]. Nested `namespace A.B { }` declarations record one fact
+    /// per level (the walk visits each); `exported` reads the enclosing
+    /// `export`-wrapper depth; `body_scope` is filled post-pass (see
+    /// [`assign_namespace_body_scopes`]).
+    fn record_namespace(&mut self, decl: &TSNamespaceDeclaration<'_>) {
+        let Some(name) = slice_at(self.source, decl.id.span) else {
+            return;
+        };
+        self.note_exported(name);
+        let Some(&symbol) = self.symbols.get(&(name.to_owned(), decl.id.span.start)) else {
+            // No matching symbol (only possible with recovery from parse
+            // errors): skip rather than invent a key.
+            return;
+        };
+        let span = decl.span;
+        self.namespaces.push(NamespaceFact {
+            symbol,
+            scope: self.scopes.get(&symbol).copied().unwrap_or(u32::MAX),
+            name: name.to_owned(),
+            span: Span {
+                file: self.file,
+                lo: span.start,
+                hi: span.end,
+            },
+            body_scope: u32::MAX,
+            declared: decl.declare,
+            exported: self.export_depth > 0,
+            exported_members: Vec::new(),
         });
     }
 
@@ -1403,6 +1817,12 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
             for declarator in &it.declarations {
                 self.record_declarator(declarator);
             }
+        } else if self.export_depth > 0 {
+            // `let`/`var` emit no decl facts (P010 gap), but their exported
+            // names still count for namespace visibility.
+            for declarator in &it.declarations {
+                self.note_declarator(declarator);
+            }
         }
         // Keep walking: initializers may nest functions/blocks that declare
         // their own consts (`const f = () => { const y = 1; … }`).
@@ -1452,6 +1872,72 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
         // the visitor total over future AST shapes (mirrors the other
         // record-then-walk methods).
         walk::walk_ts_interface_declaration(self, it);
+    }
+
+    fn visit_ts_enum_declaration(&mut self, it: &TSEnumDeclaration<'a>) {
+        self.record_enum(it);
+        // Keep walking: initializers may nest functions/blocks that declare
+        // their own consts (`enum E { A = (() => 1)() }`).
+        walk::walk_ts_enum_declaration(self, it);
+    }
+
+    fn visit_ts_namespace_declaration(&mut self, it: &TSNamespaceDeclaration<'a>) {
+        // Keep walking: members nest consts, functions, interfaces, enums,
+        // and further namespaces, each gaining real scopes/symbols/facts.
+        // Nested `namespace A.B { }` visits once per level. The stack
+        // attributes exported members to the innermost block; a skipped
+        // record (only possible with recovery from parse errors) pushes
+        // nothing, so members attribute outward rather than mis-attributing.
+        let before = self.namespaces.len();
+        self.record_namespace(it);
+        let pushed = self.namespaces.len() > before;
+        if pushed {
+            let top = u32::try_from(before).unwrap_or(u32::MAX);
+            self.ns_stack.push(top);
+        }
+        walk::walk_ts_namespace_declaration(self, it);
+        if pushed {
+            self.ns_stack.pop();
+        }
+    }
+
+    fn visit_export_declaration(&mut self, it: &ExportDeclaration<'a>) {
+        // `export <declaration>` wrappers mark exportedness (gates
+        // namespace-qualified visibility solver-side).
+        self.export_depth = self.export_depth.saturating_add(1);
+        walk::walk_export_declaration(self, it);
+        self.export_depth = self.export_depth.saturating_sub(1);
+    }
+
+    fn visit_export_default_declaration(&mut self, it: &ExportDefaultDeclaration<'a>) {
+        self.export_depth = self.export_depth.saturating_add(1);
+        walk::walk_export_default_declaration(self, it);
+        self.export_depth = self.export_depth.saturating_sub(1);
+    }
+
+    fn visit_class(&mut self, it: &Class<'a>) {
+        // Named classes count for namespace visibility (their qualified
+        // uses decline as non-types solver-side); anonymous class
+        // expressions carry no member name. The scope-membership guard
+        // keeps expression-local names from ever matching.
+        if let Some(id) = it.id.as_ref() {
+            if let Some(name) = slice_at(self.source, id.span) {
+                self.note_exported(name);
+            }
+        }
+        // Keep walking: static blocks and computed keys nest declarators.
+        walk::walk_class(self, it);
+    }
+
+    fn visit_ts_type_alias_declaration(&mut self, it: &TSTypeAliasDeclaration<'a>) {
+        // Type aliases count for namespace visibility (their qualified uses
+        // decline as non-types solver-side — kind is unknowable facts-side).
+        if let Some(name) = slice_at(self.source, it.id.span) {
+            self.note_exported(name);
+        }
+        // Keep walking: the aliased type nests no declarators, but the walk
+        // keeps the visitor total over future AST shapes.
+        walk::walk_ts_type_alias_declaration(self, it);
     }
 
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
@@ -1567,7 +2053,7 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         })
         .collect();
 
-    let collected = collect_decls(file, source, &parse.program, &symbols);
+    let collected = collect_decls(file, source, &parse.program, &symbols, &scopes);
     ParsedFile {
         file,
         scopes,
@@ -1580,6 +2066,8 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         guards: collected.guards,
         decline_regions: collected.declines,
         interfaces: collected.interfaces,
+        enums: collected.enums,
+        namespaces: collected.namespaces,
         errors,
     }
 }
@@ -1593,18 +2081,22 @@ struct CollectedFacts {
     guards: Vec<TypeofGuardFact>,
     declines: Vec<DeclineRegionFact>,
     interfaces: Vec<InterfaceFact>,
+    enums: Vec<EnumFact>,
+    namespaces: Vec<NamespaceFact>,
 }
 
 /// Runs the targeted declarator walk and returns owned facts.
 ///
 /// Symbol linkage resolves each declarator's `(name, binding start)` to the
 /// per-file [`SymbolFact`] index built above; facts come out in source
-/// (visitor) order, so the sequences are deterministic.
+/// (visitor) order, so the sequences are deterministic. Namespace
+/// `body_scope` values are filled post-pass from `scopes` plus `symbols`.
 fn collect_decls<'a>(
     file: FileId,
     source: &'a str,
     program: &Program<'a>,
     symbols: &[SymbolFact],
+    scopes: &[ScopeFact],
 ) -> CollectedFacts {
     let mut index_of = std::collections::HashMap::new();
     let mut scope_of = std::collections::HashMap::new();
@@ -1627,8 +2119,12 @@ fn collect_decls<'a>(
         guards: Vec::new(),
         declines: Vec::new(),
         interfaces: Vec::new(),
+        enums: Vec::new(),
+        namespaces: Vec::new(),
         if_depth: 0,
         fn_depth: 0,
+        export_depth: 0,
+        ns_stack: Vec::new(),
     };
     collector.visit_program(program);
     let DeclCollector {
@@ -1638,8 +2134,11 @@ fn collect_decls<'a>(
         guards,
         declines,
         interfaces,
+        mut namespaces,
+        enums,
         ..
     } = collector;
+    assign_namespace_body_scopes(scopes, symbols, &mut namespaces);
     CollectedFacts {
         decls,
         functions,
@@ -1647,6 +2146,8 @@ fn collect_decls<'a>(
         guards,
         declines,
         interfaces,
+        enums,
+        namespaces,
     }
 }
 
@@ -2830,5 +3331,252 @@ export function f(a: string): string { return a + b; }
         assert_eq!(fact.members[0].name, "a");
         assert!(fact.members[0].complex_reason.is_none());
         assert!(pf.decls.is_empty(), "merged const emits no decl fact");
+    }
+
+    #[test]
+    fn enum_facts_record_literal_values_and_auto_increment() {
+        let src = "enum Color { Red, Green, Blue }\n\
+                   enum Base { A = 5, B, C }\n\
+                   enum SN { \"kebab-key\" = 3 }\n";
+        let pf = parse_module(FileId(0), "e.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.enums.len(), 3);
+        let color = &pf.enums[0];
+        assert_eq!(color.name, "Color");
+        assert_eq!(slice_of(src, color.span), "enum Color { Red, Green, Blue }");
+        assert!(!color.is_const && !color.declared && !color.exported);
+        let symbol = &pf.symbols[usize::try_from(color.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "Color");
+        assert_eq!(color.scope, symbol.scope);
+        let values: Vec<(&str, EnumValueKind)> = color
+            .members
+            .iter()
+            .map(|member| (member.name.as_str(), member.value.clone()))
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("Red", EnumValueKind::Number(0.0)),
+                ("Green", EnumValueKind::Number(1.0)),
+                ("Blue", EnumValueKind::Number(2.0)),
+            ]
+        );
+        let base = &pf.enums[1];
+        assert_eq!(base.name, "Base");
+        let values: Vec<f64> = base
+            .members
+            .iter()
+            .map(|member| match member.value {
+                EnumValueKind::Number(found) => found,
+                ref other => panic!("expected number, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(values, [5.0, 6.0, 7.0]);
+        // String-literal member names record verbatim and stay checkable.
+        let named = &pf.enums[2];
+        assert_eq!(named.members.len(), 1);
+        assert_eq!(named.members[0].name, "kebab-key");
+        assert_eq!(named.members[0].value, EnumValueKind::Number(3.0));
+        for fact in &pf.enums {
+            assert_eq!(fact.span.file, FileId(0));
+            assert!(fact.span.lo < fact.span.hi);
+        }
+    }
+
+    #[test]
+    fn enum_facts_record_strings_and_decline_computed() {
+        let src = "enum Str { A = \"a\", B = \"b\" }\n\
+                   const K = 10;\n\
+                   enum Comp { X = K, Y = -1, Z }\n\
+                   enum AfterStr { S = \"s\", T }\n";
+        let pf = parse_module(FileId(0), "c.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.enums.len(), 3);
+        let strings = &pf.enums[0];
+        assert_eq!(
+            strings.members[0].value,
+            EnumValueKind::String("a".to_owned())
+        );
+        assert_eq!(
+            strings.members[1].value,
+            EnumValueKind::String("b".to_owned())
+        );
+        // Identifier and unary initializers are computed with reasons, and a
+        // bare member after them cannot auto-increment, so it declines too.
+        let computed = &pf.enums[1];
+        assert_eq!(computed.members.len(), 3);
+        for member in &computed.members {
+            let EnumValueKind::Computed { reason } = &member.value else {
+                panic!("expected computed, got {:?}", member.value);
+            };
+            assert!(
+                reason.contains("outside the subset"),
+                "reason for {}: {reason}",
+                member.name
+            );
+        }
+        // A bare member after a string member declines (no numeric base).
+        let after = &pf.enums[2];
+        assert_eq!(
+            after.members[0].value,
+            EnumValueKind::String("s".to_owned())
+        );
+        let EnumValueKind::Computed { reason } = &after.members[1].value else {
+            panic!("expected computed, got {:?}", after.members[1].value);
+        };
+        assert!(reason.contains("auto-increment"), "reason: {reason}");
+    }
+
+    #[test]
+    fn enum_facts_carry_const_declare_export_flags() {
+        let src = "const enum CE { X }\ndeclare enum AE { A }\nexport enum EE { E }\n";
+        let pf = parse_module(FileId(0), "f.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.enums.len(), 3);
+        assert!(pf.enums[0].is_const && !pf.enums[0].declared && !pf.enums[0].exported);
+        assert!(!pf.enums[1].is_const && pf.enums[1].declared && !pf.enums[1].exported);
+        assert!(!pf.enums[2].is_const && !pf.enums[2].declared && pf.enums[2].exported);
+        // Ambient members still record (the solver declines them, never skips).
+        assert_eq!(pf.enums[1].members.len(), 1);
+        assert_eq!(pf.enums[1].members[0].value, EnumValueKind::Number(0.0));
+    }
+
+    #[test]
+    fn enum_facts_decline_computed_names() {
+        let pf = parse_module(FileId(0), "w.ts", "enum Weird { [\"a-b\"] = 1 }\n");
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.enums.len(), 1);
+        assert_eq!(pf.enums[0].members.len(), 1);
+        let EnumValueKind::Computed { reason } = &pf.enums[0].members[0].value else {
+            panic!("expected computed, got {:?}", pf.enums[0].members[0].value);
+        };
+        assert!(reason.contains("member name"), "reason: {reason}");
+    }
+
+    #[test]
+    fn namespace_facts_scope_members_and_body_scope() {
+        let src = "namespace NS { export const VAL = 1; export enum Dir { Up } enum Priv { A } }\n\
+                   const y: number = NS.VAL;\n";
+        let pf = parse_module(FileId(0), "n.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.namespaces.len(), 1);
+        let fact = &pf.namespaces[0];
+        assert_eq!(fact.name, "NS");
+        assert!(!fact.declared && !fact.exported);
+        assert!(fact.span.lo < fact.span.hi);
+        assert_eq!(fact.span.file, FileId(0));
+        let symbol = &pf.symbols[usize::try_from(fact.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "NS");
+        assert_eq!(fact.scope, symbol.scope);
+        // The body scope is a real child holding the member symbols.
+        assert_ne!(fact.body_scope, u32::MAX, "body scope resolved");
+        let body = &pf.scopes[usize::try_from(fact.body_scope).expect("dense scope index")];
+        assert_eq!(body.parent, fact.scope);
+        for name in ["VAL", "Dir", "Priv"] {
+            let member = pf.symbols.iter().find(|s| s.name == name).expect(name);
+            assert_eq!(
+                member.scope, fact.body_scope,
+                "member {name} scoped in body"
+            );
+        }
+        // Declarations inside are visited normally with real facts.
+        assert!(pf.decls.iter().any(|decl| {
+            pf.symbols[usize::try_from(decl.symbol).expect("dense symbol index")].name == "VAL"
+        }));
+        // Only `export`-wrapped members list as exported (`Priv` hides).
+        assert!(fact.exported_members.contains(&"VAL".to_owned()));
+        assert!(fact.exported_members.contains(&"Dir".to_owned()));
+        assert!(!fact.exported_members.contains(&"Priv".to_owned()));
+        let dir = pf
+            .enums
+            .iter()
+            .find(|fact| fact.name == "Dir")
+            .expect("Dir fact");
+        assert!(dir.exported);
+        assert_eq!(dir.scope, fact.body_scope);
+        let priv_enum = pf
+            .enums
+            .iter()
+            .find(|fact| fact.name == "Priv")
+            .expect("Priv fact");
+        assert!(!priv_enum.exported);
+    }
+
+    #[test]
+    fn namespace_facts_nest_and_track_exported() {
+        let src = "namespace Outer { export namespace Inner { export const V = 2; } }\n\
+                   namespace Empty {}\n\
+                   declare namespace Ambient { const A: number; }\n\
+                   module M { export const W = 1; }\n";
+        let pf = parse_module(FileId(0), "m.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.namespaces.len(), 5);
+        let outer = &pf.namespaces[0];
+        let inner = &pf.namespaces[1];
+        assert_eq!(
+            (outer.name.as_str(), inner.name.as_str()),
+            ("Outer", "Inner")
+        );
+        assert!(!outer.exported && inner.exported);
+        assert_ne!(outer.body_scope, u32::MAX);
+        assert_ne!(inner.body_scope, u32::MAX);
+        // The nested block lives inside the outer body scope.
+        assert_eq!(inner.scope, outer.body_scope);
+        let inner_body = &pf.scopes[usize::try_from(inner.body_scope).expect("dense scope index")];
+        assert_eq!(inner_body.parent, inner.scope);
+        let vee = pf.symbols.iter().find(|s| s.name == "V").expect("V symbol");
+        assert_eq!(vee.scope, inner.body_scope);
+        // Exported members attribute to the innermost block.
+        assert!(outer.exported_members.contains(&"Inner".to_owned()));
+        assert!(inner.exported_members.contains(&"V".to_owned()));
+        // Empty blocks have no member symbols, so no body scope.
+        assert_eq!(pf.namespaces[2].name, "Empty");
+        assert_eq!(pf.namespaces[2].body_scope, u32::MAX);
+        // Ambient and `module`-keyword forms record like plain blocks.
+        assert!(pf.namespaces[3].declared && !pf.namespaces[3].exported);
+        assert_eq!(pf.namespaces[3].name, "Ambient");
+        assert_eq!(pf.namespaces[4].name, "M");
+        assert!(!pf.namespaces[4].declared);
+        assert_ne!(pf.namespaces[4].body_scope, u32::MAX);
+        for fact in &pf.namespaces {
+            assert_eq!(fact.span.file, FileId(0));
+            assert!(fact.span.lo < fact.span.hi);
+        }
+    }
+
+    #[test]
+    fn interface_facts_track_exported() {
+        let src = "interface Top { a: number; }\n\
+                   namespace NS { export interface Pub { x: number; } interface Hidden { y: number; } }\n";
+        let pf = parse_module(FileId(0), "i.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.interfaces.len(), 3);
+        assert!(!pf.interfaces[0].exported);
+        assert!(pf.interfaces[1].exported);
+        assert!(!pf.interfaces[2].exported);
+        for fact in &pf.interfaces {
+            assert!(fact.members[0].complex_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn namespace_facts_list_all_exported_member_kinds() {
+        // Every exported declaration kind attributes its name (hidden ones
+        // list nowhere); `export { C }` specifier lists are not wrappers.
+        let src = "namespace NS { export const C = 1; export let L = 2; export function F(): void {} export class K {} export type T = number; export enum E { A } export interface I { x: number; } export namespace N {} const Hid = 3; }\n";
+        let pf = parse_module(FileId(0), "k.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.namespaces.len(), 2);
+        let fact = &pf.namespaces[0];
+        assert_eq!(fact.name, "NS");
+        for name in ["C", "L", "F", "K", "T", "E", "I", "N"] {
+            assert!(
+                fact.exported_members.contains(&name.to_owned()),
+                "missing {name}: {:?}",
+                fact.exported_members
+            );
+        }
+        assert!(!fact.exported_members.contains(&"Hid".to_owned()));
+        assert_eq!(pf.namespaces[1].name, "N");
     }
 }
