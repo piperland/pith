@@ -1,0 +1,16 @@
+[package]
+name = "pith-queries"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pith_queries"
+path = "src/lib.rs"
+
+[dependencies]
+pith-ids = { path = "../pith-ids" }
+pith-types = { path = "../pith-types" }
+pith-symbols = { path = "../pith-symbols" }
+
+[lints]
+workspace = true

@@ -530,10 +530,26 @@ name = "pith-ids"
 version = "0.1.0"
 
 [[package]]
+name = "pith-queries"
+version = "0.1.0"
+dependencies = [
+ "pith-ids",
+ "pith-symbols",
+ "pith-types",
+]
+
+[[package]]
 name = "pith-symbols"
 version = "0.1.0"
 dependencies = [
  "pith-frontend",
+ "pith-ids",
+]
+
+[[package]]
+name = "pith-types"
+version = "0.1.0"
+dependencies = [
  "pith-ids",
 ]
 
