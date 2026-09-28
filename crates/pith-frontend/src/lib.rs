@@ -53,12 +53,42 @@
 //! parenthesized returns (`return (1)`) classify
 //! [`ReturnKind::NonLiteral`], exactly like const initializers; directives
 //! do not count as statements for [`FunctionBodyFact::Empty`].
+//!
+//! Call facts (P014): [`ParsedFile::calls`] carries one [`CallFact`] per
+//! direct `f(...)` call expression, in visitor (pre-order) order. Each fact
+//! records the callee name plus its identifier span ([`CallFact::callee_span`]),
+//! the whole call span ([`CallFact::span`]), and one [`CallArgFact`] per
+//! argument (literal kind via [`CallArgKind`] plus span). Only plain
+//! `Identifier` callees emit facts: method/member calls (`obj.m()`), optional
+//! chains (`f?.()`), and calls with any spread element (`f(...xs)`) are
+//! documented non-emissions — out of the solver subset, never mis-recorded.
+//! (`super(...)`, `import(...)`, `new f()`, and tagged templates never reach
+//! the call visitor as identifier calls.) Nested calls each emit their own
+//! fact (`f(g(1))` yields one for `g(1)` and one for `f(...)`, the inner
+//! argument classifying [`CallArgKind::NonLiteral`]).
+//!
+//! Probe basis (tsc 7.0.2 `--strict --pretty false`, recorded in the solver
+//! docs): `TS2554` (`Expected 2 arguments, but got 1.`, too-few anchored at
+//! the callee, too-many at the first excess argument) beats `TS2345`
+//! (`Argument of type 'string' is not assignable to parameter of type
+//! 'number'.`, anchored at the argument) — one diagnostic per call site, and
+//! only the first mismatched argument reports. Optional/rest arities
+//! (`Expected 1-2 arguments …`, `TS2555`) and overload failures (`TS2769`)
+//! are declined by the solver; unresolved callees are already tracked as
+//! [`UnresolvedFact`]s, so the solver does not double-report them.
+//!
+//! Parameter enabling (P014, entailed by the call checker): each
+//! [`FunctionParamFact`] additionally carries its annotation text plus
+//! `optional`/`is_rest` markers. Exact-arity checking needs to decline range
+//! (`b?: number`, defaulted) and variadic (`...rest`) lists, and arg-type
+//! checking needs the annotated names — none of which name-only params can
+//! express. No other declaration-fact surface changes.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, Expression, Function, FunctionBody, FunctionType, ObjectPropertyKind, Program,
-    PropertyKey, PropertyKind, Statement, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    Argument, BindingPattern, CallExpression, Expression, Function, FunctionBody, FunctionType,
+    ObjectPropertyKind, Program, PropertyKey, PropertyKind, Statement, TSTypeAnnotation,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -212,15 +242,23 @@ pub struct FunctionFact {
 /// One identifier parameter: its name plus whether it carries a type
 /// annotation.
 ///
-/// `annotated` is what the solver gates on (unannotated parameters are
-/// outside the subset); the annotation text itself is not needed downstream
-/// and is not recorded.
+/// `annotated` is what the return checker gates on (unannotated parameters
+/// are outside the subset); `annotation_text`/`optional`/`is_rest` feed the
+/// call-site checker (P014): arg-type checks need the annotated names, and
+/// exact-arity checks decline range (`b?: number`, defaulted `b: T = …`) and
+/// variadic (`...rest: T[]`) lists instead of mis-counting them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionParamFact {
     /// Parameter name as written.
     pub name: String,
     /// Whether the parameter carries a type annotation.
     pub annotated: bool,
+    /// Raw annotation text (`Some("number")`); `None` when unannotated.
+    pub annotation_text: Option<String>,
+    /// `true` for `b?: number` and defaulted `b: T = …` (arity is a range).
+    pub optional: bool,
+    /// `true` for `...rest: T[]` (variadic).
+    pub is_rest: bool,
 }
 
 /// Literal kind of a straight-line `return <expr>;`, mirroring [`InitKind`].
@@ -291,6 +329,60 @@ pub enum FunctionBodyFact {
     Complex,
 }
 
+/// Argument literal kind at a direct call site, mirroring [`InitKind`].
+///
+/// Only primitive literals classify; everything else (identifiers, objects,
+/// calls, templates, `-1`, …) is [`CallArgKind::NonLiteral`] — expression
+/// facts the adapter does not emit yet. Deliberately payload-free: tsc's
+/// `TS2345` elaborations spell widened names only (probed 7.0.2), so the
+/// boolean value rides nowhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallArgKind {
+    /// A numeric literal (`1`, `0x10`, …).
+    Number,
+    /// A string literal (`"ok"`, …).
+    String,
+    /// `true` / `false`.
+    Boolean,
+    /// `null`.
+    Null,
+    /// The `undefined` identifier.
+    Undefined,
+    /// Any non-literal argument (identifier, object, call, …).
+    NonLiteral,
+}
+
+/// One argument of a direct call: literal kind plus span.
+///
+/// `span` is the argument expression's own range, so the solver anchors
+/// `TS2345`-family diagnostics at the mismatched argument exactly like tsc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallArgFact {
+    /// Literal kind of the argument expression.
+    pub kind: CallArgKind,
+    /// Span of the argument expression.
+    pub span: Span,
+}
+
+/// One direct `f(...)` call's call-site facts.
+///
+/// `callee_span` is the callee identifier's own range (too-few-arity
+/// diagnostics anchor here, mirroring tsc); `span` is the whole call
+/// expression's range. `args` is source order, one fact per argument —
+/// including non-literals (the solver skips those per-argument, never the
+/// whole call, so arity still checks).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallFact {
+    /// Callee name as written.
+    pub callee: String,
+    /// Span of the callee identifier.
+    pub callee_span: Span,
+    /// Span of the whole call expression.
+    pub span: Span,
+    /// Argument facts in source order.
+    pub args: Vec<CallArgFact>,
+}
+
 /// Everything Pith owns after a frontend pass. Arenas are dropped on return.
 #[derive(Clone, Debug)]
 pub struct ParsedFile {
@@ -305,6 +397,9 @@ pub struct ParsedFile {
     /// One fact per named `function` declaration, in source (visitor) order.
     /// Empty when the file declares no functions.
     pub functions: Vec<FunctionFact>,
+    /// One fact per direct `f(...)` call expression, in visitor (pre-order)
+    /// order. Empty when the file makes no direct calls.
+    pub calls: Vec<CallFact>,
     /// Parser + semantic diagnostics as plain strings (codes deferred to P008).
     pub errors: Vec<String>,
 }
@@ -338,6 +433,7 @@ struct DeclCollector<'a> {
     scopes: std::collections::HashMap<u32, u32>,
     decls: Vec<DeclFact>,
     functions: Vec<FunctionFact>,
+    calls: Vec<CallFact>,
 }
 
 /// Builds the colon-stripped annotation fact for a `TSTypeAnnotation` span
@@ -353,6 +449,19 @@ fn annotation_fact(source: &str, file: FileId, span: oxc_span::Span) -> Option<A
             hi: span.end,
         },
     })
+}
+
+/// Builds the colon-stripped annotation text for one parameter annotation
+/// (`: number` -> `Some("number")`), or `None` when unannotated (or the span
+/// does not slice, only possible with recovery from parse errors).
+fn param_annotation_text(
+    source: &str,
+    file: FileId,
+    annotation: Option<&TSTypeAnnotation<'_>>,
+) -> Option<String> {
+    annotation
+        .and_then(|ann| annotation_fact(source, file, ann.span))
+        .map(|fact| fact.text)
 }
 
 /// Nearest same-name symbol at or before `start`: the overload-merge owner.
@@ -398,6 +507,22 @@ fn return_kind(source: &str, expression: &Expression<'_>) -> ReturnKind {
             }
         }
         _ => ReturnKind::NonLiteral,
+    }
+}
+
+/// Classifies one call argument into its literal kind.
+///
+/// A thin exhaustive map over [`return_kind`] (no duplicated match arms):
+/// the boolean payload is dropped because `TS2345` messages spell widened
+/// names only (probed 7.0.2) — exactly like const initializer classification.
+fn call_arg_kind(source: &str, expression: &Expression<'_>) -> CallArgKind {
+    match return_kind(source, expression) {
+        ReturnKind::Number => CallArgKind::Number,
+        ReturnKind::String => CallArgKind::String,
+        ReturnKind::Boolean(_) => CallArgKind::Boolean,
+        ReturnKind::Null => CallArgKind::Null,
+        ReturnKind::Undefined => CallArgKind::Undefined,
+        ReturnKind::NonLiteral => CallArgKind::NonLiteral,
     }
 }
 
@@ -585,6 +710,15 @@ impl DeclCollector<'_> {
             params.push(FunctionParamFact {
                 name: param.to_owned(),
                 annotated: item.type_annotation.is_some(),
+                annotation_text: param_annotation_text(
+                    self.source,
+                    self.file,
+                    item.type_annotation.as_deref(),
+                ),
+                // A defaulted `b: T = …` widens arity to a range exactly
+                // like `b?: T`, so both mark `optional` for the call checker.
+                optional: item.optional || item.initializer.is_some(),
+                is_rest: false,
             });
         }
         if !params_complex {
@@ -595,6 +729,13 @@ impl DeclCollector<'_> {
                             Some(param) => params.push(FunctionParamFact {
                                 name: param.to_owned(),
                                 annotated: rest.type_annotation.is_some(),
+                                annotation_text: param_annotation_text(
+                                    self.source,
+                                    self.file,
+                                    rest.type_annotation.as_deref(),
+                                ),
+                                optional: false,
+                                is_rest: true,
                             }),
                             None => {
                                 params_complex = true;
@@ -622,6 +763,59 @@ impl DeclCollector<'_> {
             body,
         });
     }
+
+    /// Records one call expression when it is a direct `f(...)` call.
+    ///
+    /// Anything else emits no fact, never a wrong one: member/computed calls
+    /// (`obj.m()`), `super(...)`, and every other non-identifier callee fail
+    /// the `Identifier` match; optional chains (`f?.()`) hit the `optional`
+    /// gate (tsc checks their arity, but the shape is outside the subset);
+    /// any spread element (`f(...xs)`) drops the whole call (arity is
+    /// unknowable from facts). Unclassifiable arguments still occupy their
+    /// position as [`CallArgKind::NonLiteral`] so arity checks keep working.
+    fn record_call(&mut self, call: &CallExpression<'_>) {
+        if call.optional {
+            return;
+        }
+        let Expression::Identifier(ident) = &call.callee else {
+            return;
+        };
+        if call.arguments.iter().any(Argument::is_spread) {
+            return;
+        }
+        let mut args = Vec::with_capacity(call.arguments.len());
+        for argument in &call.arguments {
+            // Only `SpreadElement` converts to `None`, already excluded
+            // above: this skips rather than mis-records on skew.
+            let Some(expression) = argument.as_expression() else {
+                return;
+            };
+            let span = expression.span();
+            args.push(CallArgFact {
+                kind: call_arg_kind(self.source, expression),
+                span: Span {
+                    file: self.file,
+                    lo: span.start,
+                    hi: span.end,
+                },
+            });
+        }
+        let callee_span = Span {
+            file: self.file,
+            lo: ident.span.start,
+            hi: ident.span.end,
+        };
+        self.calls.push(CallFact {
+            callee: ident.name.to_string(),
+            callee_span,
+            span: Span {
+                file: self.file,
+                lo: call.span.start,
+                hi: call.span.end,
+            },
+            args,
+        });
+    }
 }
 
 impl<'a> Visit<'a> for DeclCollector<'a> {
@@ -641,6 +835,13 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
         // Keep walking: bodies nest consts and further function declarations
         // (`function o() { const y = 1; function i() { return y; } … }`).
         walk::walk_function(self, it, flags);
+    }
+
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        self.record_call(it);
+        // Keep walking: arguments nest further calls (`f(g(1))` yields a fact
+        // per call) and declarations inside them.
+        walk::walk_call_expression(self, it);
     }
 }
 
@@ -737,7 +938,7 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         })
         .collect();
 
-    let (decls, functions) = collect_decls(file, source, &parse.program, &symbols);
+    let (decls, functions, calls) = collect_decls(file, source, &parse.program, &symbols);
     ParsedFile {
         file,
         scopes,
@@ -746,6 +947,7 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         imports,
         decls,
         functions,
+        calls,
         errors,
     }
 }
@@ -760,7 +962,7 @@ fn collect_decls<'a>(
     source: &'a str,
     program: &Program<'a>,
     symbols: &[SymbolFact],
-) -> (Vec<DeclFact>, Vec<FunctionFact>) {
+) -> (Vec<DeclFact>, Vec<FunctionFact>, Vec<CallFact>) {
     let mut index_of = std::collections::HashMap::new();
     let mut scope_of = std::collections::HashMap::new();
     for symbol in symbols {
@@ -778,9 +980,10 @@ fn collect_decls<'a>(
         scopes: scope_of,
         decls: Vec::new(),
         functions: Vec::new(),
+        calls: Vec::new(),
     };
     collector.visit_program(program);
-    (collector.decls, collector.functions)
+    (collector.decls, collector.functions, collector.calls)
 }
 
 #[cfg(test)]
@@ -1446,8 +1649,150 @@ export function f(a: string): string { return a + b; }
         assert_eq!(names, ["a", "b", "rest"]);
         let annotated: Vec<bool> = mixed.params.iter().map(|param| param.annotated).collect();
         assert_eq!(annotated, [true, false, true]);
+        // Call-checker enabling: annotation text plus optional/rest markers.
+        let texts: Vec<Option<&str>> = mixed
+            .params
+            .iter()
+            .map(|param| param.annotation_text.as_deref())
+            .collect();
+        assert_eq!(texts, [Some("number"), None, Some("string[]")]);
+        let optional: Vec<bool> = mixed.params.iter().map(|param| param.optional).collect();
+        assert_eq!(optional, [false, false, false]);
+        let rests: Vec<bool> = mixed.params.iter().map(|param| param.is_rest).collect();
+        assert_eq!(rests, [false, false, true]);
         let destructured = &pf.functions[1];
         assert!(destructured.params_complex);
         assert!(destructured.params.is_empty());
+    }
+
+    #[test]
+    fn function_facts_optional_and_defaulted_mark_range() {
+        let src =
+            "function opt(a: number, b?: number, c: string = \"d\"): number {\n  return 1;\n}\n";
+        let pf = parse_module(FileId(0), "o.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        let fact = &pf.functions[0];
+        assert!(!fact.params_complex);
+        let names: Vec<&str> = fact
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        let optional: Vec<bool> = fact.params.iter().map(|param| param.optional).collect();
+        // `?` and defaulted alike widen arity to a range: both decline.
+        assert_eq!(optional, [false, true, true]);
+        let texts: Vec<Option<&str>> = fact
+            .params
+            .iter()
+            .map(|param| param.annotation_text.as_deref())
+            .collect();
+        assert_eq!(texts, [Some("number"), Some("number"), Some("string")]);
+        assert!(!fact.params.iter().any(|param| param.is_rest));
+    }
+
+    #[test]
+    fn call_facts_direct_call_exact_spans() {
+        // Offsets hand-counted (`add(1, "ok");` starts at 59: `add` at
+        // 59..62, `1` at 63, `"ok"` at 66..70, whole call 59..71).
+        let src = "function add(a: number, b: string): number {\n  return 1;\n}\nadd(1, \"ok\");\n";
+        let pf = parse_module(FileId(0), "c.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.calls.len(), 1);
+        let call = &pf.calls[0];
+        assert_eq!(call.callee, "add");
+        assert_eq!((call.callee_span.lo, call.callee_span.hi), (59, 62));
+        assert_eq!(call.callee_span.file, FileId(0));
+        assert_eq!((call.span.lo, call.span.hi), (59, 71));
+        assert_eq!(call.span.file, FileId(0));
+        assert_eq!(slice_of(src, call.callee_span), "add");
+        assert_eq!(slice_of(src, call.span), "add(1, \"ok\")");
+        assert_eq!(call.args.len(), 2);
+        assert_eq!(call.args[0].kind, CallArgKind::Number);
+        assert_eq!((call.args[0].span.lo, call.args[0].span.hi), (63, 64));
+        assert_eq!(slice_of(src, call.args[0].span), "1");
+        assert_eq!(call.args[1].kind, CallArgKind::String);
+        assert_eq!((call.args[1].span.lo, call.args[1].span.hi), (66, 70));
+        assert_eq!(slice_of(src, call.args[1].span), "\"ok\"");
+    }
+
+    #[test]
+    fn call_facts_cover_all_arg_kinds() {
+        let src = "f(1, \"ok\", true, null, undefined, other, { x: 1 }, g(2));\n";
+        let pf = parse_module(FileId(0), "k.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        // Pre-order: the outer `f(...)` fact lands before the nested `g(2)`.
+        assert_eq!(pf.calls.len(), 2);
+        let outer = &pf.calls[0];
+        assert_eq!(outer.callee, "f");
+        let kinds: Vec<CallArgKind> = outer.args.iter().map(|arg| arg.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                CallArgKind::Number,
+                CallArgKind::String,
+                CallArgKind::Boolean,
+                CallArgKind::Null,
+                CallArgKind::Undefined,
+                CallArgKind::NonLiteral,
+                CallArgKind::NonLiteral,
+                CallArgKind::NonLiteral,
+            ]
+        );
+        for arg in &outer.args {
+            assert_eq!(arg.span.file, FileId(0));
+            assert!(arg.span.lo < arg.span.hi);
+        }
+        let inner = &pf.calls[1];
+        assert_eq!(inner.callee, "g");
+        assert_eq!(inner.args.len(), 1);
+        assert_eq!(inner.args[0].kind, CallArgKind::Number);
+    }
+
+    #[test]
+    fn call_facts_skip_methods_optionals_spreads() {
+        // Methods, optional chains, and spreads bind symbols but emit no call
+        // facts: only the final direct `add(1, 2)` does. The unresolved
+        // `missing` keeps the skip honest (no decl to mis-resolve to).
+        let src = "function add(a: number, b: number): number {\n  return 1;\n}\n\
+                   const obj = { pick(n: number): number { return n; } };\n\
+                   obj.pick(1, 2);\nadd?.(1);\nadd(...[1, 2]);\nmissing(1);\nadd(1, 2);\n";
+        let pf = parse_module(FileId(0), "s.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.calls.len(), 2);
+        let callees: Vec<&str> = pf.calls.iter().map(|call| call.callee.as_str()).collect();
+        assert_eq!(callees, ["missing", "add"]);
+        let last = &pf.calls[1];
+        assert_eq!(last.args.len(), 2);
+    }
+
+    #[test]
+    fn call_facts_skip_tagged_new_super_import() {
+        // Tagged templates, `new`, `super()`, and `import()` never reach
+        // `visit_call_expression` (or fail the identifier gate): no facts,
+        // never mis-recorded. The trailing direct call proves the walker
+        // kept going.
+        let src = "function add(a: number, b: number): number {\n  return 1;\n}\n\
+                   const tag = (s: string) => s;\n\
+                   tag`hi`;\n\
+                   new Date();\n\
+                   class C extends Date {\n  constructor() {\n    super();\n  }\n}\n\
+                   add(1, 2);\n";
+        let pf = parse_module(FileId(0), "s.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.calls.len(), 1);
+        assert_eq!(pf.calls[0].callee, "add");
+        assert_eq!(pf.calls[0].args.len(), 2);
+    }
+
+    #[test]
+    fn call_facts_skip_dynamic_import() {
+        // `import("x")` is an import expression, not a call: no fact. Kept
+        // separate because it parses as a distinct AST node (`ImportExpression`).
+        let src = "async function load(): Promise<void> {\n  await import(\"./m\");\n}\n";
+        let pf = parse_module(FileId(0), "s.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(pf.calls.is_empty());
     }
 }
