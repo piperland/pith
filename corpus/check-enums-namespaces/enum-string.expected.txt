@@ -1,0 +1,5 @@
+enum-string.ts:TS2322: Type '"a"' is not assignable to type 'Str'.
+enum-string.ts:TS2322: Type '"z"' is not assignable to type 'Str'.
+enum-string.ts:TS2322: Type '1' is not assignable to type 'Str'.
+enum-string.ts:TS2322: Type 'undefined' is not assignable to type 'Str'.
+enum-string.ts:TS2322: Type 'null' is not assignable to type 'Str'.

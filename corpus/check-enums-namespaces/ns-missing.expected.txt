@@ -1,0 +1,5 @@
+ns-missing.ts:TS2694: Namespace 'NS' has no exported member 'Nope'.
+ns-missing.ts:TS2694: Namespace 'NS' has no exported member 'Hidden'.
+ns-missing.ts:TS2709: Cannot use namespace 'NS' as a type.
+ns-missing.ts:TS2749: 'Outer.Inner' refers to a value, but is being used as a type here. Did you mean 'typeof Outer.Inner'?
+ns-missing.ts:TS2713: Cannot access 'Point.X' because 'Point' is a type, but not a namespace. Did you mean to retrieve the type of the property 'X' in 'Point' with 'Point["X"]'?

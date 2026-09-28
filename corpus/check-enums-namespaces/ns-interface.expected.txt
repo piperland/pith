@@ -1,0 +1,3 @@
+ns-interface.ts:TS2741: Property 'y' is missing in type '{ x: number; }' but required in type 'Point'.
+ns-interface.ts:TS2353: Object literal may only specify known properties, and 'extra' does not exist in type 'Point'.
+ns-interface.ts:TS2322: Type 'string' is not assignable to type 'number'.

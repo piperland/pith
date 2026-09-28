@@ -1,0 +1,1 @@
+ns-enum.ts:TS2322: Type '9' is not assignable to type 'Dir'.

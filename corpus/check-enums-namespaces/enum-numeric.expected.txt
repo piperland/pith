@@ -1,0 +1,4 @@
+enum-numeric.ts:TS2322: Type '5' is not assignable to type 'Color'.
+enum-numeric.ts:TS2322: Type '2.5' is not assignable to type 'Color'.
+enum-numeric.ts:TS2322: Type '9' is not assignable to type 'Base'.
+enum-numeric.ts:TS2322: Type 'true' is not assignable to type 'Color'.
