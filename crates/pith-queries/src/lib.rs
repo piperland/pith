@@ -22,6 +22,9 @@ use pith_ids::{FileId, NodeId, SymbolId, TypeId};
 use pith_symbols::Binder;
 use pith_types::{TypeData, TypeStore};
 
+#[cfg(test)]
+mod invalidation_demo;
+
 /// Which question a [`QueryKey`] asks. Extend with new variants as the
 /// solver grows (each new kind gets its own memo namespace for free, since
 /// the kind is part of the key).
