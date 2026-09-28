@@ -18,21 +18,18 @@
 //! `TS2322` <-> `PITH2322`, `TS2304` <-> `PITH2304` — plus the unsupported
 //! count for out-of-subset fixtures.
 //!
-//! Scope-blindness (documented, fix deferred): the driver resolves every
-//! fallback span scope-sensitively (`DeclFact.symbol` -> `SymbolFact.scope`
-//! -> [`Binder::resolve`] -> store span). Residual: `check_file`'s internal
-//! `binder_span` matches by `(file, name)` only, so two same-name decls in
-//! different scopes of one file would verdict against the first declaration
-//! regardless of scope, overriding the driver's correct fallback. The full
-//! fix threads scope/`SymbolId` through `ConstDecl` into `check_file` — a
-//! core change deliberately deferred to keep the solver core untouched per
-//! P011. No check-const fixture shadows a name, so no differential below is
-//! affected.
+//! Scope-sensitivity (P012): the driver resolves every fallback span
+//! scope-sensitively (`DeclFact.symbol` -> `SymbolFact.scope` ->
+//! [`Binder::resolve`] -> store span) AND threads that scope plus the
+//! resolved [`SymbolId`] into each [`ConstDecl`], so `check_file`'s internal
+//! span resolution agrees with the driver even when two same-name decls
+//! share a file. No check-const fixture shadows a name; the shadowing proof
+//! lives in the solver unit tests (`shadowed_same_name_verdicts_against_own_scopes`).
 
 use pith_frontend::{parse_module, InitKind as FrontendInitKind, ParsedFile};
-use pith_ids::{FileId, Span};
+use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
-use pith_solver::{check_file, ConstDecl, FileReport, InitKind};
+use pith_solver::{check_file, ConstDecl, DeclKind, FileReport, InitKind};
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
 const FILE: FileId = FileId(0);
@@ -87,35 +84,48 @@ fn map_init(kind: FrontendInitKind) -> InitKind {
 
 /// Scope-sensitive fallback span for one declarator: `decl.symbol` indexes
 /// `ParsedFile.symbols`, and the `(scope, name)` pair resolves through the
-/// binder to the exact declaration span. Falls back to the binding span only
-/// when the binder cannot resolve (never happens for well-formed facts).
-fn fallback_span(parsed: &ParsedFile, binder: &Binder, symbol_index: u32) -> (String, Span) {
+/// binder to the exact declaration span plus its [`SymbolId`]. The scope
+/// comes from the new [`DeclFact`](pith_frontend::DeclFact) scope fact;
+/// spans fall back to the binding span only when the binder cannot resolve
+/// (never happens for well-formed facts).
+fn fallback_span(
+    parsed: &ParsedFile,
+    binder: &Binder,
+    symbol_index: u32,
+    scope: u32,
+) -> (String, Span, Option<SymbolId>) {
     let symbol = &parsed.symbols[usize::try_from(symbol_index).expect("dense symbol index")];
-    let span = binder
-        .resolve(parsed.file, symbol.scope, &symbol.name)
+    let id = binder.resolve(parsed.file, scope, &symbol.name);
+    let span = id
         .and_then(|id| binder.store().get(id))
         .map_or(symbol.span, |found| found.span);
-    (symbol.name.clone(), span)
+    (symbol.name.clone(), span, id)
 }
 
 /// The fact-fed driver: every [`ConstDecl`] field comes from adapter facts.
 ///
 /// - `name` via `ParsedFile.symbols[decl.symbol]` (never re-typed);
+/// - `scope`/`symbol` via the declarator scope fact plus binder resolution;
+/// - `kind` is `const` (the adapter emits no `let` facts yet);
 /// - `annotation` as the frontend's colon-stripped text verbatim;
 /// - `init` via the explicit [`map_init`] variant map;
-/// - `span` via the scope-sensitive [`fallback_span`] (used by `check_file`
-///   only when its name lookup misses).
+/// - `init_object` is `None` (no `ObjectMemberFact`s yet; check-const
+///   fixtures hold no object literals anyway).
 fn decls_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<ConstDecl> {
     parsed
         .decls
         .iter()
         .map(|decl| {
-            let (name, span) = fallback_span(parsed, binder, decl.symbol);
+            let (name, span, symbol) = fallback_span(parsed, binder, decl.symbol, decl.scope);
             ConstDecl {
                 name,
                 span,
+                scope: decl.scope,
+                symbol,
+                kind: DeclKind::Const,
                 annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
                 init: decl.init.as_ref().map(|init| map_init(init.kind)),
+                init_object: None,
             }
         })
         .collect()
@@ -277,6 +287,13 @@ fn driver_maps_facts_without_hand_feeding() {
     assert_eq!(decls[0].name, "a");
     assert_eq!(decls[0].annotation.as_deref(), Some("number"));
     assert_eq!(decls[0].init, Some(InitKind::Number));
+    assert_eq!(decls[0].kind, DeclKind::Const);
+    assert_eq!(decls[0].init_object, None);
+    assert!(decls[0].symbol.is_some(), "driver resolves the SymbolId");
+    assert_eq!(
+        decls[0].scope,
+        parsed.symbols[usize::try_from(parsed.decls[0].symbol).expect("dense")].scope
+    );
     assert_eq!(decls[1].name, "b");
     assert_eq!(decls[1].annotation, None);
     assert_eq!(decls[1].init, Some(InitKind::NonLiteral));
