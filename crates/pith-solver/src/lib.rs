@@ -221,6 +221,9 @@ use pith_queries::{Dep, QueryDb, QueryKey, QueryKind};
 use pith_symbols::Binder;
 use pith_types::{TypeData, TypeStore};
 
+/// Multi-file programs: import graphs, cross-file checking, invalidation.
+pub mod multifile;
+
 /// Code for literal-vs-annotation contradictions (oracle `TS2322`).
 pub const CODE_MISMATCH: &str = "PITH2322";
 /// Code for unknown annotation names (oracle `TS2304`).
@@ -630,15 +633,15 @@ pub fn check_file(
     }
     let mut report = FileReport::default();
     for (index, decl) in decls.iter().enumerate() {
-        check_one(
+        let mut ctx = CheckCtx {
             file,
-            occurrence_node(index),
-            decl,
-            binder,
-            db,
-            &freshness,
-            &mut report,
-        );
+            node: occurrence_node(index),
+            db: &mut *db,
+            freshness: &freshness,
+            report: &mut report,
+            extra: &[],
+        };
+        check_one(decl, binder, &mut ctx);
     }
     sort_report(&mut report);
     report
@@ -706,15 +709,15 @@ pub fn check_functions(
         }
     }
     for (index, decl) in synth.iter().enumerate() {
-        check_one(
+        let mut ctx = CheckCtx {
             file,
-            function_occurrence_node(index),
-            decl,
-            binder,
-            db,
-            &freshness,
-            &mut report,
-        );
+            node: function_occurrence_node(index),
+            db: &mut *db,
+            freshness: &freshness,
+            report: &mut report,
+            extra: &[],
+        };
+        check_one(decl, binder, &mut ctx);
     }
     sort_report(&mut report);
     report
@@ -1971,6 +1974,30 @@ pub fn check_narrowing(
 
 /// Checks one declaration for [`check_narrowing`]: union routing plus
 /// environment registration (see the function docs).
+/// Splits a union annotation into unknown plain names versus shaped pieces.
+///
+/// Unknown alphanumeric names diagnose (`TS2304`); shaped pieces (unions
+/// within unions, objects, anything non-identifier) decline. Known
+/// primitives pass through silently in neither list.
+fn split_union_members(annotation: &str) -> (Vec<&str>, bool) {
+    let mut unknown: Vec<&str> = Vec::new();
+    let mut shaped = false;
+    for piece in annotation.split('|').map(str::trim) {
+        if annotation_type(piece).is_none() {
+            if !piece.is_empty()
+                && piece
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            {
+                unknown.push(piece);
+            } else {
+                shaped = true;
+            }
+        }
+    }
+    (unknown, shaped)
+}
+
 fn check_narrowing_decl(
     file: FileId,
     node: NodeId,
@@ -2007,30 +2034,24 @@ fn check_narrowing_decl(
             db,
             freshness,
             report,
+            extra: &[],
         };
         check_object(decl, span, annotation, &mut ctx);
         return;
     }
     if !annotation.contains('|') {
-        check_one(file, node, decl, binder, db, freshness, report);
+        let mut ctx = CheckCtx {
+            file,
+            node,
+            db: &mut *db,
+            freshness,
+            report: &mut *report,
+            extra: &[],
+        };
+        check_one(decl, binder, &mut ctx);
         return;
     }
-    let pieces: Vec<&str> = annotation.split('|').map(str::trim).collect();
-    let mut unknown: Vec<&str> = Vec::new();
-    let mut shaped = false;
-    for piece in pieces {
-        if annotation_type(piece).is_none() {
-            if piece
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-                && !piece.is_empty()
-            {
-                unknown.push(piece);
-            } else {
-                shaped = true;
-            }
-        }
-    }
+    let (unknown, shaped) = split_union_members(annotation);
     if !unknown.is_empty() {
         for name in unknown {
             report.diagnostics.push(PithDiagnostic {
@@ -2613,19 +2634,25 @@ fn object_type_text(names: &[&str], types: &[&str]) -> String {
 /// [`check_file`] passes [`occurrence_node`] positions, [`check_functions`]
 /// passes disjoint function nodes — never mix the two for one file.
 ///
+/// `extra` carries cross-file [`Dep`] edges (the declaring file's occurrence
+/// nodes a use-file declaration was resolved against): single-file callers
+/// pass `&[]`, so their memo entries record exactly today's self-dep.
+///
 /// Priority inside the object path mirrors tsc (probed 7.0.2): wrong-member
 /// `TS2322`s (literal order, one per member) beat the first-excess `TS2353`,
 /// which beats missing members (one `TS2741`, or one `TS2739` for several).
 /// Only one family ever fires per declaration.
-fn check_one(
-    file: FileId,
-    node: NodeId,
-    decl: &ConstDecl,
-    binder: &Binder,
-    db: &mut QueryDb,
-    freshness: &FreshnessTable,
-    report: &mut FileReport,
-) {
+///
+/// Takes the shared [`CheckCtx`] (file, node, memo store, freshness table,
+/// report, and extra cross-file edges) so the arity stays flat as the
+/// subset grows; `binder` and `decl` ride alongside.
+fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
+    let file = ctx.file;
+    let node = ctx.node;
+    let db: &mut QueryDb = &mut *ctx.db;
+    let freshness = ctx.freshness;
+    let report: &mut FileReport = &mut *ctx.report;
+    let extra = ctx.extra;
     let span = binder_span(binder, file, decl);
     let Some(raw) = decl.annotation.as_deref() else {
         report.unsupported.push(UnsupportedDecl {
@@ -2652,6 +2679,7 @@ fn check_one(
             db,
             freshness,
             report,
+            extra,
         };
         check_object(decl, span, annotation, &mut ctx);
         return;
@@ -2674,15 +2702,17 @@ fn check_one(
         return;
     };
     // Thread through the memo database: the annotation type is the answer
-    // to this declaration's TypeOf query; the dep edge lets a later edit
-    // invalidate exactly this entry.
+    // to this declaration's TypeOf query; the self-dep plus any cross-file
+    // edges let a later edit invalidate exactly the entries that read them.
     let key = QueryKey {
         file,
         node,
         kind: QueryKind::TypeOf,
     };
-    let dep = Dep { file, node };
-    let stored = db.type_of(key, &[dep], || ann_ty);
+    let mut deps = Vec::with_capacity(extra.len().saturating_add(1));
+    deps.push(Dep { file, node });
+    deps.extend_from_slice(extra);
+    let stored = db.type_of(key, &deps, || ann_ty);
     debug_assert_eq!(stored, ann_ty);
     if let Some(init_object) = decl.init_object.as_ref() {
         check_primitive_annotation_object_init(file, span, annotation, init_object, report);
@@ -2757,13 +2787,15 @@ fn check_primitive_annotation_object_init(
 /// Shared checking context: occurrence identity plus the verdict sinks.
 ///
 /// Bundles the parameters every object-check helper needs so arity stays
-/// flat as the subset grows.
+/// flat as the subset grows. `extra` carries cross-file [`Dep`] edges (see
+/// [`check_one`]); the object-shape memo records them alongside the self-dep.
 struct CheckCtx<'a> {
     file: FileId,
     node: NodeId,
     db: &'a mut QueryDb,
     freshness: &'a FreshnessTable,
     report: &'a mut FileReport,
+    extra: &'a [Dep],
 }
 
 /// Object annotation (`{ a: number; ... }`) against any initializer.
@@ -2906,11 +2938,13 @@ fn memoize_object_shape(expected: &[ExpectedMember], ctx: &mut CheckCtx<'_>) {
         node: ctx.node,
         kind: QueryKind::TypeOf,
     };
-    let dep = Dep {
+    let mut deps = Vec::with_capacity(ctx.extra.len().saturating_add(1));
+    deps.push(Dep {
         file: ctx.file,
         node: ctx.node,
-    };
-    let stored = ctx.db.type_of(key, &[dep], || ann_ty);
+    });
+    deps.extend_from_slice(ctx.extra);
+    let stored = ctx.db.type_of(key, &deps, || ann_ty);
     debug_assert_eq!(stored, ann_ty);
 }
 
@@ -3271,12 +3305,18 @@ pub struct NamespaceShape {
 /// missing, non-literal, and object initializers (those paths never read
 /// it) — the same hand-fed seam as M1's `compute` closures and the
 /// [`GenericCall`] explicit type arguments.
+///
+/// `cross_file_deps` carries the declaring file's occurrence nodes a
+/// use-file declaration was resolved against (see [`check_one`]): empty on
+/// single-file paths, so their memo entries record exactly today's self-dep.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnumDecl {
     /// The declaration (spans/scopes/shapes as in [`check_file`]).
     pub decl: ConstDecl,
     /// Source slice of the initializer span for literal spellings.
     pub init_text: Option<String>,
+    /// Cross-file [`Dep`] edges recorded with this declaration's memo entry.
+    pub cross_file_deps: Vec<Dep>,
 }
 
 /// The shape tables one [`check_enums`] run resolves against, bundled so
@@ -3356,15 +3396,15 @@ impl InterfaceDeclCtx<'_, '_> {
     /// Plain spellings (and missing annotations) keep [`check_one`]'s
     /// verdicts by construction.
     fn delegate(&mut self) {
-        check_one(
-            self.file,
-            self.node,
-            self.decl,
-            self.binder,
-            &mut *self.db,
-            self.freshness,
-            &mut *self.report,
-        );
+        let mut ctx = CheckCtx {
+            file: self.file,
+            node: self.node,
+            db: &mut *self.db,
+            freshness: self.freshness,
+            report: &mut *self.report,
+            extra: &[],
+        };
+        check_one(self.decl, self.binder, &mut ctx);
     }
 
     /// Resolves an interface-named annotation to its shape: unknown names
@@ -3401,6 +3441,7 @@ impl InterfaceDeclCtx<'_, '_> {
             db: &mut *self.db,
             freshness: self.freshness,
             report: &mut *self.report,
+            extra: &[],
         };
         check_interface_shape(
             self.decl,
@@ -3595,15 +3636,15 @@ impl EnumDeclCtx<'_, '_> {
     /// Plain spellings (and missing annotations) keep [`check_one`]'s
     /// verdicts by construction.
     fn delegate(&mut self) {
-        check_one(
-            self.file,
-            self.node,
-            &self.decl.decl,
-            self.binder,
-            &mut *self.db,
-            self.freshness,
-            &mut *self.report,
-        );
+        let mut ctx = CheckCtx {
+            file: self.file,
+            node: self.node,
+            db: &mut *self.db,
+            freshness: self.freshness,
+            report: &mut *self.report,
+            extra: &self.decl.cross_file_deps,
+        };
+        check_one(&self.decl.decl, self.binder, &mut ctx);
     }
 
     /// Pushes one [`UnsupportedDecl`] at `span`.
@@ -3635,6 +3676,7 @@ impl EnumDeclCtx<'_, '_> {
             db: &mut *self.db,
             freshness: self.freshness,
             report: &mut *self.report,
+            extra: &self.decl.cross_file_deps,
         };
         check_interface_shape(&self.decl.decl, span, display, shape, &mut tail);
     }
@@ -7281,6 +7323,7 @@ mod tests {
                 init_object: None,
             },
             init_text: text.map(str::to_owned),
+            cross_file_deps: Vec::new(),
         }
     }
 
@@ -7715,6 +7758,7 @@ mod tests {
         let good = EnumDecl {
             decl: object_decl("v", 9, 19, "Point", vec![("x", ObjectMemberKind::Number)]),
             init_text: None,
+            cross_file_deps: Vec::new(),
         };
         let as_type = enum_decl_for("w", 20, 30, "NS", InitKind::Number, Some("1"));
         let unknown = enum_decl_for("u", 31, 41, "Nope", InitKind::Number, Some("1"));
