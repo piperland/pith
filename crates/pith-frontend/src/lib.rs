@@ -141,12 +141,16 @@ pub struct InitFact {
 /// `symbol` is the per-file index into [`ParsedFile::symbols`] of the
 /// [`SymbolFact`] for the same declarator (matched on binding name +
 /// binding start; declaration order in [`ParsedFile::decls`] is source
-/// order). Only simple-identifier bindings produce facts; destructured
-/// declarators are skipped (see the module-level build-mode note).
+/// order). `scope` redundantly carries that symbol's owning scope so
+/// downstream drivers resolve spans without re-indexing into `symbols`
+/// (P012 scope threading). Only simple-identifier bindings produce facts;
+/// destructured declarators are skipped (see the module-level build-mode note).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclFact {
     /// Per-file symbol index of the declarator's binding.
     pub symbol: u32,
+    /// Owning scope (per-file scope index) of [`DeclFact::symbol`].
+    pub scope: u32,
     /// Raw annotation text + span; `None` means unannotated.
     pub annotation: Option<AnnotationFact>,
     /// Initializer literal kind + span; `None` means no initializer.
@@ -192,6 +196,9 @@ struct DeclCollector<'a> {
     /// ranges can never mis-key; `(name, start)` is injective — one token,
     /// one binding.
     symbols: std::collections::HashMap<(String, u32), u32>,
+    /// Per-file symbol index -> owning scope (mirrors `SymbolFact.scope`;
+    /// carried so each [`DeclFact`] records its declarator scope directly).
+    scopes: std::collections::HashMap<u32, u32>,
     decls: Vec<DeclFact>,
 }
 
@@ -250,6 +257,7 @@ impl DeclCollector<'_> {
 
         self.decls.push(DeclFact {
             symbol,
+            scope: self.scopes.get(&symbol).copied().unwrap_or(u32::MAX),
             annotation,
             init,
         });
@@ -386,17 +394,20 @@ fn collect_decls<'a>(
     symbols: &[SymbolFact],
 ) -> Vec<DeclFact> {
     let mut index_of = std::collections::HashMap::new();
+    let mut scope_of = std::collections::HashMap::new();
     for symbol in symbols {
         let previous = index_of.insert((symbol.name.clone(), symbol.span.lo), symbol.index);
         debug_assert!(
             previous.is_none(),
             "duplicate (name, binding-start) symbol key"
         );
+        scope_of.insert(symbol.index, symbol.scope);
     }
     let mut collector = DeclCollector {
         file,
         source,
         symbols: index_of,
+        scopes: scope_of,
         decls: Vec::new(),
     };
     collector.visit_program(program);
@@ -807,6 +818,33 @@ export function f(a: string): string { return a + b; }
         let init = decl.init.as_ref().expect("initialized");
         assert_eq!(init.kind, InitKind::Number);
         assert_eq!((init.span.lo, init.span.hi), (52, 53));
+    }
+
+    #[test]
+    fn decl_facts_carry_declarator_scope() {
+        // Shadowing: the inner `x` must link its own symbol AND scope, so a
+        // downstream driver can resolve the inner declaration span instead
+        // of the outer one (P012 scope threading).
+        let pf = parse_module(
+            FileId(7),
+            "s.ts",
+            "const x: number = 1;\nfunction f(): void {\n  const x: string = \"ok\";\n  console.log(x);\n}\n",
+        );
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 2);
+        let scopes: Vec<u32> = pf.decls.iter().map(|decl| decl.scope).collect();
+        assert_ne!(
+            scopes[0], scopes[1],
+            "shadowing decls share scope: {scopes:?}"
+        );
+        for decl in &pf.decls {
+            let symbol = &pf.symbols[usize::try_from(decl.symbol).expect("dense symbol index")];
+            assert_eq!(symbol.name, "x");
+            assert_eq!(
+                decl.scope, symbol.scope,
+                "decl scope trails its symbol's scope"
+            );
+        }
     }
 
     #[test]
