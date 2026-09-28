@@ -932,6 +932,672 @@ fn classify_param(param: &FunctionParam) -> Result<(TypeId, String), String> {
     )
 }
 
+/// Generic functions (P016, probed on tsc 7.0.2 `--strict --pretty false`).
+///
+/// [`check_generics`] checks identity-style `function id<T>(x: T): T`
+/// declarations with explicit type arguments AND single-candidate inference
+/// from argument literals. The (inferred or explicit) type argument binds in
+/// the scoped [`InferenceTable`], substitutes for `T` in the parameter
+/// annotation text, and checks through the same primitive comparisons (and
+/// message shapes) as [`check_calls`]. Bodies check against `T` directly at
+/// declaration level, exactly like tsc (call-independent).
+///
+/// Probe record (each `function id<T>(x: T): T { return x; }` unless noted):
+///
+/// - Explicit correct `id<number>(1)`: clean. Explicit wrong
+///   `id<number>("oops")`: `TS2345: Argument of type 'string' is not
+///   assignable to parameter of type 'number'.` at the argument (same shape
+///   as non-generic calls).
+/// - Explicit unknown `id<Nope>(1)`: `TS2304: Cannot find name 'Nope'.` at
+///   the type-argument list (the solver anchors at the callee: no
+///   type-argument spans exist in facts — documented fold).
+/// - Explicit count `id<number, string>(1)`: `TS2558: Expected 1 type
+///   arguments, but got 2.` (note the `type arguments` spelling; same
+///   callee-span fold).
+/// - Explicit union `id<number | string>(1)`: clean in tsc; the solver
+///   declines (union type arguments are outside the subset — pinned
+///   oracle-clean divergence).
+/// - Inference binds from the argument, so an inferred call site itself
+///   never errors: `const a: string = id(1)` reports `TS2322` AT THE USE,
+///   never at the call (uses need expression facts — outside the subset).
+///   The subset pins "inferred wrong" on the body-vs-`T` shape below while
+///   the binding still records in the side table.
+/// - No candidates: `id(u)` over `declare const u: number` binds `number`
+///   from the identifier (clean); zero-parameter `mk<T>()` binds `unknown`
+///   (clean). The subset has no expression facts, so non-literal arguments
+///   decline with a reason (disclosed limit, never silent).
+/// - Arity `id<number>()`: `TS2554` exactly like non-generic calls
+///   (`Expected 1 arguments, but got 0.`).
+/// - Bodies check against `T` directly: `return 1` reports `TS2322: Type
+///   'number' is not assignable to type 'T'.` plus the elaboration `'T'
+///   could be instantiated with an arbitrary type which could be unrelated
+///   to 'number'.` (first line mirrored, elaboration folded like P015);
+///   `return { v: 1 }` reports `Type '{ v: number; }' is not assignable to
+///   type 'T'.` the same way. `return x` (the `T`-typed parameter) is clean
+///   in tsc but inexpressible without expression facts, so non-literal
+///   returns decline (P013's reason) while calls still check (P014
+///   precedent: body checkability is irrelevant to call sites).
+/// - Declines, all probed: multi-parameter `pair<T, U>` (clean call),
+///   constrained `idc("s")` (clean), defaulted `idd(1)` (clean) — solver
+///   declines each (pinned oracle-clean divergences). Union parameter
+///   `x: T | string` and object return `: { v: T }` error in tsc ITSELF
+///   (the `return x` fails: `Type 'string | T' is not assignable to type
+///   'T'.`, `Type 'T' is not assignable to type '{ v: T; }'.`) — solver
+///   declines with reasons (pinned oracle-error divergences).
+/// - Multi-parameter inference `f(1, "s")` over `(x: T, y: T)` binds the
+///   literal type `1`, then `TS2345` on `"s"`: literal-type inference is
+///   outside the subset (multi-parameter lists decline before any call
+///   checks).
+///
+/// Corollaries a generic declaration is never decl-silent: literal bodies
+/// always diagnose (no literal inhabits bare `T`), non-literal bodies
+/// decline, and every other shape declines. Calls verify independently.
+///
+/// Design law (H-002): inferred bindings are per-occurrence side state in
+/// [`InferenceTable`], keyed by `(file, node)` — never in
+/// [`TypeData`](pith_types::TypeData). Instantiation resolves to shared
+/// builtin [`TypeId`]s through [`annotation_type`] (the shared interner's
+/// canonical ids), so no parallel universe is interned and nothing here
+/// needs the [`QueryDb`] memo (there is no new structure to memoize).
+///
+/// Code for explicit type-argument count mismatches (oracle `TS2558`).
+pub const CODE_TYPE_ARITY: &str = "PITH2558";
+
+/// One generic `function id<T>(x: T): T` declaration: the plain
+/// [`FunctionDecl`] plus its declared type-parameter names verbatim from
+/// adapter facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericDecl {
+    /// The underlying declaration (name/span/scope/symbol/params/return/body).
+    pub decl: FunctionDecl,
+    /// Declared type-parameter names in source order (`["T"]` for `id<T>`).
+    pub type_params: Vec<String>,
+    /// `true` when any parameter carries a constraint, a default, or an
+    /// `in`/`out`/`const` modifier (from the adapter's complexity flag).
+    pub type_params_complex: bool,
+}
+
+/// One call site that may instantiate a generic declaration.
+///
+/// Explicit type arguments ride a hand-fed seam: the adapter emits no
+/// call-type-argument facts, so the driver supplies the written texts
+/// (`Some(vec!["number"])` for `id<number>(1)`, `None` for `id(1)`).
+/// Callee names, spans, arity, and inferred kinds still come from facts;
+/// only the angle-bracket texts are hand-fed (disclosed, mirroring the
+/// const-driver seam — the same seam M1's `compute` closures used).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericCall {
+    /// The call-site facts (callee, spans, argument kinds).
+    pub call: CallSite,
+    /// Written type-argument texts in source order; `None` means inferred.
+    pub explicit_args: Option<Vec<String>>,
+}
+
+/// Per-call-site inference side table (H-002 refined mode).
+///
+/// Maps each generic call occurrence to the [`TypeId`] its type parameter
+/// bound — inferred from the single literal argument, or resolved from the
+/// explicit type argument. Instantiated structure is shared and canonical
+/// (builtins through [`annotation_type`]); THIS table holds only the
+/// occurrence-varying binding, keyed by `(file, node)`.
+#[derive(Clone, Debug, Default)]
+struct InferenceTable {
+    bindings: HashMap<(FileId, NodeId), TypeId>,
+}
+
+impl InferenceTable {
+    /// The recorded binding for one call occurrence, if any.
+    #[must_use]
+    fn binding(&self, file: FileId, node: NodeId) -> Option<TypeId> {
+        self.bindings.get(&(file, node)).copied()
+    }
+}
+
+/// What a checkable generic declaration carries into call checking: the
+/// single bound type-parameter name (body verdicts emit at declaration
+/// level, so calls only need the name for decline-free gating).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GenericShape {
+    /// The single bound type-parameter name (`T`).
+    t_name: String,
+}
+
+/// Checks every generic declaration in `decls` plus every instantiation in
+/// `calls` for `file`, returning the sorted [`FileReport`].
+///
+/// Declaration phase (one note max per declaration, structural first):
+/// type-parameter gates (complex, count), parameter gates (patterns,
+/// annotatedness, optionality, exactly one bare-`T` annotation), return
+/// gates (present, bare `T`), then the body check (literal returns diagnose
+/// against `T` directly; non-literal returns and every other shape decline).
+/// A generic declaration is never decl-silent (see the module docs).
+///
+/// Call phase (one diagnostic max per call): name resolution mirrors
+/// [`check_calls`] (unresolved callees skip, overloads decline); calls to
+/// declined declarations skip silently (the declaration note covers them).
+/// Then arity (`PITH2554`, exact single argument), `T` resolution (explicit
+/// count `PITH2558` / unknown `PITH2304` / complex-type-argument decline, or
+/// single-literal inference with a no-candidate decline), and finally the
+/// substituted argument check (`PITH2345`, vacuous for inferred calls by
+/// construction). Non-literal arguments under explicit type arguments skip
+/// per-argument (P014 precedent); under inference they decline (no
+/// candidate).
+///
+/// Spans mirror the oracle: body diagnostics at the declaration span,
+/// too-few arity and `PITH2558`/`PITH2304` at the callee identifier,
+/// too-many arity and `PITH2345` at the argument. Explicit-argument anchors
+/// fold to the callee (no type-argument spans exist in facts).
+#[must_use]
+pub fn check_generics(
+    file: FileId,
+    decls: &[GenericDecl],
+    calls: &[GenericCall],
+    binder: &Binder,
+) -> FileReport {
+    let mut report = FileReport::default();
+    let mut shapes: Vec<Option<GenericShape>> = Vec::with_capacity(decls.len());
+    for generic in decls {
+        shapes.push(check_generic_decl(file, generic, binder, &mut report));
+    }
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, generic) in decls.iter().enumerate() {
+        by_name
+            .entry(generic.decl.name.as_str())
+            .or_default()
+            .push(index);
+    }
+    let mut ctx = GenericCallCtx {
+        file,
+        binder,
+        shapes: &shapes,
+        by_name: &by_name,
+        inference: InferenceTable::default(),
+        report: &mut report,
+    };
+    for (index, call_site) in calls.iter().enumerate() {
+        check_one_generic_call(generic_occurrence_node(index), call_site, &mut ctx);
+    }
+    sort_report(&mut report);
+    report
+}
+
+/// Mutable call-checking state for one [`check_generics`] run, bundled so
+/// the per-call helper stays lean.
+struct GenericCallCtx<'a, 'b> {
+    file: FileId,
+    binder: &'a Binder,
+    shapes: &'a [Option<GenericShape>],
+    by_name: &'a HashMap<&'b str, Vec<usize>>,
+    inference: InferenceTable,
+    report: &'a mut FileReport,
+}
+
+/// Pushes one [`UnsupportedDecl`] and returns `None`: the decline shorthand
+/// for generic gates (every decline site returns `Option<..>`, so one
+/// helper keeps them flat instead of repeating the push).
+fn decline_to_none<T>(
+    report: &mut FileReport,
+    file: FileId,
+    span: Span,
+    reason: String,
+) -> Option<T> {
+    report
+        .unsupported
+        .push(UnsupportedDecl { file, span, reason });
+    None
+}
+
+/// Gates one generic declaration and emits its body verdict.
+///
+/// Returns the [`GenericShape`] for call checking, or `None` after pushing
+/// exactly one note. The SHAPE gates calls; the BODY never does: body
+/// verdicts (literal diagnoses, non-literal and every other decline) emit
+/// their note and the shape still returns, so calls check independently of
+/// body checkability (P014 precedent).
+fn check_generic_decl(
+    file: FileId,
+    generic: &GenericDecl,
+    binder: &Binder,
+    report: &mut FileReport,
+) -> Option<GenericShape> {
+    let decl = &generic.decl;
+    let span = binder_span_for(
+        binder,
+        file,
+        decl.name.as_str(),
+        decl.scope,
+        decl.symbol,
+        decl.span,
+    );
+    let shape = match generic_decl_shape(generic) {
+        Ok(shape) => shape,
+        Err(reason) => return decline_to_none(report, file, span, reason),
+    };
+    match &decl.body {
+        FunctionBody::SingleReturn(body) => {
+            let _ = check_generic_body(file, span, &decl.name, &shape, body, report);
+        }
+        FunctionBody::NoBody { declared: true } => {
+            let _: Option<GenericShape> = decline_to_none(
+                report,
+                file,
+                span,
+                format!("declare function '{}' has no body to check", decl.name),
+            );
+        }
+        FunctionBody::NoBody { declared: false } => {
+            let _: Option<GenericShape> = decline_to_none(
+                report,
+                file,
+                span,
+                format!(
+                    "overload signature for '{}' has no body to check",
+                    decl.name
+                ),
+            );
+        }
+        FunctionBody::Empty => {
+            let _: Option<GenericShape> = decline_to_none(
+                report,
+                file,
+                span,
+                format!("empty body on '{}': nothing to check against", decl.name),
+            );
+        }
+        FunctionBody::Complex => {
+            let _: Option<GenericShape> = decline_to_none(
+                report,
+                file,
+                span,
+                format!(
+                    "complex body on '{}': control flow is outside the subset",
+                    decl.name
+                ),
+            );
+        }
+    }
+    Some(shape)
+}
+
+/// Gates one generic declaration's type parameters, value parameters, and
+/// return annotation into a [`GenericShape`]; `Err` carries the reason.
+///
+/// Gate order is structural-first: type-parameter complexity and count,
+/// then value-parameter patterns/annotatedness/optionality/count, then
+/// bare-`T` annotation shapes, then the return annotation. The body checks
+/// separately in [`check_generic_body`].
+fn generic_decl_shape(generic: &GenericDecl) -> Result<GenericShape, String> {
+    if generic.type_params_complex {
+        return Err(
+            "type parameter constraint, default, or modifier is outside the subset".to_owned(),
+        );
+    }
+    if generic.type_params.len() != 1 {
+        if generic.type_params.is_empty() {
+            return Err(format!(
+                "no type parameters on '{}': not a generic declaration",
+                generic.decl.name
+            ));
+        }
+        return Err(format!(
+            "multiple type parameters '{}' are outside the subset",
+            generic.type_params.join(", ")
+        ));
+    }
+    let t_name = generic.type_params[0].clone();
+    let decl = &generic.decl;
+    if decl.params_complex {
+        return Err("non-identifier parameter pattern is outside the subset".to_owned());
+    }
+    if decl.params.len() != 1 {
+        return Err(format!(
+            "generic function '{}' has {} parameters: exactly one is in the subset",
+            decl.name,
+            decl.params.len()
+        ));
+    }
+    let param = &decl.params[0];
+    if !param.annotated {
+        return Err(format!(
+            "unannotated parameter '{}' is outside the subset",
+            param.name
+        ));
+    }
+    if param.optional {
+        return Err(format!(
+            "optional parameter '{}' takes a range of arities, outside the subset",
+            param.name
+        ));
+    }
+    if param.is_rest {
+        return Err(format!(
+            "rest parameter '{}' is variadic, outside the subset",
+            param.name
+        ));
+    }
+    bare_t_param(
+        param.annotation.as_deref().map_or("", str::trim),
+        &t_name,
+        param.name.as_str(),
+    )?;
+    let annotation = decl.return_annotation.as_deref().map_or("", str::trim);
+    if decl.return_annotation.is_none() {
+        return Err(format!(
+            "no return annotation on '{}': inference is outside the subset",
+            decl.name
+        ));
+    }
+    bare_t_return(annotation, &t_name)?;
+    Ok(GenericShape { t_name })
+}
+
+/// Requires a value-parameter annotation to be exactly the bare type
+/// parameter (`T`); union/object/other shapes decline with distinct reasons.
+fn bare_t_param(text: &str, t_name: &str, param: &str) -> Result<(), String> {
+    if text == t_name {
+        return Ok(());
+    }
+    if text.contains('|') {
+        return Err(format!(
+            "union parameter type '{text}' is outside the subset"
+        ));
+    }
+    if text.starts_with('{') {
+        return Err(format!(
+            "object parameter type '{text}' is outside the subset"
+        ));
+    }
+    Err(format!(
+        "parameter type '{text}' for '{param}' is not the bare type parameter '{t_name}': outside the subset"
+    ))
+}
+
+/// Requires the return annotation to be exactly the bare type parameter
+/// (`T`); union/object/other shapes decline with distinct reasons.
+fn bare_t_return(text: &str, t_name: &str) -> Result<(), String> {
+    if text == t_name {
+        return Ok(());
+    }
+    if text.contains('|') {
+        return Err(format!("union return type '{text}' is outside the subset"));
+    }
+    if text.starts_with('{') {
+        return Err(format!("object return type '{text}' is outside the subset"));
+    }
+    Err(format!(
+        "return type '{text}' is not the bare type parameter '{t_name}': outside the subset"
+    ))
+}
+
+/// Emits one generic declaration's body verdict, returning its
+/// [`GenericShape`] for call checking.
+///
+/// Literal bodies always diagnose against `T` (no literal inhabits bare
+/// `T` — probed tsc 7.0.2); non-literal returns decline (the `T`-typed
+/// pass-through is clean in tsc but inexpressible without expression
+/// facts). Returns `Some` in both cases: calls check independently of body
+/// checkability (P014 precedent).
+#[must_use]
+fn check_generic_body(
+    file: FileId,
+    span: Span,
+    name: &str,
+    shape: &GenericShape,
+    body: &FunctionReturn,
+    report: &mut FileReport,
+) -> Option<GenericShape> {
+    let t_name = shape.t_name.as_str();
+    if let Some(init_object) = body.init_object.as_ref() {
+        return check_generic_object_body(file, span, t_name, init_object, shape, report);
+    }
+    let Some(kind) = body.kind else {
+        return decline_to_none(
+            report,
+            file,
+            span,
+            "missing return expression: nothing to check against".to_owned(),
+        );
+    };
+    if kind == InitKind::NonLiteral {
+        return decline_to_none(
+            report,
+            file,
+            span,
+            format!("non-literal return in '{name}' is outside the subset"),
+        );
+    }
+    report.diagnostics.push(PithDiagnostic {
+        code: CODE_MISMATCH.to_owned(),
+        file,
+        span,
+        message: format!(
+            "Type '{}' is not assignable to type '{t_name}'.",
+            kind.name()
+        ),
+    });
+    Some(shape.clone())
+}
+
+/// Emits one generic declaration's object-literal body verdict: the literal
+/// spells in source order against `T` (probed tsc 7.0.2: `Type '{ v:
+/// number; }' is not assignable to type 'T'.`). Non-literal and empty
+/// members decline instead of forcing a spelling.
+#[must_use]
+fn check_generic_object_body(
+    file: FileId,
+    span: Span,
+    t_name: &str,
+    init_object: &ObjectInit,
+    shape: &GenericShape,
+    report: &mut FileReport,
+) -> Option<GenericShape> {
+    if init_object.members.is_empty() {
+        return decline_to_none(
+            report,
+            file,
+            span,
+            "empty object return against a bare type parameter is outside the subset".to_owned(),
+        );
+    }
+    let mut names: Vec<&str> = Vec::with_capacity(init_object.members.len());
+    let mut types: Vec<&str> = Vec::with_capacity(init_object.members.len());
+    for member in &init_object.members {
+        if member.kind == ObjectMemberKind::NonLiteral {
+            return decline_to_none(
+                report,
+                file,
+                span,
+                format!("non-literal member '{}' is outside the subset", member.name),
+            );
+        }
+        names.push(member.name.as_str());
+        types.push(member.kind.display_name());
+    }
+    report.diagnostics.push(PithDiagnostic {
+        code: CODE_MISMATCH.to_owned(),
+        file,
+        span,
+        message: format!(
+            "Type '{}' is not assignable to type '{t_name}'.",
+            object_type_text(&names, &types)
+        ),
+    });
+    Some(shape.clone())
+}
+
+/// Checks one generic instantiation, pushing into the context report.
+///
+/// At most one diagnostic ever fires per call (arity before resolution
+/// before argument types); declines push exactly one [`UnsupportedDecl`].
+/// Calls to declined declarations skip silently (the declaration note
+/// covers them).
+fn check_one_generic_call(node: NodeId, call_site: &GenericCall, ctx: &mut GenericCallCtx<'_, '_>) {
+    let call = &call_site.call;
+    let file = ctx.file;
+    let candidates = ctx.by_name.get(call.callee.as_str());
+    let Some(candidates) = candidates else {
+        if ctx
+            .binder
+            .unresolved()
+            .iter()
+            .any(|entry| entry.file == file && entry.name == call.callee)
+        {
+            return;
+        }
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file,
+            span: call.callee_span,
+            reason: format!(
+                "call to undeclared name '{}': nothing to check against",
+                call.callee
+            ),
+        });
+        return;
+    };
+    if candidates.len() != 1 {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file,
+            span: call.callee_span,
+            reason: format!(
+                "multiple declarations for '{}': overload resolution is outside the subset",
+                call.callee
+            ),
+        });
+        return;
+    }
+    let Some(shape) = ctx.shapes[candidates[0]].clone() else {
+        // Declined at declaration level: the declaration note covers it.
+        return;
+    };
+    if call.args.len() != 1 {
+        let span = if call.args.is_empty() {
+            call.callee_span
+        } else {
+            call.args[1].span
+        };
+        ctx.report.diagnostics.push(PithDiagnostic {
+            code: CODE_ARITY.to_owned(),
+            file,
+            span,
+            message: format!("Expected 1 arguments, but got {}.", call.args.len()),
+        });
+        return;
+    }
+    let Some((bound, display)) = resolve_t(node, &shape, call_site, ctx) else {
+        return;
+    };
+    let argument = &call.args[0];
+    if argument.kind == InitKind::NonLiteral {
+        // Reachable only under explicit type arguments (inference declines
+        // non-literals during resolution): skip per-argument, P014 precedent.
+        return;
+    }
+    if argument.kind.type_id() != bound {
+        ctx.report.diagnostics.push(PithDiagnostic {
+            code: CODE_ARG_TYPE.to_owned(),
+            file,
+            span: argument.span,
+            message: format!(
+                "Argument of type '{}' is not assignable to parameter of type '{display}'.",
+                argument.kind.name(),
+            ),
+        });
+    }
+}
+
+/// Resolves `T` for one call to its builtin [`TypeId`] plus display text,
+/// recording the binding in the [`InferenceTable`].
+///
+/// Explicit arguments gate count (`PITH2558`), then name
+/// (`PITH2304` for unknown names, decline for union/object shapes tsc
+/// accepts but the subset cannot spell checks against). Inference binds
+/// the single literal argument's kind and declines non-literals (no
+/// candidate without expression facts). Returns `None` when one note was
+/// pushed and the call declines.
+#[must_use]
+fn resolve_t(
+    node: NodeId,
+    shape: &GenericShape,
+    call_site: &GenericCall,
+    ctx: &mut GenericCallCtx<'_, '_>,
+) -> Option<(TypeId, String)> {
+    let call = &call_site.call;
+    let file = ctx.file;
+    if let Some(texts) = call_site.explicit_args.as_ref() {
+        if texts.len() != 1 {
+            ctx.report.diagnostics.push(PithDiagnostic {
+                code: CODE_TYPE_ARITY.to_owned(),
+                file,
+                span: call.callee_span,
+                message: format!("Expected 1 type arguments, but got {}.", texts.len()),
+            });
+            return None;
+        }
+        let text = texts[0].trim();
+        if text.contains('|') || text.starts_with('{') {
+            ctx.report.unsupported.push(UnsupportedDecl {
+                file,
+                span: call.callee_span,
+                reason: format!(
+                    "call to '{}': type argument '{text}' is outside the subset",
+                    call.callee
+                ),
+            });
+            return None;
+        }
+        let Some(bound) = annotation_type(text) else {
+            ctx.report.diagnostics.push(PithDiagnostic {
+                code: CODE_UNKNOWN_ANNOTATION.to_owned(),
+                file,
+                span: call.callee_span,
+                message: format!("Cannot find name '{text}'."),
+            });
+            return None;
+        };
+        ctx.inference.bindings.insert((file, node), bound);
+        // Verdicts below substitute the RECORDED binding, never the
+        // transient local: occurrence-varying state flows through the
+        // scoped side table (H-002), even though the two agree here.
+        let bound = ctx.inference.binding(file, node).unwrap_or(bound);
+        return Some((bound, text.to_owned()));
+    }
+    let argument = &call.args[0];
+    if argument.kind == InitKind::NonLiteral {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file,
+            span: argument.span,
+            reason: format!(
+                "call to '{}': cannot infer '{}' from a non-literal argument: expression facts are outside the subset",
+                call.callee, shape.t_name
+            ),
+        });
+        return None;
+    }
+    let bound = argument.kind.type_id();
+    let display = primitive_name(bound).unwrap_or("unknown").to_owned();
+    ctx.inference.bindings.insert((file, node), bound);
+    // Same read-back as the explicit path: substitute the recorded
+    // binding (H-002), never the transient local.
+    let bound = ctx.inference.binding(file, node).unwrap_or(bound);
+    Some((bound, display))
+}
+
+/// Occurrence [`NodeId`] for the `index`-th generic call instantiation.
+///
+/// Generic inference bindings key per call occurrence; the range stays
+/// disjoint from const nodes ([`occurrence_node`]) and function nodes
+/// ([`function_occurrence_node`]) so all three checkers may share nothing
+/// while never aliasing.
+#[must_use]
+fn generic_occurrence_node(index: usize) -> NodeId {
+    const BASE: u32 = 0x8000_0000;
+    NodeId(
+        u32::try_from(index)
+            .unwrap_or(u32::MAX)
+            .saturating_add(BASE),
+    )
+}
+
 /// Narrowing over union annotations (P015, probed on tsc 7.0.2
 /// `--strict --pretty false`).
 ///
@@ -4356,5 +5022,525 @@ mod tests {
             report.diagnostics[0].message,
             "Type 'string' is not assignable to type 'number'."
         );
+    }
+
+    fn generic_param(annotation: Option<&str>) -> FunctionParam {
+        FunctionParam {
+            name: "x".to_owned(),
+            annotated: annotation.is_some(),
+            annotation: annotation.map(str::to_owned),
+            optional: false,
+            is_rest: false,
+        }
+    }
+
+    fn generic_decl_named(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        t_params: &[&str],
+        param_ann: Option<&str>,
+        ret_ann: Option<&str>,
+        body: FunctionBody,
+    ) -> GenericDecl {
+        GenericDecl {
+            decl: FunctionDecl {
+                name: name.to_owned(),
+                span: span(lo, hi),
+                scope: 0,
+                symbol: None,
+                params: vec![generic_param(param_ann)],
+                params_complex: false,
+                return_annotation: ret_ann.map(str::to_owned),
+                body,
+            },
+            type_params: t_params.iter().map(|param| (*param).to_owned()).collect(),
+            type_params_complex: false,
+        }
+    }
+
+    /// The canonical identity declaration: `function id<T>(x: T): T` with a
+    /// pass-through body (non-literal, so the declaration declines while
+    /// calls still check — P014 precedent).
+    fn identity_decl(lo: u32, hi: u32) -> GenericDecl {
+        generic_decl_named(
+            "id",
+            lo,
+            hi,
+            &["T"],
+            Some("T"),
+            Some("T"),
+            FunctionBody::SingleReturn(FunctionReturn {
+                kind: Some(InitKind::NonLiteral),
+                init_object: None,
+            }),
+        )
+    }
+
+    fn generic_call_args(
+        callee: &str,
+        callee_lo: u32,
+        callee_hi: u32,
+        args: Vec<(InitKind, u32, u32)>,
+        explicit: Option<Vec<&str>>,
+    ) -> GenericCall {
+        GenericCall {
+            call: CallSite {
+                callee: callee.to_owned(),
+                callee_span: span(callee_lo, callee_hi),
+                span: span(callee_lo, callee_hi + 2),
+                args: args
+                    .into_iter()
+                    .map(|(kind, lo, hi)| CallArg {
+                        kind,
+                        span: span(lo, hi),
+                    })
+                    .collect(),
+            },
+            explicit_args: explicit.map(|texts| texts.into_iter().map(str::to_owned).collect()),
+        }
+    }
+
+    fn generics_report(
+        decls: &[GenericDecl],
+        calls: &[GenericCall],
+        binder: &Binder,
+    ) -> FileReport {
+        check_generics(FILE, decls, calls, binder)
+    }
+
+    #[test]
+    fn generic_explicit_correct_binds_silently() {
+        // `id<number>(1)`: the argument matches the instantiation, so no
+        // diagnostic. The pass-through body still declines (one note).
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let args = vec![(InitKind::Number, 40, 41)];
+        let calls = [generic_call_args("id", 30, 32, args, Some(vec!["number"]))];
+        let report = generics_report(&decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("non-literal return"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn generic_explicit_wrong_is_ts2345() {
+        // `id<number>("oops")`: the oracle's TS2345 at the argument.
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let args = vec![(InitKind::String, 40, 46)];
+        let calls = [generic_call_args("id", 30, 32, args, Some(vec!["number"]))];
+        let report = generics_report(&decls, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'string' is not assignable to parameter of type 'number'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(40, 46));
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_explicit_count_is_ts2558() {
+        // `id<number, string>(1)`: the oracle's TS2558 at the callee.
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let calls = [generic_call_args(
+            "id",
+            30,
+            32,
+            vec![(InitKind::Number, 40, 41)],
+            Some(vec!["number", "string"]),
+        )];
+        let report = generics_report(&decls, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_TYPE_ARITY);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Expected 1 type arguments, but got 2."
+        );
+        assert_eq!(report.diagnostics[0].span, span(30, 32));
+    }
+
+    #[test]
+    fn generic_explicit_unknown_is_ts2304() {
+        // `id<Nope>(1)`: the oracle's TS2304 (callee-anchored: no
+        // type-argument spans exist in facts).
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let args = vec![(InitKind::Number, 40, 41)];
+        let calls = [generic_call_args("id", 30, 32, args, Some(vec!["Nope"]))];
+        let report = generics_report(&decls, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_UNKNOWN_ANNOTATION);
+        assert_eq!(report.diagnostics[0].message, "Cannot find name 'Nope'.");
+    }
+
+    #[test]
+    fn generic_explicit_union_declines() {
+        // `id<number | string>(1)` is clean in tsc but unspellable here:
+        // the call declines (plus the body's own note).
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let calls = [generic_call_args(
+            "id",
+            30,
+            32,
+            vec![(InitKind::Number, 40, 41)],
+            Some(vec!["number | string"]),
+        )];
+        let report = generics_report(&decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[1].reason.contains("type argument"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn generic_inferred_correct_binds_silently() {
+        // `id(1)`: T binds `number` from the literal; the check is vacuous
+        // by construction, so only the body note remains.
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let args = vec![(InitKind::Number, 40, 41)];
+        let calls = [generic_call_args("id", 30, 32, args, None)];
+        let report = generics_report(&decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_literal_body_diagnoses_against_t() {
+        // `return "s"` against `T`: the oracle's TS2322, call-independent
+        // (tsc checks generic bodies against `T` directly). The `f(1)` call
+        // still infers cleanly beside it.
+        let binder = binder_with(&[("f", span(0, 20))]);
+        let decls = [generic_decl_named(
+            "f",
+            0,
+            20,
+            &["T"],
+            Some("T"),
+            Some("T"),
+            FunctionBody::SingleReturn(FunctionReturn {
+                kind: Some(InitKind::String),
+                init_object: None,
+            }),
+        )];
+        let calls = [generic_call_args(
+            "f",
+            30,
+            31,
+            vec![(InitKind::Number, 40, 41)],
+            None,
+        )];
+        let report = generics_report(&decls, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'T'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(0, 20));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn generic_object_body_spells_against_t() {
+        // `return { v: 1 }` against `T`: the oracle's `{ v: number; }`
+        // spelling (probed tsc 7.0.2).
+        let binder = binder_with(&[("f", span(0, 20))]);
+        let decls = [generic_decl_named(
+            "f",
+            0,
+            20,
+            &["T"],
+            Some("T"),
+            Some("T"),
+            FunctionBody::SingleReturn(FunctionReturn {
+                kind: None,
+                init_object: Some(ObjectInit {
+                    members: vec![ObjectMemberInit {
+                        name: "v".to_owned(),
+                        kind: ObjectMemberKind::Number,
+                    }],
+                    fresh: true,
+                }),
+            }),
+        )];
+        let report = generics_report(&decls, &[], &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type '{ v: number; }' is not assignable to type 'T'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn generic_custom_param_name_spells_in_messages() {
+        // `U` behaves exactly like `T`, including in message spellings.
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [generic_decl_named(
+            "id",
+            0,
+            20,
+            &["U"],
+            Some("U"),
+            Some("U"),
+            FunctionBody::SingleReturn(FunctionReturn {
+                kind: Some(InitKind::Number),
+                init_object: None,
+            }),
+        )];
+        let report = generics_report(&decls, &[], &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'U'."
+        );
+    }
+
+    #[test]
+    fn generic_inference_failure_declines() {
+        // `id(u)` over an identifier: tsc binds from the identifier's type,
+        // but the subset has no expression facts — one call note (plus the
+        // body's own note), never silent.
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let calls = [generic_call_args(
+            "id",
+            30,
+            32,
+            vec![(InitKind::NonLiteral, 40, 41)],
+            None,
+        )];
+        let report = generics_report(&decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[1].reason.contains("cannot infer"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn generic_multi_param_declines_and_skips_call() {
+        // `pair<T, U>`: the declaration declines; its call skips silently
+        // (the declaration note covers it — no double-report).
+        let binder = binder_with(&[("pair", span(0, 20))]);
+        let mut decl = identity_decl(0, 20);
+        decl.decl.name = "pair".to_owned();
+        decl.type_params = vec!["T".to_owned(), "U".to_owned()];
+        let calls = [generic_call_args(
+            "pair",
+            30,
+            34,
+            vec![(InitKind::Number, 40, 41)],
+            None,
+        )];
+        let report = generics_report(&[decl], &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("multiple type parameters"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn generic_complex_type_params_decline() {
+        // Constraints/defaults/modifiers arrive as one flag: one reason.
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let mut decl = identity_decl(0, 20);
+        decl.type_params_complex = true;
+        let report = generics_report(&[decl], &[], &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("constraint"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn generic_nested_t_positions_decline() {
+        // `T` outside a bare position (union param, object param, object
+        // return, primitive param) declines with a distinct reason each.
+        let binder = binder_with(&[
+            ("f", span(0, 20)),
+            ("g", span(21, 41)),
+            ("h", span(42, 62)),
+            ("k", span(63, 83)),
+        ]);
+        let body = || {
+            FunctionBody::SingleReturn(FunctionReturn {
+                kind: Some(InitKind::NonLiteral),
+                init_object: None,
+            })
+        };
+        let decls = [
+            generic_decl_named("f", 0, 20, &["T"], Some("T | string"), Some("T"), body()),
+            generic_decl_named("g", 21, 41, &["T"], Some("{ v: T }"), Some("T"), body()),
+            generic_decl_named("h", 42, 62, &["T"], Some("T"), Some("{ v: T }"), body()),
+            generic_decl_named("k", 63, 83, &["T"], Some("number"), Some("T"), body()),
+        ];
+        let report = generics_report(&decls, &[], &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 4);
+        assert!(
+            report.unsupported[0].reason.contains("union parameter"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("object parameter"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+        assert!(
+            report.unsupported[2].reason.contains("object return"),
+            "reason: {}",
+            report.unsupported[2].reason
+        );
+        assert!(
+            report.unsupported[3].reason.contains("bare type parameter"),
+            "reason: {}",
+            report.unsupported[3].reason
+        );
+    }
+
+    #[test]
+    fn generic_missing_return_and_arity_decline() {
+        // No return annotation declines; zero-arg and two-arg calls report
+        // TS2554 at the oracle's spans.
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [generic_decl_named(
+            "id",
+            0,
+            20,
+            &["T"],
+            Some("T"),
+            None,
+            FunctionBody::Complex,
+        )];
+        let calls = [
+            generic_call_args("id", 30, 32, vec![], Some(vec!["number"])),
+            generic_call_args(
+                "id",
+                50,
+                52,
+                vec![(InitKind::Number, 60, 61), (InitKind::Number, 63, 64)],
+                None,
+            ),
+        ];
+        let report = generics_report(&decls, &calls, &binder);
+        // The declaration declines (no return annotation), so both calls
+        // skip silently: arity never runs against a declined declaration.
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("no return annotation"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn generic_arity_reports_on_checkable_decls() {
+        // Arity runs once the declaration gates pass: too-few anchors at
+        // the callee, too-many at the first excess argument (P014 mirrors).
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let calls = [
+            generic_call_args("id", 30, 32, vec![], Some(vec!["number"])),
+            generic_call_args(
+                "id",
+                50,
+                52,
+                vec![(InitKind::Number, 60, 61), (InitKind::Number, 63, 64)],
+                None,
+            ),
+        ];
+        let report = generics_report(&decls, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diag| diag.code == CODE_ARITY));
+        assert_eq!(report.diagnostics[0].span, span(30, 32));
+        assert_eq!(report.diagnostics[1].span, span(63, 64));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Expected 1 arguments, but got 0."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Expected 1 arguments, but got 2."
+        );
+    }
+
+    #[test]
+    fn generic_overloads_and_undeclared_mirror_calls() {
+        // Overloads decline per call; unresolved-tracked callees skip
+        // silently (P014 precedent, never double-diagnosed).
+        let binder = calls_binder(&[("id", span(0, 20)), ("id", span(21, 41))], &["missing"]);
+        let decls = [identity_decl(0, 20), identity_decl(21, 41)];
+        let calls = [
+            generic_call_args("id", 50, 52, vec![(InitKind::Number, 60, 61)], None),
+            generic_call_args("missing", 70, 77, vec![(InitKind::Number, 78, 79)], None),
+        ];
+        let report = generics_report(&decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 3);
+        assert!(report
+            .unsupported
+            .iter()
+            .any(|note| note.reason.contains("multiple declarations")));
+    }
+
+    #[test]
+    fn generic_occurrence_nodes_stay_disjoint() {
+        // Inference keys must never alias const or function memo nodes when
+        // checkers share a file.
+        assert_ne!(generic_occurrence_node(0), occurrence_node(0));
+        assert_ne!(generic_occurrence_node(0), function_occurrence_node(0));
+        assert_ne!(generic_occurrence_node(3), generic_occurrence_node(4));
+    }
+
+    #[test]
+    fn generic_reports_sort_deterministically() {
+        // Scrambled declaration order still verdicts in span order.
+        let binder = binder_with(&[("b", span(40, 60)), ("a", span(0, 20))]);
+        let decls = [identity_decl(40, 60), identity_decl(0, 20)];
+        let report = generics_report(&decls, &[], &binder);
+        assert_eq!(report.unsupported.len(), 2);
+        let los: Vec<u32> = report.unsupported.iter().map(|note| note.span.lo).collect();
+        assert_eq!(los, [0, 40]);
+        let repeat = generics_report(&decls, &[], &binder);
+        assert_eq!(report, repeat);
     }
 }
