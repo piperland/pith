@@ -13,9 +13,8 @@
 *.key
 id_* 
 
-# rust
+# rust (workspace produces libraries; Cargo.lock committed for reproducibility)
 target/
-Cargo.lock
 
 # node (plugins tooling)
 node_modules/

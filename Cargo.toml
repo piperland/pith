@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pith-ids"]
+members = ["crates/pith-ids", "crates/pith-frontend"]
 resolver = "2"
 
 [workspace.package]

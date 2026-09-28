@@ -1,0 +1,18 @@
+[package]
+name = "pith-frontend"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pith_frontend"
+path = "src/lib.rs"
+
+[dependencies]
+pith-ids = { path = "../pith-ids" }
+oxc_allocator = "=0.152.0"
+oxc_parser = "=0.152.0"
+oxc_semantic = "=0.152.0"
+oxc_span = "=0.152.0"
+
+[lints]
+workspace = true
