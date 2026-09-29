@@ -1,0 +1,6 @@
+as-cast-decline.ts:TS2322: Type 'number' is not assignable to type 'string'.
+as-cast-decline.ts:TS2352: Conversion of type 'string' to type 'number' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
+as-cast-decline.ts:TS2322: Type 'string' is not assignable to type 'number'.
+as-cast-decline.ts:TS2352: Conversion of type 'number' to type 'string' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
+as-cast-decline.ts:TS2345: Argument of type 'number' is not assignable to parameter of type 'string'.
+as-cast-decline.ts:TS2352: Conversion of type 'string' to type 'number' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
