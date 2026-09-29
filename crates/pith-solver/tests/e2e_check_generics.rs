@@ -212,7 +212,12 @@ fn generics_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<GenericDecl>
                     declared: *declared,
                 },
                 FunctionBodyFact::Empty => FunctionBody::Empty,
-                FunctionBodyFact::Complex => FunctionBody::Complex,
+                // P031 straight bodies decline here: no fixture in this
+                // suite holds one, so outcomes are unchanged; faithful
+                // mapping lives in e2e_check_functions.
+                FunctionBodyFact::StraightBody { .. } | FunctionBodyFact::Complex => {
+                    FunctionBody::Complex
+                }
             };
             GenericDecl {
                 decl: FunctionDecl {

@@ -21,21 +21,34 @@
 //! Straight-line joins check per return (P023): `branching` (oracle `TS2322`
 //! in the `else` branch) and the two-return/guard fixtures match their
 //! baselines with zero unsupported notes, while `multi-return` (oracle
-//! clean) is silent with zero notes. One fixture still diverges by design
+//! clean) is silent with zero notes. Straight bodies check per position
+//! (P031): `straight-clean` (incl. unannotated-skip and nested-`function`
+//! shapes) is silent with zero notes; `straight-inner-wrong` (incl. the
+//! multi-declarator shape), `straight-tail-wrong`, `straight-object-inner`,
+//! and `straight-nested-block` match their oracle `TS2322`s;
+//! `straight-both-wrong` matches twice; `straight-unannotated-cast`
+//! matches the oracle `TS2352`. One more fixture diverges by design (the
+//! oracle errors where the subset declines): `straight-identifier-init`
+//! (oracle `TS2322` on an identifier-initialized inner declarator —
+//! pinned explicitly like `unannotated-param` below).
+//! One fixture still diverges by design
 //! (the oracle errors where the subset declines): `unannotated-param`
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
 //! present, solver silent with one unsupported note — instead of forcing a
 //! false match.
 
 use pith_frontend::{
-    parse_module, FunctionBodyFact, ParsedFile, ReturnKind as FrontendReturnKind,
+    parse_module, CastFact as FrontendCastFact, CastKind as FrontendCastKind,
+    CastOperandKind as FrontendCastOperandKind, FunctionBodyFact, InitKind as FrontendInitKind,
+    InnerDeclFact as FrontendInnerDecl, ParsedFile, ReturnKind as FrontendReturnKind,
     SingleReturnFact as FrontendReturn,
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_functions, FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn,
-    InitKind, JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    check_functions, CastInput, CastKind, DeclKind, FileReport, FunctionBody, FunctionDecl,
+    FunctionParam, FunctionReturn, InitKind, InnerDecl, JoinedReturns, ObjectInit,
+    ObjectMemberInit, ObjectMemberKind, StraightBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -106,9 +119,12 @@ fn map_member_kind(kind: FrontendReturnKind) -> ObjectMemberKind {
 /// Maps one frontend return expression to the solver's return shape.
 ///
 /// Object returns become member facts (always fresh: only direct syntactic
-/// literals carry them); every other return becomes its literal kind.
-/// Exhaustive through [`map_return_kind`]/[`map_member_kind`], so a new
-/// frontend variant fails to compile instead of silently mis-checking.
+/// literals carry them); assertion returns carry their cast fact through
+/// (no existing fixture holds one — zero differential effect, mapped so
+/// the straight-body tail shares one faithful path). Every other return
+/// becomes its literal kind. Exhaustive through
+/// [`map_return_kind`]/[`map_member_kind`], so a new frontend variant fails
+/// to compile instead of silently mis-checking.
 fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     let init_object = ret.members.as_ref().map(|members| ObjectInit {
         members: members
@@ -128,7 +144,7 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     FunctionReturn {
         kind,
         init_object,
-        cast: None,
+        cast: ret.cast.as_ref().map(map_cast),
     }
 }
 
@@ -137,6 +153,126 @@ fn map_joined(first: &FrontendReturn, second: &FrontendReturn) -> JoinedReturns 
     JoinedReturns {
         first: map_function_return(first),
         second: map_function_return(second),
+    }
+}
+
+/// Maps one frontend cast-operand kind to the solver's initializer kind.
+///
+/// Exhaustive so a new frontend variant fails to compile instead of
+/// silently mis-checking (mirrors the check-any driver's cast map).
+fn map_cast_operand_kind(kind: FrontendCastOperandKind) -> InitKind {
+    match kind {
+        FrontendCastOperandKind::Number => InitKind::Number,
+        FrontendCastOperandKind::String => InitKind::String,
+        FrontendCastOperandKind::Boolean => InitKind::Boolean,
+        FrontendCastOperandKind::Null => InitKind::Null,
+        FrontendCastOperandKind::Undefined => InitKind::Undefined,
+        FrontendCastOperandKind::NonLiteral => InitKind::NonLiteral,
+    }
+}
+
+/// Maps one frontend assertion form to the solver's, variant by variant.
+///
+/// Exhaustive so a new frontend variant fails to compile instead of silently
+/// mis-checking (mirrors the check-any driver's cast map).
+fn map_cast_kind(kind: FrontendCastKind) -> CastKind {
+    match kind {
+        FrontendCastKind::As => CastKind::As,
+        FrontendCastKind::Satisfies => CastKind::Satisfies,
+        FrontendCastKind::Angle => CastKind::Angle,
+    }
+}
+
+/// Maps one frontend cast fact to the solver's input.
+///
+/// An unsliceable target (only possible with recovery from parse errors)
+/// echoes as `""`, which the solver declines as complex — recorded, never
+/// mis-checked or dropped (mirrors the check-any driver's cast map).
+fn map_cast(cast: &FrontendCastFact) -> CastInput {
+    CastInput {
+        operand: map_cast_operand_kind(cast.operand_kind),
+        target: cast.target_text.clone().unwrap_or_default(),
+        operand_span: cast.operand_span,
+        kind: map_cast_kind(cast.kind),
+    }
+}
+
+/// Maps one frontend leading-initializer kind to the solver's.
+///
+/// Exhaustive so a new frontend variant fails to compile instead of
+/// silently mis-checking.
+fn map_inner_init_kind(kind: FrontendInitKind) -> InitKind {
+    match kind {
+        FrontendInitKind::Number => InitKind::Number,
+        FrontendInitKind::String => InitKind::String,
+        FrontendInitKind::Boolean => InitKind::Boolean,
+        FrontendInitKind::Null => InitKind::Null,
+        FrontendInitKind::Undefined => InitKind::Undefined,
+        FrontendInitKind::NonLiteral => InitKind::NonLiteral,
+    }
+}
+
+/// Maps one frontend leading declarator to the solver's straight-body
+/// position.
+///
+/// Identity resolves through the binder from the fact's own symbol linkage
+/// (mirroring [`fallback_span`]); object initializers become member facts
+/// (always fresh); assertion initializers carry their cast fact through.
+fn map_inner_decl(parsed: &ParsedFile, binder: &Binder, inner: &FrontendInnerDecl) -> InnerDecl {
+    let (name, span, symbol) = fallback_span(parsed, binder, inner.symbol, inner.scope);
+    let init_object = inner.members.as_ref().map(|members| ObjectInit {
+        members: members
+            .iter()
+            .map(|member| ObjectMemberInit {
+                name: member.name.clone(),
+                kind: map_member_kind(member.kind),
+            })
+            .collect(),
+        fresh: true,
+    });
+    let init = if init_object.is_some() {
+        None
+    } else {
+        inner
+            .init
+            .as_ref()
+            .map(|init| map_inner_init_kind(init.kind))
+    };
+    InnerDecl {
+        name,
+        span,
+        scope: inner.scope,
+        symbol,
+        kind: if inner.is_let {
+            DeclKind::Let
+        } else {
+            DeclKind::Const
+        },
+        annotation: inner.annotation.as_ref().map(|ann| ann.text.clone()),
+        init,
+        init_object,
+        cast: inner
+            .init
+            .as_ref()
+            .and_then(|init| init.cast.as_ref())
+            .map(map_cast),
+    }
+}
+
+/// Maps one frontend straight body to the solver's: leading declarators in
+/// source order plus the terminal return.
+fn map_straight(
+    parsed: &ParsedFile,
+    binder: &Binder,
+    leading: &[FrontendInnerDecl],
+    tail: &FrontendReturn,
+) -> StraightBody {
+    StraightBody {
+        leading: leading
+            .iter()
+            .map(|inner| map_inner_decl(parsed, binder, inner))
+            .collect(),
+        tail: map_function_return(tail),
     }
 }
 
@@ -163,7 +299,9 @@ fn fallback_span(
 /// - `params` as names + annotated-ness verbatim, `params_complex` verbatim;
 /// - `return_annotation` as the frontend's colon-stripped text verbatim;
 /// - `body` mapped variant by variant; object returns become member facts
-///   (always fresh: only direct syntactic literals carry them).
+///   (always fresh: only direct syntactic literals carry them), assertion
+///   positions carry casts, and straight bodies map leading declarators
+///   plus the tail return through [`map_straight`].
 fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDecl> {
     parsed
         .functions
@@ -184,6 +322,9 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                     then_branch,
                     else_branch,
                 } => FunctionBody::BranchReturns(map_joined(then_branch, else_branch)),
+                FunctionBodyFact::StraightBody { leading, tail } => {
+                    FunctionBody::StraightBody(map_straight(parsed, binder, leading, tail))
+                }
                 FunctionBodyFact::NoBody { declared } => FunctionBody::NoBody {
                     declared: *declared,
                 },
@@ -348,6 +489,81 @@ fixture_test!(
     "object-return.expected.txt",
     0
 );
+fixture_test!(
+    straight_clean_is_silent,
+    "straight-clean.ts",
+    "straight-clean.expected.txt",
+    0
+);
+fixture_test!(
+    straight_inner_wrong_matches_ts2322,
+    "straight-inner-wrong.ts",
+    "straight-inner-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    straight_tail_wrong_matches_ts2322,
+    "straight-tail-wrong.ts",
+    "straight-tail-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    straight_both_wrong_matches_ts2322_twice,
+    "straight-both-wrong.ts",
+    "straight-both-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    straight_nested_block_matches_ts2322,
+    "straight-nested-block.ts",
+    "straight-nested-block.expected.txt",
+    0
+);
+fixture_test!(
+    straight_object_inner_matches_ts2322,
+    "straight-object-inner.ts",
+    "straight-object-inner.expected.txt",
+    0
+);
+fixture_test!(
+    straight_unannotated_cast_matches_ts2352,
+    "straight-unannotated-cast.ts",
+    "straight-unannotated-cast.expected.txt",
+    0
+);
+
+#[test]
+fn straight_identifier_init_divergence_pins_ts2322() {
+    // By design the subset declines where the oracle errors: tsc reports
+    // `TS2322` on the identifier-initialized inner declarator (it knows the
+    // parameter's value type) while the solver records one unsupported note
+    // and stays silent — no value-type facts, never a forced verdict.
+    let source = include_str!("../../../corpus/check-functions/straight-identifier-init.ts");
+    let expected =
+        include_str!("../../../corpus/check-functions/straight-identifier-init.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'number' is not assignable to type 'string'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("non-literal initializer"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
 
 #[test]
 fn unannotated_param_divergence_pins_ts7006() {
