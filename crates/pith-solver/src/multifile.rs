@@ -30,6 +30,12 @@
 //!   (`TS2322` wrong member, `TS2741` missing — the P017 families intact).
 //! - A type used as a value diagnoses `TS2693` in tsc; the solver declines
 //!   those uses with reasons (pinned oracle-error divergence).
+//! - `import type` of an existing alias is silent in tsc; the solver
+//!   declines failed type-only imports (and their annotation uses) with
+//!   reasons instead of `PITH2305`/`PITH2307`/`PITH2304` — a pinned
+//!   divergence, since type aliases emit no facts and diagnosing would risk
+//!   false verdicts. Failed VALUE imports keep the exact mirrors (their
+//!   export space is fully facted).
 //!
 //! Driver seams (all disclosed, mirroring the narrowing/check-enums
 //! precedents): identifier-initializer names ride [`ProgramFile::ident_inits`]
@@ -57,7 +63,10 @@
 //! - Annotations resolving to the declaring file's interfaces/enums relink
 //!   onto the LOCAL import binding's symbol and check through [`check_enums`]
 //!   unchanged; value targets there decline via the existing not-an-enum
-//!   path (tsc's `TS2749` is the pinned gap).
+//!   path (tsc's `TS2749` is the pinned gap). Annotations naming a
+//!   type-only import the graph cannot resolve skip checking with a
+//!   recorded reason (type aliases emit no facts — `PITH2304` there would
+//!   be a false verdict).
 //! - Calls merge imported function declarations (parameters from the
 //!   declaring file) with local ones and check through [`check_calls`]
 //!   unchanged — calls are unmemoized, so they record no query deps
@@ -106,6 +115,13 @@ pub struct ImportUse {
     pub imported_span: Option<Span>,
     /// Span of the module-specifier string (anchors `PITH2307`).
     pub specifier_span: Span,
+    /// `true` for `import type` bindings (mechanical copy of the frontend
+    /// flag: elision is unobservable to checking). Failed type-only imports
+    /// decline with reasons instead of diagnosing — the subset facts no
+    /// type-alias space, so a failing type-only resolution may name a member
+    /// the target does export as a type, and `PITH2305`/`PITH2307` there
+    /// would risk a false verdict where tsc stays clean.
+    pub is_type: bool,
 }
 
 /// One file's checking inputs for [`check_program`].
@@ -258,12 +274,31 @@ pub fn check_program(
 /// per statement even with several bindings — probed); missing members
 /// diagnose once per binding at the imported-name span (one oracle `TS2305`
 /// per binding — probed); other failures decline with reasons.
+///
+/// Type-only imports never diagnose (any failure shape declines): their
+/// export space includes type aliases the subset never facts, so a
+/// diagnostic would risk a false verdict where tsc stays clean (probed:
+/// `import type` of an existing alias is silent). Value imports keep the
+/// exact mirrors — their export space is fully facted.
 fn check_import_statements(ctx: &mut FileCtx<'_>) {
     let file = ctx.input.file;
     let mut reported: HashSet<String> = HashSet::new();
     for use_ in &ctx.input.imports {
         match ctx.graph.resolve_import(file, &use_.local) {
             Ok(_) => {}
+            Err(other) if use_.is_type => {
+                ctx.report.unsupported.push(super::UnsupportedDecl {
+                    file,
+                    span: use_.span,
+                    reason: format!(
+                        "type-only import '{}' from '{}': {}: \
+                         type aliases are outside the subset",
+                        use_.local,
+                        use_.specifier,
+                        other.reason()
+                    ),
+                });
+            }
             Err(ImportError::UnresolvableSpecifier { specifier, .. }) => {
                 if reported.insert(specifier.clone()) {
                     ctx.report.diagnostics.push(super::PithDiagnostic {
@@ -492,6 +527,25 @@ fn resolve_type_shape(ctx: &FileCtx<'_>, target: &str) -> Option<Result<ShapeHit
     None
 }
 
+/// The decline reason when `target` is a type-only import whose resolution
+/// fails: `None` for value imports and for anything that resolves (failed
+/// value imports keep their `PITH2305`/`PITH2307` diagnostics; resolved
+/// imports relink shapes through [`resolve_type_shape`]).
+fn failed_type_import(ctx: &FileCtx<'_>, target: &str) -> Option<String> {
+    if !ctx
+        .input
+        .imports
+        .iter()
+        .any(|entry| entry.local == target && entry.is_type)
+    {
+        return None;
+    }
+    match ctx.graph.resolve_import(ctx.input.file, target) {
+        Ok(_) => None,
+        Err(other) => Some(other.reason()),
+    }
+}
+
 /// Declaration span for a use-file const declarator: the exact symbol id,
 /// declarator scope, then caller fallback (the same contract as the
 /// single-file span helper).
@@ -515,6 +569,11 @@ fn check_const_decls(ctx: &mut FileCtx<'_>) {
     let mut interfaces: Vec<InterfaceShape> = ctx.input.interfaces.clone();
     let mut enums: Vec<EnumShape> = ctx.input.enums.clone();
     let mut notes: Vec<(Span, String)> = Vec::new();
+    // Positions in `decls` whose declaration already declined (a failed
+    // type-only import records its gap here): they skip `check_enums`
+    // instead of checking unannotated, which would add a second, misleading
+    // "no annotation" note for a declaration that does have one.
+    let mut skip: Vec<bool> = Vec::with_capacity(ctx.input.consts.len());
     for (index, decl) in ctx.input.consts.iter().enumerate() {
         let mut resolved = decl.clone();
         let mut deps: Vec<Dep> = Vec::new();
@@ -545,7 +604,32 @@ fn check_const_decls(ctx: &mut FileCtx<'_>) {
                 && !has_local_shape(ctx, resolved.scope, annotation)
             {
                 match resolve_type_shape(ctx, annotation) {
-                    None => {}
+                    None => {
+                        if let Some(reason) = failed_type_import(ctx, annotation) {
+                            // A type-only import the value graph cannot see
+                            // (type aliases emit no facts): checking the
+                            // annotation would invent `PITH2304` where tsc
+                            // resolves the alias cleanly, so the declaration
+                            // skips checking and the gap is recorded here.
+                            let span = use_decl_span(ctx, &resolved);
+                            let name = annotation.to_owned();
+                            notes.push((
+                                span,
+                                format!(
+                                    "type-only import '{name}': {reason}: \
+                                     type aliases are outside the subset"
+                                ),
+                            ));
+                            skip.push(true);
+                            let init_text = ctx.input.enum_texts.get(index).cloned().flatten();
+                            decls.push(EnumDecl {
+                                decl: resolved,
+                                init_text,
+                                cross_file_deps: deps,
+                            });
+                            continue;
+                        }
+                    }
                     Some(Ok(ShapeHit::Interface(shape))) => interfaces.push(shape),
                     Some(Ok(ShapeHit::Enum(shape))) => enums.push(shape),
                     Some(Err(reason)) => {
@@ -560,7 +644,13 @@ fn check_const_decls(ctx: &mut FileCtx<'_>) {
             init_text,
             cross_file_deps: deps,
         });
+        skip.push(false);
     }
+    let decls: Vec<EnumDecl> = decls
+        .into_iter()
+        .zip(skip)
+        .filter_map(|(decl, skipped)| (!skipped).then_some(decl))
+        .collect();
     let input = EnumInput {
         enums: &enums,
         interfaces: &interfaces,
@@ -668,9 +758,17 @@ fn check_function_decls(ctx: &mut FileCtx<'_>) {
 /// into the existing undeclared-name decline.
 fn merged_functions(ctx: &FileCtx<'_>) -> Vec<FunctionDecl> {
     let mut merged: Vec<FunctionDecl> = ctx.input.functions.clone();
+    // One imported declaration per callee name per file: pushing per call
+    // site would fabricate same-name duplicates and trip the
+    // multiple-declaration decline on every repeat call. Local-plus-imported
+    // same-name pairs still merge (the decline is intended there).
+    let mut pushed: HashSet<&str> = HashSet::new();
     for call in &ctx.input.calls {
         let name = call.callee.as_str();
         if !ctx.input.imports.iter().any(|entry| entry.local == name) {
+            continue;
+        }
+        if !pushed.insert(name) {
             continue;
         }
         let Ok(resolved) = ctx.graph.resolve_import(ctx.input.file, name) else {
