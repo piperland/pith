@@ -226,8 +226,11 @@
 //! - Complex casts (non-literal operands, `None`/union/object/literal
 //!   targets, parenthesized chains past the outermost) decline the whole
 //!   declaration with a reason — never a forced `TS2352` (object targets
-//!   cannot spell canonically from sliced text). `unknown` without `typeof`
-//!   guards declines for the same reason: no value-type facts.
+//!   cannot spell canonically from sliced text). Identifier-held `unknown`
+//!   (`const a: string = uv`) declines in [`check_one`] for the same
+//!   reason: no value-type facts. The P033 narrowing path
+//!   ([`check_narrowing`]) checks that shape through unknown targets instead
+//!   — see the narrowing probe record.
 //! - Contract divergence (falsified premise, disclosed): the P025 contract
 //!   expected explicit `any`-to-`T` flows to diagnose, but the oracle is
 //!   silent on every such flow (probes `b`, `h`, `j`). The solver mirrors
@@ -3237,10 +3240,11 @@ fn generic_occurrence_node(index: usize) -> NodeId {
 /// `--strict --pretty false`).
 ///
 /// [`check_narrowing`] checks union-annotated `const`s (`number | string`
-/// over primitives) plus identifier-initializer *uses* of those consts
-/// (`const b: string = x;`) against [`TypeofGuard`] regions. Non-union
-/// declarations delegate to [`check_one`] unchanged, so verdicts outside
-/// narrowing match by construction.
+/// over primitives) and `unknown`-annotated `const`s plus
+/// identifier-initializer *uses* of those consts (`const b: string = x;`)
+/// against [`TypeofGuard`] regions. Other non-union declarations delegate to
+/// [`check_one`] unchanged, so verdicts outside narrowing match by
+/// construction.
 ///
 /// Probe record (each `declare const x: <union>` unless noted):
 ///
@@ -3273,6 +3277,34 @@ fn generic_occurrence_node(index: usize) -> NodeId {
 ///   non-literal-init targets narrow normally.
 /// - A use inside a nested closure sees the full union (no refinement
 ///   crosses function boundaries).
+///
+/// `unknown` targets (P033, probed on tsc 7.0.2 `--strict --pretty false`;
+/// probes in `.agent/scratch/p033-probes/`):
+///
+/// - `declare const uv: unknown;` enters the environment exactly like a
+///   union target, except EVERY initializer shape enters — literal inits
+///   included (`const u: unknown = "s"` still refines through guards and
+///   still diagnoses `Type 'unknown'` unguarded: no assignment narrowing is
+///   observable). `unknown` also absorbs every union it joins
+///   (`number | unknown` is `unknown` in tsc), so those declarations route
+///   through unknown targets as well.
+/// - Unguarded uses diagnose `Type 'unknown' is not assignable to type
+///   'string'.` (also against `number`, and against `never`); guarded
+///   `=== "string"` branches refine to the single matched primitive (match
+///   silent, mismatch `Type 'string' is not assignable to type 'number'.`),
+///   and complements fall back to `unknown` (the `else` of `=== "string"`
+///   diagnoses `Type 'unknown' …`). Early-return refines identically.
+/// - `unknown`- and `any`-expected uses are silent in every position (for
+///   union targets too — both probed clean); `never`-expected uses diagnose
+///   like any other `T` (unguarded unions spell the full union, probed).
+/// - Non-primitive guard literals decline: `typeof uv === "object"` refines
+///   to `object | null` in tsc and `"bigint"` to `bigint` — both
+///   unspellable in-subset, so those regions decline with reasons (pinned
+///   oracle-error divergences, never forced verdicts).
+/// - Genuinely-unknown targets (no annotation, no literal init) never enter
+///   and keep the legacy non-literal note; `any`-annotated declarations
+///   stay on the [`check_one`] path (their uses are silent in tsc but
+///   unlinkable in-subset — a pinned oracle-clean divergence).
 ///
 /// Design law (H-002): narrowed verdicts are per-occurrence side state
 /// (computed from the [`NarrowedUse`] occurrence span against guard spans at
@@ -3421,6 +3453,41 @@ struct UnionTarget {
     has_literal_init: bool,
 }
 
+/// One `unknown`-annotated declaration available as a narrowing target.
+///
+/// Unlike [`UnionTarget`], there are no members to spell: unguarded and
+/// complement uses diagnose `Type 'unknown' …`, while matched guard sides
+/// refine to the single matched primitive. Every initializer shape enters
+/// (probed tsc 7.0.2 P033: literal-init `unknown` still refines and still
+/// diagnoses unguarded — no assignment narrowing is observable).
+#[derive(Debug)]
+struct UnknownTarget {
+    /// Declared name (linkage is by name; shadowing declines, like unions).
+    name: String,
+}
+
+/// One narrowing target: a union-annotated const or an `unknown`-annotated
+/// one. Both live in the same per-occurrence environment (H-002: side state
+/// keyed by declaration, never interned [`TypeData`] variants).
+#[derive(Debug)]
+enum NarrowTarget {
+    /// A union-annotated const with canonical members.
+    Union(UnionTarget),
+    /// An `unknown`-annotated const (memberless: spells `unknown`).
+    Unknown(UnknownTarget),
+}
+
+impl NarrowTarget {
+    /// The declared name (linkage is by name for both variants).
+    #[must_use]
+    fn name(&self) -> &str {
+        match self {
+            Self::Union(target) => target.name.as_str(),
+            Self::Unknown(target) => target.name.as_str(),
+        }
+    }
+}
+
 /// Whether `inner` lies fully inside `outer` (same file, closed bounds).
 fn span_contains(outer: Span, inner: Span) -> bool {
     outer.file == inner.file && outer.lo <= inner.lo && inner.hi <= outer.hi
@@ -3430,21 +3497,27 @@ fn span_contains(outer: Span, inner: Span) -> bool {
 /// returning the sorted [`FileReport`].
 ///
 /// Declaration routing: object annotations delegate to [`check_one`];
-/// unions parse to canonical members (unknown names diagnose `PITH2304` like
-/// object members, shapes/degenerates decline); only missing-init and
-/// non-literal-init targets enter the narrowing environment (literal-init
-/// targets check against the union but never narrow — probed tsc 7.0.2).
-/// Non-union declarations delegate to [`check_one`] unchanged.
+/// `unknown` annotations (and unions holding an `unknown` member, which tsc
+/// absorbs into `unknown`) enter unknown targets — every initializer shape,
+/// since literal-init `unknown` still refines (probed tsc 7.0.2 P033);
+/// plain unions parse to canonical members (unknown names diagnose
+/// `PITH2304` like object members, shapes/degenerates decline); only
+/// missing-init and non-literal-init union targets enter the narrowing
+/// environment (literal-init targets check against the union but never
+/// narrow — probed tsc 7.0.2). Other non-union declarations delegate to
+/// [`check_one`] unchanged.
 ///
-/// Use routing, in order: expected-type gating (single primitives check;
-/// object/union/unknown spellings repeat [`check_one`]'s verdicts), target
-/// linkage (unknown targets keep the legacy non-literal note; shadowed or
-/// closure-ambiguous targets decline), literal-init targets decline, decline
-/// regions decline, then guard refinement (all applicable guards must agree
-/// on one primitive; complements that are not single primitives decline;
+/// Use routing, in order: expected-type gating (`any`/`unknown` expectations
+/// are clean before linkage — probed silent in every position; `never` and
+/// single primitives check; object/union expectations decline exactly like
+/// before; unknown names diagnose `PITH2304`), target linkage (missing
+/// targets keep the legacy non-literal note; shadowed or closure-ambiguous
+/// targets decline), literal-init union targets decline, decline regions
+/// decline, then guard refinement (all applicable guards must agree on one
+/// primitive; complements that are not single primitives decline;
 /// guard literals outside the union decline positive branches and fall back
-/// to the full union on complements). Unguarded uses diagnose over the full
-/// union spelling.
+/// to the full union on complements). Unguarded union uses diagnose over
+/// the full union spelling; unguarded unknown uses diagnose `unknown`.
 #[must_use]
 pub fn check_narrowing(
     file: FileId,
@@ -3465,7 +3538,7 @@ pub fn check_narrowing(
     for decl in decls {
         *name_counts.entry(decl.name.as_str()).or_default() += 1;
     }
-    let mut env: Vec<UnionTarget> = Vec::new();
+    let mut env: Vec<NarrowTarget> = Vec::new();
     let mut report = FileReport::default();
     for (index, decl) in decls.iter().enumerate() {
         let mut ctx = NarrowDeclCtx {
@@ -3561,6 +3634,14 @@ fn check_narrowing_decl(
         check_object(decl, span, annotation, decl.init, &mut ctx);
         return;
     }
+    // `unknown` absorbs every union it joins (tsc: `number | unknown` is
+    // `unknown`, probed P033), so plain `unknown` and unions holding an
+    // `unknown` member both route through unknown targets. `any`/`never`
+    // members keep today's verdicts below (pre-existing, outside this task).
+    if annotation.split('|').any(|piece| piece.trim() == "unknown") {
+        check_unknown_init(file, span, decl, nctx);
+        return;
+    }
     if !annotation.contains('|') {
         let mut ctx = CheckCtx {
             file,
@@ -3634,12 +3715,12 @@ fn check_union_init(
                 span,
                 reason: "missing initializer: nothing to check against".to_owned(),
             });
-            nctx.env.push(UnionTarget {
+            nctx.env.push(NarrowTarget::Union(UnionTarget {
                 name: decl.name.clone(),
                 members,
                 spelling,
                 has_literal_init: false,
-            });
+            }));
         }
         Some(InitKind::NonLiteral) => {
             nctx.report.unsupported.push(UnsupportedDecl {
@@ -3647,12 +3728,12 @@ fn check_union_init(
                 span,
                 reason: "non-literal initializer is outside the subset".to_owned(),
             });
-            nctx.env.push(UnionTarget {
+            nctx.env.push(NarrowTarget::Union(UnionTarget {
                 name: decl.name.clone(),
                 members,
                 spelling,
                 has_literal_init: false,
-            });
+            }));
         }
         Some(init) => {
             if !members.iter().any(|(_, id)| *id == init.type_id()) {
@@ -3670,11 +3751,40 @@ fn check_union_init(
     }
 }
 
+/// Checks an `unknown`-annotated declaration's initializer: every shape
+/// enters the narrowing environment (probed tsc 7.0.2 P033 — even literal
+/// inits refine through guards and diagnose unguarded). Missing and
+/// non-literal initializers decline with a note like union targets;
+/// bearing literals are clean (`unknown` admits every value, the P025
+/// rule), so they enter silently.
+fn check_unknown_init(file: FileId, span: Span, decl: &ConstDecl, nctx: &mut NarrowDeclCtx<'_>) {
+    match decl.init {
+        None => {
+            nctx.report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: "missing initializer: nothing to check against".to_owned(),
+            });
+        }
+        Some(InitKind::NonLiteral) => {
+            nctx.report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: "non-literal initializer is outside the subset".to_owned(),
+            });
+        }
+        Some(_) => {}
+    }
+    nctx.env.push(NarrowTarget::Unknown(UnknownTarget {
+        name: decl.name.clone(),
+    }));
+}
+
 /// Fact slices feeding [`check_narrowing`], bundled so the entry point
 /// stays lean: identifier uses, `typeof` guards, and decline regions.
 #[derive(Debug)]
 pub struct NarrowingFacts<'a> {
-    /// Identifier uses of union-annotated consts.
+    /// Identifier uses of union- and `unknown`-annotated consts.
     pub uses: &'a [NarrowedUse],
     /// Straight-line `typeof` guards.
     pub guards: &'a [TypeofGuard],
@@ -3687,7 +3797,7 @@ struct NarrowDeclCtx<'a> {
     binder: &'a Binder,
     db: &'a mut QueryDb,
     freshness: &'a FreshnessTable,
-    env: &'a mut Vec<UnionTarget>,
+    env: &'a mut Vec<NarrowTarget>,
     report: &'a mut FileReport,
 }
 
@@ -3695,7 +3805,7 @@ struct NarrowDeclCtx<'a> {
 struct NarrowUseCtx<'a> {
     guards: &'a [TypeofGuard],
     declines: &'a [DeclineRegion],
-    env: &'a [UnionTarget],
+    env: &'a [NarrowTarget],
     name_counts: &'a HashMap<&'a str, usize>,
     binder: &'a Binder,
     report: &'a mut FileReport,
@@ -3732,7 +3842,7 @@ struct LinkedUse<'a> {
     span: Span,
     expected: TypeId,
     expected_text: String,
-    target: &'a UnionTarget,
+    target: &'a NarrowTarget,
 }
 
 /// Links one identifier-use to its narrowing target: span resolution,
@@ -3740,22 +3850,16 @@ struct LinkedUse<'a> {
 ///
 /// Returns `None` when the use declines (one [`UnsupportedDecl`] pushed).
 /// Guard refinement runs separately in [`refine_use`].
-fn link_use_target<'a>(
-    file: FileId,
+/// Resolves one narrowing use's expected type: object/union spellings
+/// decline, unknown names diagnose `PITH2304`, and `any`/`unknown`
+/// expectations accept every narrowed flow silently (probed tsc 7.0.2
+/// P033 — silent in every position, for union targets too).
+fn resolve_use_expected(
     use_: &NarrowedUse,
-    env: &'a [UnionTarget],
-    name_counts: &HashMap<&str, usize>,
-    binder: &Binder,
+    span: Span,
+    file: FileId,
     report: &mut FileReport,
-) -> Option<LinkedUse<'a>> {
-    let span = binder_span_for(
-        binder,
-        file,
-        use_.name.as_str(),
-        use_.scope,
-        use_.symbol,
-        use_.span,
-    );
+) -> Option<TypeId> {
     let expected_text = use_.annotation.trim();
     if expected_text.starts_with('{') {
         report.unsupported.push(UnsupportedDecl {
@@ -3773,18 +3877,46 @@ fn link_use_target<'a>(
         });
         return None;
     }
-    let Some(expected) = annotation_type(expected_text) else {
-        report.diagnostics.push(PithDiagnostic {
-            code: CODE_UNKNOWN_ANNOTATION.to_owned(),
-            file,
-            span,
-            message: format!("Cannot find name '{expected_text}'."),
-        });
-        return None;
+    let expected = match annotation_type(expected_text) {
+        Some(id) => id,
+        None => match boundary_annotation_type(expected_text) {
+            Some(boundary) if boundary == TypeStore::ANY || boundary == TypeStore::UNKNOWN => {
+                return None;
+            }
+            // `never` expectations diagnose like any other `T` (probed
+            // P033, both target kinds, guarded and unguarded).
+            Some(boundary) if boundary == TypeStore::NEVER => boundary,
+            _ => {
+                report.diagnostics.push(PithDiagnostic {
+                    code: CODE_UNKNOWN_ANNOTATION.to_owned(),
+                    file,
+                    span,
+                    message: format!("Cannot find name '{expected_text}'."),
+                });
+                return None;
+            }
+        },
     };
-    let matching: Vec<&UnionTarget> = env
+    Some(expected)
+}
+
+/// Links one narrowing use to exactly one environment target: unknown
+/// targets decline to the legacy note, shadowed/multi-declared targets
+/// decline, unresolved-ambiguous targets decline, and literal-initialized
+/// union targets decline (tsc never narrows them — probed 7.0.2, while
+/// unknown targets always narrow, probed P033).
+fn link_target_shape<'a>(
+    use_: &NarrowedUse,
+    span: Span,
+    file: FileId,
+    env: &'a [NarrowTarget],
+    name_counts: &HashMap<&str, usize>,
+    binder: &Binder,
+    report: &mut FileReport,
+) -> Option<&'a NarrowTarget> {
+    let matching: Vec<&NarrowTarget> = env
         .iter()
-        .filter(|target| target.name == use_.target)
+        .filter(|target| target.name() == use_.target)
         .collect();
     if matching.is_empty() {
         report.unsupported.push(UnsupportedDecl {
@@ -3821,72 +3953,161 @@ fn link_use_target<'a>(
         });
         return None;
     }
-    if target.has_literal_init {
-        report.unsupported.push(UnsupportedDecl {
-            file,
-            span,
-            reason: format!(
-                "union target '{}' has a literal initializer: tsc never narrows it (7.0.2)",
-                use_.target
-            ),
-        });
-        return None;
+    // Literal-initialized union targets never narrow (probed tsc 7.0.2);
+    // unknown targets always narrow, whatever the initializer (probed P033).
+    if let NarrowTarget::Union(union) = target {
+        if union.has_literal_init {
+            report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: format!(
+                    "union target '{}' has a literal initializer: tsc never narrows it (7.0.2)",
+                    use_.target
+                ),
+            });
+            return None;
+        }
     }
+    Some(target)
+}
+
+fn link_use_target<'a>(
+    file: FileId,
+    use_: &NarrowedUse,
+    env: &'a [NarrowTarget],
+    name_counts: &HashMap<&str, usize>,
+    binder: &Binder,
+    report: &mut FileReport,
+) -> Option<LinkedUse<'a>> {
+    let span = binder_span_for(
+        binder,
+        file,
+        use_.name.as_str(),
+        use_.scope,
+        use_.symbol,
+        use_.span,
+    );
+    let expected = resolve_use_expected(use_, span, file, report)?;
+    let target = link_target_shape(use_, span, file, env, name_counts, binder, report)?;
     Some(LinkedUse {
         span,
         expected,
-        expected_text: expected_text.to_owned(),
+        expected_text: use_.annotation.trim().to_owned(),
         target,
     })
 }
 
-/// Refines one linked use through decline regions and applicable guards.
-///
-/// Unguarded uses diagnose over the full union spelling; every applicable
-/// guard must agree on one primitive (see [`narrow_guard`]).
+/// Refines one linked use through decline regions and applicable guards,
+/// dispatching on the target kind (see [`refine_union_use`] and
+/// [`refine_unknown_use`]).
 fn refine_use(
     file: FileId,
     use_: &NarrowedUse,
     linked: &LinkedUse<'_>,
     uctx: &mut NarrowUseCtx<'_>,
 ) {
+    match linked.target {
+        NarrowTarget::Union(target) => refine_union_use(file, use_, linked, target, uctx),
+        NarrowTarget::Unknown(target) => refine_unknown_use(file, use_, linked, target, uctx),
+    }
+}
+
+/// Pushes the decline-region note when the use lies inside a refused
+/// region. Returns `true` when the use declines (callers return).
+#[must_use]
+fn declined_in_region(
+    file: FileId,
+    span: Span,
+    use_: &NarrowedUse,
+    declines: &[DeclineRegion],
+    report: &mut FileReport,
+) -> bool {
+    let Some(region) = declines
+        .iter()
+        .find(|region| span_contains(region.span, use_.init_span))
+    else {
+        return false;
+    };
+    report.unsupported.push(UnsupportedDecl {
+        file,
+        span,
+        reason: format!(
+            "narrowing declined for use of '{}': {}",
+            use_.target, region.reason
+        ),
+    });
+    true
+}
+
+/// Which side of one guard a use sits on: `Some(true)` for the
+/// matched-literal side (`===` then, `!==` else/after), `Some(false)` for
+/// the complement, `None` when the use is outside the guard.
+#[must_use]
+fn guard_side(guard: &TypeofGuard, init_span: Span) -> Option<bool> {
+    // Then of `===` (else of `!==`, after of `!==`) keeps the matched
+    // literal; every other branch refines to the complement.
+    if span_contains(guard.then_span, init_span) {
+        Some(!guard.negated)
+    } else if guard
+        .else_span
+        .is_some_and(|else_span| span_contains(else_span, init_span))
+        || guard.early_return && init_span.lo >= guard.if_span.hi
+    {
+        Some(guard.negated)
+    } else {
+        None
+    }
+}
+
+/// Requires every applicable guard to agree on one refinement, defaulting
+/// to the full spelling when no guard applies. Returns `None` after pushing
+/// the overlap decline.
+#[must_use]
+fn agree_narrowed(
+    narrowed: &[Narrowed],
+    file: FileId,
+    span: Span,
+    target: &str,
+    report: &mut FileReport,
+) -> Option<Narrowed> {
+    if narrowed.is_empty() {
+        return Some(Narrowed::FullUnion);
+    }
+    let first = narrowed[0];
+    if narrowed.iter().all(|narrow| *narrow == first) {
+        return Some(first);
+    }
+    report.unsupported.push(UnsupportedDecl {
+        file,
+        span,
+        reason: format!("overlapping guards refine '{target}' differently: outside the subset"),
+    });
+    None
+}
+
+/// Refines one union-linked use through decline regions and applicable
+/// guards (the union half of [`refine_use`]).
+///
+/// Unguarded uses diagnose over the full union spelling; every applicable
+/// guard must agree on one primitive (see [`narrow_guard`]).
+fn refine_union_use(
+    file: FileId,
+    use_: &NarrowedUse,
+    linked: &LinkedUse<'_>,
+    target: &UnionTarget,
+    uctx: &mut NarrowUseCtx<'_>,
+) {
     let span = linked.span;
     let expected = linked.expected;
     let expected_text = linked.expected_text.as_str();
-    let target: &UnionTarget = linked.target;
     let guards = uctx.guards;
-    let declines = uctx.declines;
     let report: &mut FileReport = &mut *uctx.report;
-    if let Some(region) = declines
-        .iter()
-        .find(|region| span_contains(region.span, use_.init_span))
-    {
-        report.unsupported.push(UnsupportedDecl {
-            file,
-            span,
-            reason: format!(
-                "narrowing declined for use of '{}': {}",
-                use_.target, region.reason
-            ),
-        });
+    if declined_in_region(file, span, use_, uctx.declines, report) {
         return;
     }
     let mut narrowed: Vec<Narrowed> = Vec::new();
     for guard in guards.iter().filter(|guard| guard.target == use_.target) {
-        // Then of `===` (else of `!==`, after of `!==`) keeps the matched
-        // literal; every other branch refines to the complement.
-        let side = if span_contains(guard.then_span, use_.init_span) {
-            Some(!guard.negated)
-        } else if guard
-            .else_span
-            .is_some_and(|else_span| span_contains(else_span, use_.init_span))
-            || guard.early_return && use_.init_span.lo >= guard.if_span.hi
-        {
-            Some(guard.negated)
-        } else {
-            None
-        };
-        let Some(matched_side) = side else {
+        let Some(matched_side) = guard_side(guard, use_.init_span) else {
             continue;
         };
         match narrow_guard(guard, matched_side, target, file, span, report) {
@@ -3894,23 +4115,8 @@ fn refine_use(
             Err(()) => return,
         }
     }
-    let verdict = if narrowed.is_empty() {
-        Narrowed::FullUnion
-    } else {
-        let first = narrowed[0];
-        if narrowed.iter().all(|narrow| *narrow == first) {
-            first
-        } else {
-            report.unsupported.push(UnsupportedDecl {
-                file,
-                span,
-                reason: format!(
-                    "overlapping guards refine '{}' differently: outside the subset",
-                    use_.target
-                ),
-            });
-            return;
-        }
+    let Some(verdict) = agree_narrowed(&narrowed, file, span, use_.target.as_str(), report) else {
+        return;
     };
     match verdict {
         Narrowed::Single(narrowed_id) => {
@@ -3935,6 +4141,68 @@ fn refine_use(
                     "Type '{}' is not assignable to type '{expected_text}'.",
                     target.spelling
                 ),
+            });
+        }
+    }
+}
+
+/// Refines one `unknown`-linked use through decline regions and applicable
+/// guards (the unknown half of [`refine_use`]).
+///
+/// Matched guard sides refine to the single matched primitive; every other
+/// position (unguarded, complements) checks `unknown` — probed tsc 7.0.2
+/// P033.
+fn refine_unknown_use(
+    file: FileId,
+    use_: &NarrowedUse,
+    linked: &LinkedUse<'_>,
+    target: &UnknownTarget,
+    uctx: &mut NarrowUseCtx<'_>,
+) {
+    let span = linked.span;
+    let expected = linked.expected;
+    let expected_text = linked.expected_text.as_str();
+    let report: &mut FileReport = &mut *uctx.report;
+    if declined_in_region(file, span, use_, uctx.declines, report) {
+        return;
+    }
+    let mut narrowed: Vec<Narrowed> = Vec::new();
+    for guard in uctx
+        .guards
+        .iter()
+        .filter(|guard| guard.target == target.name)
+    {
+        let Some(matched_side) = guard_side(guard, use_.init_span) else {
+            continue;
+        };
+        match narrow_unknown_guard(guard, matched_side, file, span, report) {
+            Ok(narrow) => narrowed.push(narrow),
+            Err(()) => return,
+        }
+    }
+    let Some(verdict) = agree_narrowed(&narrowed, file, span, target.name.as_str(), report) else {
+        return;
+    };
+    match verdict {
+        Narrowed::Single(narrowed_id) => {
+            if narrowed_id != expected {
+                let actual = primitive_name(narrowed_id).unwrap_or("unknown");
+                report.diagnostics.push(PithDiagnostic {
+                    code: CODE_MISMATCH.to_owned(),
+                    file,
+                    span,
+                    message: format!(
+                        "Type '{actual}' is not assignable to type '{expected_text}'."
+                    ),
+                });
+            }
+        }
+        Narrowed::FullUnion => {
+            report.diagnostics.push(PithDiagnostic {
+                code: CODE_MISMATCH.to_owned(),
+                file,
+                span,
+                message: format!("Type 'unknown' is not assignable to type '{expected_text}'."),
             });
         }
     }
@@ -3999,6 +4267,48 @@ fn narrow_guard(
         guard.matched, target.spelling
     ));
     Err(())
+}
+
+/// Applies one guard branch to an `unknown` use: `matched_side` is `true`
+/// for the matched-literal side (`===` then, `!==` else/after) and `false`
+/// for the complement. `Ok` carries the refinement; `Err` means one
+/// [`UnsupportedDecl`] was pushed and the use declines.
+///
+/// Unlike [`narrow_guard`], there is no membership test: every primitive is
+/// reachable from `unknown`, and every complement falls back to `unknown`
+/// (probed tsc 7.0.2 P033: the `else` of `=== "string"` diagnoses
+/// `Type 'unknown' …`).
+fn narrow_unknown_guard(
+    guard: &TypeofGuard,
+    matched_side: bool,
+    file: FileId,
+    span: Span,
+    report: &mut FileReport,
+) -> Result<Narrowed, ()> {
+    let Some(matched) = annotation_type(guard.matched.as_str()) else {
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: format!(
+                "guard literal '{}' is not a narrowable primitive: outside the subset",
+                guard.matched
+            ),
+        });
+        return Err(());
+    };
+    if guard.matched == "void" {
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: "typeof never yields 'void': void guards are outside the subset".to_owned(),
+        });
+        return Err(());
+    }
+    if matched_side {
+        Ok(Narrowed::Single(matched))
+    } else {
+        Ok(Narrowed::FullUnion)
+    }
 }
 
 /// Occurrence [`NodeId`] for the `index`-th synthetic function-return
@@ -8640,6 +8950,20 @@ mod tests {
         }
     }
 
+    fn unknown_decl(name: &str, lo: u32, hi: u32, init: Option<InitKind>) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: Some("unknown".to_owned()),
+            init,
+            init_object: None,
+            cast: None,
+        }
+    }
+
     fn narrowing_use(
         name: &str,
         lo: u32,
@@ -9167,6 +9491,283 @@ mod tests {
         assert_eq!(report.unsupported.len(), 1);
         assert_eq!(
             report.unsupported[0].reason,
+            "non-literal initializer is outside the subset"
+        );
+    }
+
+    #[test]
+    fn narrowing_unknown_unguarded_use_diagnoses_unknown() {
+        // `declare const uv: unknown` plus an unguarded use: tsc's exact
+        // `unknown` spelling (probed 7.0.2 P033), not a decline.
+        let binder = binder_with(&[("uv", span(0, 10)), ("a", span(20, 30))]);
+        let decls = [unknown_decl("uv", 0, 10, None)];
+        let uses = [narrowing_use("a", 20, 30, "string", "uv", 28, 29)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'unknown' is not assignable to type 'string'."
+        );
+    }
+
+    #[test]
+    fn narrowing_unknown_literal_init_still_narrows() {
+        // Unlike unions, literal-init `unknown` enters the environment
+        // (probed 7.0.2 P033: no assignment narrowing is observable): the
+        // declaration itself is clean and the unguarded use diagnoses.
+        let binder = binder_with(&[("u", span(0, 10)), ("a", span(20, 30))]);
+        let decls = [unknown_decl("u", 0, 10, Some(InitKind::String))];
+        let uses = [narrowing_use("a", 20, 30, "string", "u", 28, 29)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'unknown' is not assignable to type 'string'."
+        );
+    }
+
+    #[test]
+    fn narrowing_unknown_non_literal_init_notes_and_enters() {
+        // Non-literal `unknown` initializers decline with a note like union
+        // targets — and still enter, so uses diagnose.
+        let binder = binder_with(&[("u", span(0, 10)), ("a", span(20, 30))]);
+        let decls = [unknown_decl("u", 0, 10, Some(InitKind::NonLiteral))];
+        let uses = [narrowing_use("a", 20, 30, "number", "u", 28, 29)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("non-literal"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'unknown' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
+    fn narrowing_unknown_guarded_match_is_silent() {
+        let binder = binder_with(&[("uv", span(0, 10)), ("greeting", span(40, 60))]);
+        let decls = [unknown_decl("uv", 0, 10, None)];
+        let uses = [narrowing_use("greeting", 40, 60, "string", "uv", 58, 59)];
+        let guards = [guard(
+            "uv",
+            "string",
+            false,
+            false,
+            guard_spans(20, 70, None, 10, 70),
+        )];
+        let report = narrow_report(&decls, &uses, &guards, &[], &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        // The `declare const` target itself has nothing to check.
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn narrowing_unknown_guarded_mismatch_is_pith2322() {
+        let binder = binder_with(&[("uv", span(0, 10)), ("count", span(40, 60))]);
+        let decls = [unknown_decl("uv", 0, 10, None)];
+        let uses = [narrowing_use("count", 40, 60, "number", "uv", 58, 59)];
+        let guards = [guard(
+            "uv",
+            "string",
+            false,
+            false,
+            guard_spans(20, 70, None, 10, 70),
+        )];
+        let report = narrow_report(&decls, &uses, &guards, &[], &binder);
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
+    fn narrowing_unknown_else_complement_diagnoses_unknown() {
+        // The complement of one primitive in `unknown` is still `unknown`
+        // (probed 7.0.2 P033) — never a narrowed single.
+        let binder = binder_with(&[("uv", span(0, 10)), ("a", span(80, 90))]);
+        let decls = [unknown_decl("uv", 0, 10, None)];
+        let uses = [narrowing_use("a", 80, 90, "string", "uv", 88, 89)];
+        let guards = [guard(
+            "uv",
+            "string",
+            false,
+            false,
+            guard_spans(20, 40, Some((60, 110)), 10, 60),
+        )];
+        let report = narrow_report(&decls, &uses, &guards, &[], &binder);
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'unknown' is not assignable to type 'string'."
+        );
+    }
+
+    #[test]
+    fn narrowing_unknown_expected_is_silent() {
+        // `unknown` into `unknown` is silent in tsc (probed P033) — no
+        // diagnostic and no use note, just the declaration note.
+        let binder = binder_with(&[("uv", span(0, 10)), ("again", span(20, 30))]);
+        let decls = [unknown_decl("uv", 0, 10, None)];
+        let uses = [narrowing_use("again", 20, 30, "unknown", "uv", 28, 29)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn narrowing_any_expected_is_silent_for_union() {
+        // `any`-expected uses accept every narrowed flow (probed P033) —
+        // the PITH2304 the old gating emitted was a mis-verdict.
+        let binder = binder_with(&[("x", span(0, 10)), ("a", span(20, 30))]);
+        let decls = [union_decl("x", 0, 10, "number | string", None)];
+        let uses = [narrowing_use("a", 20, 30, "any", "x", 28, 29)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn narrowing_never_expected_diagnoses_like_any_other_t() {
+        // Probed tsc 7.0.2 P033, both target kinds: unguarded unions spell
+        // the full union, guarded positions the narrowed single.
+        let binder = binder_with(&[("x", span(0, 10)), ("n", span(20, 30))]);
+        let decls = [union_decl("x", 0, 10, "number | string", None)];
+        let uses = [narrowing_use("n", 20, 30, "never", "x", 28, 29)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string | number' is not assignable to type 'never'."
+        );
+        let binder = binder_with(&[("uv", span(0, 10)), ("m", span(20, 30))]);
+        let decls = [unknown_decl("uv", 0, 10, None)];
+        let uses = [narrowing_use("m", 20, 30, "never", "uv", 28, 29)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'unknown' is not assignable to type 'never'."
+        );
+    }
+
+    #[test]
+    fn narrowing_union_absorbs_unknown_member() {
+        // `number | unknown` is `unknown` in tsc (probed P033): the
+        // declaration enters an unknown target instead of diagnosing
+        // `PITH2304` for the `unknown` piece.
+        let binder = binder_with(&[("x", span(0, 10)), ("a", span(20, 30))]);
+        let decls = [union_decl("x", 0, 10, "number | unknown", None)];
+        let uses = [narrowing_use("a", 20, 30, "string", "x", 28, 29)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'unknown' is not assignable to type 'string'."
+        );
+    }
+
+    #[test]
+    fn narrowing_unknown_object_guard_declines() {
+        // `typeof uv === "object"` refines to `object | null` in tsc
+        // (probed P033) — unspellable in-subset, so the region declines
+        // instead of verdicting.
+        let binder = binder_with(&[("uv", span(0, 10)), ("a", span(40, 60))]);
+        let decls = [unknown_decl("uv", 0, 10, None)];
+        let uses = [narrowing_use("a", 40, 60, "string", "uv", 58, 59)];
+        let guards = [guard(
+            "uv",
+            "object",
+            false,
+            false,
+            guard_spans(20, 70, None, 10, 70),
+        )];
+        let report = narrow_report(&decls, &uses, &guards, &[], &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[1]
+                .reason
+                .contains("narrowable primitive"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn narrowing_genuinely_unknown_keeps_legacy_note() {
+        // No annotation and no literal init: genuinely unknown, never
+        // verdicts — the declaration notes, and uses of it keep the legacy
+        // non-literal note (tsc infers `unknown` and stays clean: a pinned
+        // oracle-clean divergence).
+        let binder = binder_with(&[
+            ("uv", span(0, 10)),
+            ("g", span(20, 30)),
+            ("h", span(40, 50)),
+        ]);
+        let decls = [
+            unknown_decl("uv", 0, 10, None),
+            ConstDecl {
+                name: "g".to_owned(),
+                span: span(20, 30),
+                scope: 0,
+                symbol: None,
+                kind: DeclKind::Const,
+                annotation: None,
+                init: Some(InitKind::NonLiteral),
+                init_object: None,
+                cast: None,
+            },
+        ];
+        let uses = [narrowing_use("h", 40, 50, "string", "g", 48, 49)];
+        let report = narrow_report(&decls, &uses, &[], &[], &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 3);
+        assert!(
+            report.unsupported[1].reason.contains("no annotation"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+        assert_eq!(
+            report.unsupported[2].reason,
             "non-literal initializer is outside the subset"
         );
     }
