@@ -1,0 +1,1 @@
+straight-object-inner.ts:TS2322: Type 'string' is not assignable to type 'number'.

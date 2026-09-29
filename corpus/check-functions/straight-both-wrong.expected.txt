@@ -1,0 +1,2 @@
+straight-both-wrong.ts:TS2322: Type 'string' is not assignable to type 'number'.
+straight-both-wrong.ts:TS2322: Type 'string' is not assignable to type 'number'.
