@@ -1,0 +1,2 @@
+member-arity.ts:TS2554: Expected 1 arguments, but got 0.
+member-arity.ts:TS2554: Expected 2 arguments, but got 3.
