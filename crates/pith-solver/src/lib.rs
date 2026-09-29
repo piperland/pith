@@ -129,8 +129,7 @@
 //!   verdicts.
 //!
 //! Member calls on known values (P024, probed on tsc 7.0.2
-//! `--strict --pretty false`; probes in `.agent/scratch/p024-probes/`):
-//!
+//! `--strict --pretty false`; probes in `.agent/scratch/p024-probes/`)):
 //! - The adapter emits member facts only for static member calls on a closed
 //!   allowlist of known-value receivers (`JSON`, `Object`, `Array`,
 //!   `console`, `Math`); everything else keeps the existing non-emission, so
@@ -167,6 +166,50 @@
 //!   string-searching. A locally declared binding shadowing a known value
 //!   still routes opaque (documented limit: member facts carry no occurrence
 //!   scope, so shadowing is indistinguishable facts-side).
+//!
+//! `any`/`unknown` boundary plus `as` casts (P025, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p025-probes/`):
+//!
+//! - `any` annotations admit every value: `const m: any = 1`, `takeAny("oops")`
+//!   against `(x: any)`, `function f(x: any): any { return 1; }`, and
+//!   `const a: number = av` (an `any`-typed source) are all clean — both
+//!   directions silent. The solver mirrors with silence (never a forced
+//!   `PITH2304`: `any` is a known annotation now).
+//! - `unknown` annotations admit every bearing value (`const u: unknown = "s"`
+//!   clean); `unknown`-typed VALUES against `T` diagnose `TS2322`
+//!   (`Type 'unknown' is not assignable to type 'string'.`), which the solver
+//!   reaches through admitted `as unknown` casts. Identifier-held `unknown`
+//!   (`const a: string = uv`) declines: the subset has no value-type facts.
+//! - `never` annotations diagnose `TS2322` for every bearing literal
+//!   (`Type 'number' is not assignable to type 'never'.`); `never` parameters
+//!   decline (unprobed message shape — never forced).
+//! - `as` / angle assertions admit on overlap and decline with `TS2352`
+//!   (`Conversion of type 'string' to type 'number' may be a mistake because
+//!   neither type sufficiently overlaps with the other. If this was
+//!   intentional, convert the expression to 'unknown' first.`). In-subset
+//!   overlap: same widened primitive, or either side `any` / `unknown` /
+//!   `never` (`true as boolean`, `1 as any`, `"x" as unknown`, `"x" as never`,
+//!   `uv as string` all admit; `string as number`, `null as undefined`,
+//!   `"x" as { a: number; }` decline). Angle assertions share the rule.
+//! - `satisfies` admits on the same overlap but stays transparent to the
+//!   OPERAND type; its decline spells `TS1360`
+//!   (`Type 'string' does not satisfy the expected type 'number'.`).
+//! - Declined casts diagnose INDEPENDENTLY of the annotation: `const s:
+//!   string = ("hello" as number)` reports BOTH `TS2322` and `TS2352`, and
+//!   `const m: any = ("hello" as number)` reports `TS2352` alone; the solver
+//!   emits the cast diagnostic then continues through the existing path with
+//!   the result kind (`as`/angle: the target; `satisfies`: the operand).
+//!   Unannotated declined casts still diagnose (`const g = "x" satisfies
+//!   number` spells `TS1360`).
+//! - Complex casts (non-literal operands, `None`/union/object/literal
+//!   targets, parenthesized chains past the outermost) decline the whole
+//!   declaration with a reason — never a forced `TS2352` (object targets
+//!   cannot spell canonically from sliced text). `unknown` without `typeof`
+//!   guards declines for the same reason: no value-type facts.
+//! - Contract divergence (falsified premise, disclosed): the P025 contract
+//!   expected explicit `any`-to-`T` flows to diagnose, but the oracle is
+//!   silent on every such flow (probes `b`, `h`, `j`). The solver mirrors
+//!   the oracle (silence), not the contract premise.
 //!
 //! Classes (P020, probed on tsc 7.0.2 `--strict --pretty false`; probes in
 //! `.agent/scratch/p020-probes/`):
@@ -334,6 +377,10 @@ pub const CODE_EXCESS_MEMBER: &str = "PITH2353";
 pub const CODE_ARITY: &str = "PITH2554";
 /// Code for call-site argument-type mismatches (oracle `TS2345`).
 pub const CODE_ARG_TYPE: &str = "PITH2345";
+/// Code for declined `as`/angle assertions (oracle `TS2352`).
+pub const CODE_CAST: &str = "PITH2352";
+/// Code for declined `satisfies` assertions (oracle `TS1360`).
+pub const CODE_SATISFIES: &str = "PITH1360";
 /// Code for namespace member misses (oracle `TS2694`).
 pub const CODE_NO_EXPORTED_MEMBER: &str = "PITH2694";
 /// Code for namespaces used as types (oracle `TS2709`).
@@ -398,6 +445,10 @@ pub enum InitKind {
     Null,
     /// `undefined`.
     Undefined,
+    /// An admitted `as unknown` result (never a direct literal: only
+    /// [`evaluate_cast`] produces it). Spells `unknown` in messages, so
+    /// `unknown`-into-`T` flows diagnose exactly like the oracle.
+    Unknown,
     /// Any non-literal initializer (identifier, object, call, ...).
     NonLiteral,
 }
@@ -415,7 +466,7 @@ impl InitKind {
             Self::Boolean => TypeStore::BOOLEAN,
             Self::Null => TypeStore::NULL,
             Self::Undefined => TypeStore::UNDEFINED,
-            Self::NonLiteral => TypeStore::UNKNOWN,
+            Self::Unknown | Self::NonLiteral => TypeStore::UNKNOWN,
         }
     }
 
@@ -428,7 +479,7 @@ impl InitKind {
             Self::Boolean => "boolean",
             Self::Null => "null",
             Self::Undefined => "undefined",
-            Self::NonLiteral => "unknown",
+            Self::Unknown | Self::NonLiteral => "unknown",
         }
     }
 }
@@ -570,6 +621,11 @@ pub struct ConstDecl {
     /// otherwise. A `Some` paired with a primitive `init` (or vice versa)
     /// is contradictory input and becomes an [`UnsupportedDecl`].
     pub init_object: Option<ObjectInit>,
+    /// Outermost assertion facts when the initializer is an `as` /
+    /// `satisfies` / angle assertion (`None` otherwise). Driver-mapped
+    /// from the adapter's cast facts; [`check_one`] evaluates the
+    /// admit/decline rule and checks the result through the existing path.
+    pub cast: Option<CastInput>,
 }
 
 /// One function parameter: name + whether it carries a type annotation.
@@ -608,6 +664,10 @@ pub struct FunctionReturn {
     pub kind: Option<InitKind>,
     /// Object-literal members when the return is `{ ... }`; `None` otherwise.
     pub init_object: Option<ObjectInit>,
+    /// Outermost assertion facts when the return is an `as` / `satisfies` /
+    /// angle assertion (`None` otherwise). Rides the synthetic [`ConstDecl`]
+    /// into [`check_one`], so returns share the const cast rule exactly.
+    pub cast: Option<CastInput>,
 }
 
 /// Body shapes of one function declaration.
@@ -707,6 +767,187 @@ pub fn annotation_type(name: &str) -> Option<TypeId> {
         "undefined" => Some(TypeStore::UNDEFINED),
         "null" => Some(TypeStore::NULL),
         _ => None,
+    }
+}
+
+/// Maps a boundary annotation name to its builtin [`TypeId`].
+///
+/// `any`, `unknown`, and `never` live outside [`annotation_type`] on
+/// purpose: narrowing, generics, and union-piece classification call that
+/// map, and admitting boundary names there would change their decline
+/// behavior (probed divergences the subset keeps). Only the annotation/cast
+/// policy ([`check_one`], [`classify_param`]) consults this map.
+#[must_use]
+pub fn boundary_annotation_type(name: &str) -> Option<TypeId> {
+    match name.trim() {
+        "any" => Some(TypeStore::ANY),
+        "unknown" => Some(TypeStore::UNKNOWN),
+        "never" => Some(TypeStore::NEVER),
+        _ => None,
+    }
+}
+
+/// Which assertion form one [`CastInput`] records.
+///
+/// `as` and angle assertions share the oracle rule (`TS2352` on decline);
+/// `satisfies` declines differ (`TS1360`) and admit transparently to the
+/// operand type instead of the target (both probed on tsc 7.0.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastKind {
+    /// `expr as T`.
+    As,
+    /// `expr satisfies T`.
+    Satisfies,
+    /// `<T>expr`.
+    Angle,
+}
+
+/// One `as` / `satisfies` / angle assertion on a checkable position.
+///
+/// Driver-mapped from the adapter's `CastFact` (mechanical field copies,
+/// plus the operand-kind enum translation). `target` is the verbatim target
+/// text (`""` when the fact was unsliceable — always complex, never
+/// mis-checked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CastInput {
+    /// Literal kind of the operand (`NonLiteral`/`Unknown` always decline).
+    pub operand: InitKind,
+    /// Raw target text (`Some("number")`); driver echoes `""` for
+    /// unsliceable facts so they decline instead of going missing.
+    pub target: String,
+    /// Span of the operand expression (the oracle's `TS2352` anchor).
+    pub operand_span: Span,
+    /// Which assertion form.
+    pub kind: CastKind,
+}
+
+/// An admitted or declined cast's result type: what flows downstream.
+///
+/// `as`/angle results follow the target; `satisfies` results stay the
+/// operand type (probed tsc 7.0.2). `Any` and `Never` results accept every
+/// annotation (`never` is assignable to all, `any` both ways), so both
+/// silence the position; `Unknown` checks like a literal spelling
+/// `unknown` (diagnosing against `T`, clean against `any`/`unknown`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CastType {
+    /// Target (or operand) `any`: downstream always clean.
+    Any,
+    /// Target `unknown`: downstream diagnoses `TS2322` against `T`.
+    Unknown,
+    /// Target `never`: downstream always clean.
+    Never,
+    /// A primitive kind (target for `as`/angle, operand for `satisfies`).
+    Literal(InitKind),
+}
+
+impl CastType {
+    /// The downstream [`InitKind`], or `None` for accept-all results.
+    fn into_init(self) -> Option<InitKind> {
+        match self {
+            Self::Any | Self::Never => None,
+            Self::Unknown => Some(InitKind::Unknown),
+            Self::Literal(kind) => Some(kind),
+        }
+    }
+}
+
+/// Outcome of [`evaluate_cast`]: admit or decline with the downstream
+/// [`CastType`], or complex with the decline reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CastEvaluation {
+    /// The assertion holds: check the result through the existing path.
+    Admit(CastType),
+    /// The assertion fails: diagnose, then still check the result
+    /// (probed: declined casts never suppress the downstream check).
+    Decline(CastType),
+    /// Unevaluatable (non-literal operand, unparseable target): decline
+    /// the whole position with the reason, never a forced verdict.
+    Complex(String),
+}
+
+/// Classifies one cast target text: boundary names plus the six primitives
+/// (`void` rides `undefined`: `1 as void` declines exactly like
+/// `1 as undefined`, probed shape). Anything else (unions, objects,
+/// aliases, literal types, `const`, empty) is `None` — outside the subset.
+fn classify_cast_target(text: &str) -> Option<CastType> {
+    match text.trim() {
+        "any" => Some(CastType::Any),
+        "unknown" => Some(CastType::Unknown),
+        "never" => Some(CastType::Never),
+        "number" => Some(CastType::Literal(InitKind::Number)),
+        "string" => Some(CastType::Literal(InitKind::String)),
+        "boolean" => Some(CastType::Literal(InitKind::Boolean)),
+        "null" => Some(CastType::Literal(InitKind::Null)),
+        "undefined" | "void" => Some(CastType::Literal(InitKind::Undefined)),
+        _ => None,
+    }
+}
+
+/// Applies the probed overlap rule to one assertion.
+///
+/// Admit iff the operand and target sufficiently overlap: same widened
+/// primitive, or a boundary (`any`/`unknown`/`never`) target (probed tsc
+/// 7.0.2 — `null as undefined` and `string as number` decline;
+/// `true as boolean`, `1 as any`, `"x" as unknown`, and `"x" as never`
+/// admit). `uv as string` admits in tsc but stays complex here: identifier
+/// operands carry no value-type facts, so the boundary-operand side never
+/// evaluates in-subset.
+fn evaluate_cast(cast: &CastInput) -> CastEvaluation {
+    if matches!(cast.operand, InitKind::NonLiteral | InitKind::Unknown) {
+        return CastEvaluation::Complex(
+            "cast operand is not a classifiable literal: expression facts are outside the subset"
+                .to_owned(),
+        );
+    }
+    let Some(target) = classify_cast_target(cast.target.as_str()) else {
+        return CastEvaluation::Complex(format!(
+            "cast target '{}' is outside the subset",
+            cast.target.trim()
+        ));
+    };
+    let result = match cast.kind {
+        CastKind::As | CastKind::Angle => target,
+        CastKind::Satisfies => CastType::Literal(cast.operand),
+    };
+    let overlaps = match target {
+        CastType::Any | CastType::Unknown | CastType::Never => true,
+        CastType::Literal(wanted) => wanted == cast.operand,
+    };
+    if overlaps {
+        CastEvaluation::Admit(result)
+    } else {
+        CastEvaluation::Decline(result)
+    }
+}
+
+/// Emits one cast diagnostic at the operand span (the oracle anchor).
+///
+/// `as`/angle declines spell `TS2352` with the widened operand name plus
+/// the verbatim target text (primitives spell canonically, so verbatim is
+/// exact); `satisfies` declines spell `TS1360`.
+fn emit_cast_diagnostic(file: FileId, cast: &CastInput, report: &mut FileReport) {
+    let target = cast.target.trim();
+    match cast.kind {
+        CastKind::As | CastKind::Angle => report.diagnostics.push(PithDiagnostic {
+            code: CODE_CAST.to_owned(),
+            file,
+            span: cast.operand_span,
+            message: format!(
+                "Conversion of type '{}' to type '{target}' may be a mistake \
+                because neither type sufficiently overlaps with the other. If \
+                this was intentional, convert the expression to 'unknown' first.",
+                cast.operand.name()
+            ),
+        }),
+        CastKind::Satisfies => report.diagnostics.push(PithDiagnostic {
+            code: CODE_SATISFIES.to_owned(),
+            file,
+            span: cast.operand_span,
+            message: format!(
+                "Type '{}' does not satisfy the expected type '{target}'.",
+                cast.operand.name()
+            ),
+        }),
     }
 }
 
@@ -825,6 +1066,7 @@ pub fn check_functions(
                         annotation: Some(shaped.annotation.to_owned()),
                         init: shaped_return.kind,
                         init_object: shaped_return.init_object,
+                        cast: shaped_return.cast,
                     });
                 }
             }
@@ -865,6 +1107,8 @@ struct SynthReturn {
     kind: Option<InitKind>,
     /// Object-literal members when the return is `{ ... }`; `None` otherwise.
     init_object: Option<ObjectInit>,
+    /// Assertion facts riding into the synthetic [`ConstDecl`].
+    cast: Option<CastInput>,
 }
 
 /// A checkable function shape: the return annotation text plus one
@@ -946,10 +1190,19 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody<'_>, String> {
 
 /// Gates one return position for the synthetic [`ConstDecl`]: non-literal
 /// returns decline the whole declaration with a position-naming reason
-/// (never a partial verdict over the remaining positions). The impossible
+/// (never a partial verdict over the remaining positions). Assertion
+/// returns ride through instead: their facts evaluate solver-side in
+/// [`check_one`], so the gate must not swallow them. The impossible
 /// kind/member pairs (`Some` + `Some`, `None` + `None`) pass through into
 /// the shared contradictory/missing unsupported paths in [`check_one`].
 fn shape_return(body: &FunctionReturn, position: &str, name: &str) -> Result<SynthReturn, String> {
+    if body.cast.is_some() {
+        return Ok(SynthReturn {
+            kind: body.kind,
+            init_object: body.init_object.clone(),
+            cast: body.cast.clone(),
+        });
+    }
     if body.kind == Some(InitKind::NonLiteral) {
         return Err(format!(
             "non-literal {position} in '{name}' is outside the subset"
@@ -958,6 +1211,7 @@ fn shape_return(body: &FunctionReturn, position: &str, name: &str) -> Result<Syn
     Ok(SynthReturn {
         kind: body.kind,
         init_object: body.init_object.clone(),
+        cast: None,
     })
 }
 
@@ -973,6 +1227,10 @@ pub struct CallArg {
     pub kind: InitKind,
     /// Span of the argument expression.
     pub span: Span,
+    /// Outermost assertion facts when the argument is an `as` / `satisfies` /
+    /// angle assertion (`None` otherwise). Declined casts diagnose at the
+    /// operand span; admitted results check like their kind.
+    pub cast: Option<CastInput>,
 }
 
 /// One direct `f(...)` call site to check.
@@ -1092,10 +1350,7 @@ fn check_one_call(
     };
     let params: Vec<CallParam> = params
         .into_iter()
-        .map(|(expected, display)| CallParam {
-            expected: Some(expected),
-            display,
-        })
+        .map(|(expected, display)| CallParam { expected, display })
         .collect();
     emit_call_verdict(file, &site, &params, report);
 }
@@ -1103,8 +1358,8 @@ fn check_one_call(
 /// One resolved call parameter: the expected type when checkable plus the
 /// display text for `TS2345` messages.
 ///
-/// `expected` is `None` for accept-all (`any`) and uncheckable (`object`,
-/// function, union) parameters: those skip per-argument (the non-literal
+/// `expected` is `None` for accept-all (`any`, `unknown`) and uncheckable
+/// (`object`, function, union) parameters: those skip per-argument (the non-literal
 /// precedent), never decline whole calls, so decidable arity verdicts survive
 /// uncheckable shapes.
 #[derive(Clone, Debug)]
@@ -1158,21 +1413,46 @@ fn emit_call_verdict(
         return;
     }
     for (argument, param) in site.args.iter().zip(params.iter()) {
-        if argument.kind == InitKind::NonLiteral {
+        // Assertion arguments evaluate first: complex casts skip per-argument
+        // (the `NonLiteral` precedent — arity still enforces), declined casts
+        // diagnose at the operand span, and admitted results check like their
+        // kind. Declined casts never suppress the type check (probed tsc
+        // 7.0.2: `sn(("hello" as number))` reports both `TS2345` and
+        // `TS2352`); the first-mismatch rule below still governs `TS2345`.
+        let mut kind = argument.kind;
+        if let Some(cast) = argument.cast.as_ref() {
+            match evaluate_cast(cast) {
+                CastEvaluation::Complex(_) => continue,
+                CastEvaluation::Decline(result) => {
+                    emit_cast_diagnostic(file, cast, &mut *report);
+                    let Some(result_kind) = result.into_init() else {
+                        continue;
+                    };
+                    kind = result_kind;
+                }
+                CastEvaluation::Admit(result) => {
+                    let Some(result_kind) = result.into_init() else {
+                        continue;
+                    };
+                    kind = result_kind;
+                }
+            }
+        }
+        if kind == InitKind::NonLiteral {
             continue;
         }
         let Some(expected) = param.expected else {
             continue;
         };
         let display = param.display.as_str();
-        if argument.kind.type_id() != expected {
+        if kind.type_id() != expected {
             report.diagnostics.push(PithDiagnostic {
                 code: CODE_ARG_TYPE.to_owned(),
                 file,
                 span: argument.span,
                 message: format!(
                     "Argument of type '{}' is not assignable to parameter of type '{display}'.",
-                    argument.kind.name(),
+                    kind.name(),
                 ),
             });
             return;
@@ -1183,7 +1463,8 @@ fn emit_call_verdict(
 /// Gates one call's parameter list for [`check_one_call`].
 ///
 /// `Some` carries per-parameter `(expected [``TypeId``], display text)` in
-/// source order; `None` means one [`UnsupportedDecl`] was pushed at the
+/// source order (`None` positions are accept-all `any`/`unknown`: they skip
+/// per-argument, never decline whole calls); `None` means one [`UnsupportedDecl`] was pushed at the
 /// callee span and the call declines. Structural gates run
 /// parameter-by-parameter in order (unannotated, optional/rest, then
 /// uncheckable type text): the first failure wins, so reasons stay
@@ -1193,7 +1474,7 @@ fn call_params(
     decl: &FunctionDecl,
     file: FileId,
     report: &mut FileReport,
-) -> Option<Vec<(TypeId, String)>> {
+) -> Option<Vec<(Option<TypeId>, String)>> {
     if decl.params_complex {
         decline(
             call,
@@ -1265,12 +1546,23 @@ fn decline(call: &CallSite, file: FileId, report: &mut FileReport, reason: &str)
 /// expected ([`TypeId`], display text): `Err` carries the decline reason
 /// (union, object, unknown, or missing type text the subset cannot spell
 /// argument checks against).
-fn classify_param(param: &FunctionParam) -> Result<(TypeId, String), String> {
+///
+/// `any` and `unknown` parameters accept every literal (probed tsc 7.0.2:
+/// both directions silent), so they classify accept-all (`None`, the
+/// non-literal precedent); `never` keeps declining (unprobed message shape
+/// — never forced).
+fn classify_param(param: &FunctionParam) -> Result<(Option<TypeId>, String), String> {
     let text = param.annotation.as_deref().map_or("", str::trim);
     if text.contains('|') {
         return Err(format!(
             "union parameter type '{text}' is outside the subset"
         ));
+    }
+    if matches!(
+        boundary_annotation_type(text),
+        Some(id) if id == TypeStore::ANY || id == TypeStore::UNKNOWN
+    ) {
+        return Ok((None, text.to_owned()));
     }
     annotation_type(text).map_or_else(
         || {
@@ -1279,7 +1571,7 @@ fn classify_param(param: &FunctionParam) -> Result<(TypeId, String), String> {
                 param.name
             ))
         },
-        |expected| Ok((expected, text.to_owned())),
+        |expected| Ok((Some(expected), text.to_owned())),
     )
 }
 
@@ -1841,6 +2133,7 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             annotation: prop.annotation.clone(),
             init: prop.init,
             init_object: prop.init_object.clone(),
+            cast: None,
         };
         let mut ctx = CheckCtx {
             file: run.file,
@@ -2894,7 +3187,7 @@ fn check_narrowing_decl(
             report,
             extra: &[],
         };
-        check_object(decl, span, annotation, &mut ctx);
+        check_object(decl, span, annotation, decl.init, &mut ctx);
         return;
     }
     if !annotation.contains('|') {
@@ -3454,7 +3747,15 @@ fn parse_object_annotation(text: &str) -> Option<Vec<(String, String)>> {
 /// Classifies one object member's type text: primitive [`TypeId`], or `None`
 /// with a flag saying whether the oracle would call it unknown (`TS2304`)
 /// versus out-of-subset (union/complex shapes the solver declines).
+///
+/// Boundary names (`any`, `unknown`, `never`) decline: `any`/`unknown`
+/// accept every value in tsc (no per-member verdict exists), while `never`
+/// accepts none (unprobed spelling — never forced). Either way the member
+/// is recorded, never mis-diagnosed as `TS2304`.
 fn classify_member_type(ty: &str) -> Result<TypeId, bool> {
+    if boundary_annotation_type(ty).is_some() {
+        return Err(false);
+    }
     if let Some(id) = annotation_type(ty) {
         return Ok(id);
     }
@@ -3501,6 +3802,133 @@ fn object_type_text(names: &[&str], types: &[&str]) -> String {
 /// which beats missing members (one `TS2741`, or one `TS2739` for several).
 /// Only one family ever fires per declaration.
 ///
+/// What assertion application leaves for annotation routing.
+enum AssertedInit {
+    /// Keep checking with this initializer (`None` = missing).
+    Check(Option<InitKind>),
+    /// A note was pushed; the declaration is done.
+    Done,
+}
+
+/// Applies one assertion before annotation routing (probe basis in the
+/// `check_one` docs): assertion-plus-object-members is contradictory input;
+/// complex casts decline except under `any`; declined casts diagnose and
+/// admitted casts substitute — both still check downstream through the
+/// returned initializer.
+fn apply_assertion(
+    decl: &ConstDecl,
+    span: Span,
+    file: FileId,
+    annotation: &str,
+    report: &mut FileReport,
+) -> AssertedInit {
+    let mut init = decl.init;
+    let Some(cast) = decl.cast.as_ref() else {
+        return AssertedInit::Check(init);
+    };
+    if decl.init_object.is_some() {
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: "contradictory initializer facts: assertion with object members".to_owned(),
+        });
+        return AssertedInit::Done;
+    }
+    match evaluate_cast(cast) {
+        CastEvaluation::Complex(reason) => {
+            // `any` annotations admit complex casts silently (nothing can
+            // mismatch); every other annotation declines with the reason.
+            if boundary_annotation_type(annotation) != Some(TypeStore::ANY) {
+                report
+                    .unsupported
+                    .push(UnsupportedDecl { file, span, reason });
+            }
+            AssertedInit::Done
+        }
+        CastEvaluation::Decline(result) => {
+            emit_cast_diagnostic(file, cast, &mut *report);
+            let Some(kind) = result.into_init() else {
+                return AssertedInit::Done;
+            };
+            init = Some(kind);
+            AssertedInit::Check(init)
+        }
+        CastEvaluation::Admit(result) => {
+            let Some(kind) = result.into_init() else {
+                // Accept-all results (`any`, `never`) silence the
+                // position (`never` is assignable to every annotation).
+                return AssertedInit::Done;
+            };
+            init = Some(kind);
+            AssertedInit::Check(init)
+        }
+    }
+}
+
+/// The missing-annotation path for `check_one`: declined casts still
+/// diagnose without annotations (probed tsc 7.0.2); admitted and complex
+/// casts fall into the usual no-annotation decline.
+fn decline_unannotated(decl: &ConstDecl, span: Span, file: FileId, report: &mut FileReport) {
+    if let Some(cast) = decl.cast.as_ref() {
+        if matches!(evaluate_cast(cast), CastEvaluation::Decline(_)) {
+            emit_cast_diagnostic(file, cast, &mut *report);
+            return;
+        }
+    }
+    report.unsupported.push(UnsupportedDecl {
+        file,
+        span,
+        reason: "no annotation: inference is outside the subset".to_owned(),
+    });
+}
+
+/// Resolves a boundary annotation (`any`/`unknown`/`never`/unknown names)
+/// for `check_one` (probe basis in its docs): `any`/`unknown` admit every
+/// bearing value silently and decline missing ones like the primitive path;
+/// `never` resolves; anything else unknown diagnoses `PITH2304`.
+/// (`any`/`unknown` returned above, so only `None` or `NEVER` arrive at the
+/// final match.) Returns the annotation [`TypeId`], or `None` when the
+/// declaration is done.
+fn resolve_boundary_annotation(
+    annotation: &str,
+    span: Span,
+    file: FileId,
+    bearing: bool,
+    report: &mut FileReport,
+) -> Option<TypeId> {
+    if let Some(boundary) = boundary_annotation_type(annotation) {
+        if boundary == TypeStore::ANY || boundary == TypeStore::UNKNOWN {
+            if bearing {
+                return None;
+            }
+            report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: "missing initializer: nothing to check against".to_owned(),
+            });
+            return None;
+        }
+    }
+    // `never` carries no [`TypeStore`] primitive in [`annotation_type`], so
+    // it resolves here; anything else unknown still diagnoses `PITH2304`.
+    let ann_ty = match boundary_annotation_type(annotation) {
+        Some(id) if id == TypeStore::NEVER => id,
+        _ => {
+            let Some(id) = annotation_type(annotation) else {
+                report.diagnostics.push(PithDiagnostic {
+                    code: CODE_UNKNOWN_ANNOTATION.to_owned(),
+                    file,
+                    span,
+                    message: format!("Cannot find name '{annotation}'."),
+                });
+                return None;
+            };
+            id
+        }
+    };
+    Some(ann_ty)
+}
+
 /// Takes the shared [`CheckCtx`] (file, node, memo store, freshness table,
 /// report, and extra cross-file edges) so the arity stays flat as the
 /// subset grows; `binder` and `decl` ride alongside.
@@ -3513,11 +3941,7 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
     let extra = ctx.extra;
     let span = binder_span(binder, file, decl);
     let Some(raw) = decl.annotation.as_deref() else {
-        report.unsupported.push(UnsupportedDecl {
-            file,
-            span,
-            reason: "no annotation: inference is outside the subset".to_owned(),
-        });
+        decline_unannotated(decl, span, file, &mut *report);
         return;
     };
     let annotation = raw.trim();
@@ -3530,6 +3954,13 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
         });
         return;
     }
+    // Assertion evaluation runs before annotation routing (see
+    // `apply_assertion`): declined casts diagnose independently of the
+    // annotation while admitted results substitute the initializer kind.
+    let init = match apply_assertion(decl, span, file, annotation, &mut *report) {
+        AssertedInit::Check(init) => init,
+        AssertedInit::Done => return,
+    };
     if annotation.starts_with('{') {
         let mut ctx = CheckCtx {
             file,
@@ -3539,7 +3970,7 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
             report,
             extra,
         };
-        check_object(decl, span, annotation, &mut ctx);
+        check_object(decl, span, annotation, init, &mut ctx);
         return;
     }
     if annotation.contains('|') {
@@ -3550,13 +3981,12 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
         });
         return;
     }
-    let Some(ann_ty) = annotation_type(annotation) else {
-        report.diagnostics.push(PithDiagnostic {
-            code: CODE_UNKNOWN_ANNOTATION.to_owned(),
-            file,
-            span,
-            message: format!("Cannot find name '{annotation}'."),
-        });
+    // Boundary annotations (probed tsc 7.0.2 — see
+    // `resolve_boundary_annotation`): bearing means any initializer shape,
+    // object members, or assertion facts are present.
+    let bearing = init.is_some() || decl.init_object.is_some() || decl.cast.is_some();
+    let Some(ann_ty) = resolve_boundary_annotation(annotation, span, file, bearing, &mut *report)
+    else {
         return;
     };
     // Thread through the memo database: the annotation type is the answer
@@ -3576,7 +4006,7 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
         check_primitive_annotation_object_init(file, span, annotation, init_object, report);
         return;
     }
-    let Some(init) = decl.init else {
+    let Some(init) = init else {
         report.unsupported.push(UnsupportedDecl {
             file,
             span,
@@ -3662,7 +4092,13 @@ struct CheckCtx<'a> {
 /// rest (union/complex shapes) before any shape comparison; the shape
 /// comparison itself fires exactly one diagnostic family per declaration
 /// (wrong > excess > missing). See the module-level object rules.
-fn check_object(decl: &ConstDecl, span: Span, annotation: &str, ctx: &mut CheckCtx<'_>) {
+fn check_object(
+    decl: &ConstDecl,
+    span: Span,
+    annotation: &str,
+    init: Option<InitKind>,
+    ctx: &mut CheckCtx<'_>,
+) {
     let Some(parsed) = parse_object_members(annotation, span, ctx) else {
         return;
     };
@@ -3679,7 +4115,7 @@ fn check_object(decl: &ConstDecl, span: Span, annotation: &str, ctx: &mut CheckC
             .map(|(_, _, ty)| ty.as_str())
             .collect::<Vec<&str>>(),
     );
-    finish_object_check(decl, span, &expected, &expected_text, ctx);
+    finish_object_check(decl, span, &expected, &expected_text, init, ctx);
 }
 
 /// Shared object-literal comparison tail: memoizes the shape, then fires
@@ -3688,16 +4124,22 @@ fn check_object(decl: &ConstDecl, span: Span, annotation: &str, ctx: &mut CheckC
 /// for inline annotations, the bare interface name for
 /// [`check_interface_shape`] (probed tsc 7.0.2: interface elaborations
 /// spell the name, never expanded members).
+///
+/// `init` is the initializer kind to compare: the declaration's own kind,
+/// or the cast-substituted kind when [`check_one`] evaluated an assertion
+/// (assertions never pair with object members, so the substitution only
+/// ever reaches the non-object path).
 fn finish_object_check(
     decl: &ConstDecl,
     span: Span,
     expected: &[ExpectedMember],
     expected_text: &str,
+    init: Option<InitKind>,
     ctx: &mut CheckCtx<'_>,
 ) {
     memoize_object_shape(expected, ctx);
     match decl.init_object.as_ref() {
-        None => check_object_annotation_non_object_init(decl, span, expected_text, ctx),
+        None => check_object_annotation_non_object_init(init, span, expected_text, ctx),
         Some(init_object) => {
             compare_object_members(span, expected, expected_text, init_object, ctx);
         }
@@ -3974,14 +4416,15 @@ fn diagnose_missing_members(
 ///
 /// Primitive literals diagnose compositionally (oracle: `Type 'number' is
 /// not assignable to type '{ a: number; }'.`); missing/non-literal
-/// initializers decline with the usual reasons.
+/// initializers decline with the usual reasons. `init` is the declaration's
+/// own kind or the cast-substituted kind (see [`finish_object_check`]).
 fn check_object_annotation_non_object_init(
-    decl: &ConstDecl,
+    init: Option<InitKind>,
     span: Span,
     expected_text: &str,
     ctx: &mut CheckCtx<'_>,
 ) {
-    let Some(init) = decl.init else {
+    let Some(init) = init else {
         ctx.report.unsupported.push(UnsupportedDecl {
             file: ctx.file,
             span,
@@ -4425,7 +4868,7 @@ fn check_interface_shape(
     let Some(expected) = classify_expected(&parsed, span, ctx) else {
         return;
     };
-    finish_object_check(decl, span, &expected, annotation, ctx);
+    finish_object_check(decl, span, &expected, annotation, decl.init, ctx);
 }
 
 /// Checks `const`/`let` declarators whose annotations may name enums,
@@ -5053,7 +5496,7 @@ impl EnumDeclCtx<'_, '_> {
                     format!("Type '{spelling}' is not assignable to type '{display}'."),
                 );
             }
-            InitKind::Null | InitKind::Undefined => {
+            InitKind::Null | InitKind::Undefined | InitKind::Unknown => {
                 self.diagnose(
                     span,
                     CODE_MISMATCH,
@@ -5237,6 +5680,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: Some(init),
             init_object: None,
+            cast: None,
         }
     }
 
@@ -5265,6 +5709,7 @@ mod tests {
                     .collect(),
                 fresh: true,
             }),
+            cast: None,
         }
     }
 
@@ -5612,6 +6057,7 @@ mod tests {
                 annotation: None,
                 init: Some(InitKind::Number),
                 init_object: None,
+                cast: None,
             },
             // An interface-annotated use resolves through the merged id.
             object_decl("ok", 50, 52, "Foo", vec![("a", ObjectMemberKind::Number)]),
@@ -5666,6 +6112,496 @@ mod tests {
         for unknown in ["Nope", "number[]", "", "Number"] {
             assert_eq!(annotation_type(unknown), None, "annotation {unknown:?}");
         }
+    }
+
+    /// One assertion-initialized declaration: the initializer kind is always
+    /// `NonLiteral` (assertions classify as expressions), and the cast fact
+    /// carries the operand kind plus the verbatim target text.
+    fn casted(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        ann: Option<&str>,
+        operand: InitKind,
+        target: &str,
+        kind: CastKind,
+    ) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: ann.map(str::to_owned),
+            init: Some(InitKind::NonLiteral),
+            init_object: None,
+            cast: Some(CastInput {
+                operand,
+                target: target.to_owned(),
+                operand_span: span(lo, hi),
+                kind,
+            }),
+        }
+    }
+
+    /// One call site whose single argument is an assertion.
+    fn casted_call(operand: InitKind, target: &str, kind: CastKind) -> CallSite {
+        CallSite {
+            callee: "sn".to_owned(),
+            callee_span: span(0, 2),
+            span: span(0, 60),
+            args: vec![CallArg {
+                kind: InitKind::NonLiteral,
+                span: span(3, 20),
+                cast: Some(CastInput {
+                    operand,
+                    target: target.to_owned(),
+                    operand_span: span(4, 11),
+                    kind,
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn boundary_annotations_admit_bearing_values() {
+        // Probed tsc 7.0.2: `any` and `unknown` annotations accept every
+        // bearing value silently — both directions, every literal.
+        let binder = binder_with(&[("m", span(0, 10)), ("u", span(11, 21))]);
+        let decls = [
+            decl("m", 0, 10, "any", InitKind::Number),
+            decl("m", 0, 10, "any", InitKind::String),
+            decl("m", 0, 10, "any", InitKind::NonLiteral),
+            decl("u", 11, 21, "unknown", InitKind::String),
+            decl("u", 11, 21, "unknown", InitKind::Null),
+            object_decl("m", 0, 10, "any", vec![("a", ObjectMemberKind::Number)]),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn boundary_annotations_without_init_decline() {
+        // Definite assignment stays outside the subset: bearing is required
+        // for the boundary silence.
+        let binder = binder_with(&[("m", span(0, 10))]);
+        let decls = [ConstDecl {
+            name: "m".to_owned(),
+            span: span(0, 10),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: Some("any".to_owned()),
+            init: None,
+            init_object: None,
+            cast: None,
+        }];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("missing initializer"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn never_annotation_diagnoses_bearing_literals() {
+        let binder = binder_with(&[("x", span(0, 10)), ("y", span(11, 21))]);
+        let decls = [
+            decl("x", 0, 10, "never", InitKind::Number),
+            decl("y", 11, 21, "never", InitKind::String),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 2);
+        for diag in &report.diagnostics {
+            assert_eq!(diag.code, CODE_MISMATCH);
+            assert!(
+                diag.message.ends_with("is not assignable to type 'never'."),
+                "message: {}",
+                diag.message
+            );
+        }
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn as_cast_admit_checks_target_through_existing_path() {
+        // `(1 as number)` against `number` is clean; against `string` the
+        // admitted result diagnoses exactly like a plain literal.
+        let binder = binder_with(&[("n", span(0, 10)), ("s", span(11, 21))]);
+        let decls = [
+            casted(
+                "n",
+                0,
+                10,
+                Some("number"),
+                InitKind::Number,
+                "number",
+                CastKind::As,
+            ),
+            casted(
+                "s",
+                11,
+                21,
+                Some("string"),
+                InitKind::Number,
+                "number",
+                CastKind::As,
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn as_cast_decline_reports_both_families() {
+        // Probed tsc 7.0.2: `const s: string = ("hello" as number)`
+        // reports `TS2322` at the declaration plus `TS2352` at the operand.
+        let binder = binder_with(&[("s", span(0, 10))]);
+        let decls = [casted(
+            "s",
+            0,
+            10,
+            Some("string"),
+            InitKind::String,
+            "number",
+            CastKind::As,
+        )];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        // Equal spans (helper reuses the declaration span for the operand)
+        // sort stably: the cast diagnostic pushes first.
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_CAST);
+        assert_eq!(report.diagnostics[1].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Conversion of type 'string' to type 'number' may be a mistake \
+            because neither type sufficiently overlaps with the other. If \
+            this was intentional, convert the expression to 'unknown' first."
+        );
+        assert_eq!(report.diagnostics[0].span, span(0, 10));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn declined_cast_under_any_keeps_cast_error_only() {
+        // Probed tsc 7.0.2: `const m: any = ("hello" as number)` reports
+        // `TS2352` alone — the annotation accepts the result.
+        let binder = binder_with(&[("m", span(0, 10))]);
+        let decls = [casted(
+            "m",
+            0,
+            10,
+            Some("any"),
+            InitKind::String,
+            "number",
+            CastKind::As,
+        )];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_CAST);
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn unknown_result_diagnoses_against_primitives() {
+        // Probed tsc 7.0.2: `const n: number = ("x" as unknown)` reports a
+        // lone `TS2322` spelling `unknown` — no cast diagnostic.
+        let binder = binder_with(&[("n", span(0, 10))]);
+        let decls = [casted(
+            "n",
+            0,
+            10,
+            Some("number"),
+            InitKind::String,
+            "unknown",
+            CastKind::As,
+        )];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'unknown' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn satisfies_admits_transparently_to_operand() {
+        // `satisfies` checks the operand type downstream, not the target:
+        // `(1 satisfies number)` against `string` reports the operand.
+        let binder = binder_with(&[("t", span(0, 10)), ("s", span(11, 21))]);
+        let decls = [
+            casted(
+                "t",
+                0,
+                10,
+                Some("string"),
+                InitKind::String,
+                "string",
+                CastKind::Satisfies,
+            ),
+            casted(
+                "s",
+                11,
+                21,
+                Some("string"),
+                InitKind::Number,
+                "number",
+                CastKind::Satisfies,
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn satisfies_decline_spells_ts1360() {
+        // `("x" satisfies number)` against `boolean`: `TS1360` at the
+        // operand plus the downstream operand-vs-annotation `TS2322`.
+        let binder = binder_with(&[("b", span(0, 10))]);
+        let decls = [casted(
+            "b",
+            0,
+            10,
+            Some("boolean"),
+            InitKind::String,
+            "number",
+            CastKind::Satisfies,
+        )];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_SATISFIES);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' does not satisfy the expected type 'number'."
+        );
+        assert_eq!(report.diagnostics[1].code, CODE_MISMATCH);
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn angle_assertion_shares_as_rule() {
+        let binder = binder_with(&[("t", span(0, 10))]);
+        let decls = [casted(
+            "t",
+            0,
+            10,
+            Some("number"),
+            InitKind::Number,
+            "string",
+            CastKind::Angle,
+        )];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_CAST);
+        assert_eq!(report.diagnostics[1].code, CODE_MISMATCH);
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn complex_casts_decline_with_reasons() {
+        // Non-literal operands, object targets, and unsliceable targets
+        // decline the whole declaration — never a forced verdict.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21)), ("c", span(22, 32))]);
+        let decls = [
+            casted(
+                "a",
+                0,
+                10,
+                Some("number"),
+                InitKind::NonLiteral,
+                "number",
+                CastKind::As,
+            ),
+            casted(
+                "b",
+                11,
+                21,
+                Some("number"),
+                InitKind::String,
+                "{ a: number }",
+                CastKind::As,
+            ),
+            casted(
+                "c",
+                22,
+                32,
+                Some("number"),
+                InitKind::String,
+                "",
+                CastKind::As,
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 3);
+        assert!(
+            report.unsupported[0].reason.contains("operand"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("target"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+        assert!(
+            report.unsupported[2].reason.contains("target"),
+            "reason: {}",
+            report.unsupported[2].reason
+        );
+    }
+
+    #[test]
+    fn unannotated_declined_cast_still_diagnoses() {
+        // Probed tsc 7.0.2: `const s = "hello" as number` spells `TS2352`
+        // with no annotation to check against.
+        let binder = binder_with(&[("s", span(0, 10)), ("t", span(11, 21))]);
+        let decls = [
+            casted("s", 0, 10, None, InitKind::String, "number", CastKind::As),
+            casted("t", 11, 21, None, InitKind::Number, "number", CastKind::As),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_CAST);
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("no annotation"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn any_and_unknown_params_accept_every_literal() {
+        // Probed tsc 7.0.2: `takeAny("oops")` and `h("s")` against
+        // `unknown` are clean; the mixed declaration still checks the
+        // non-boundary position.
+        let binder = Binder::new();
+        let take_any = callable("takeAny", vec![("x", "any")]);
+        let take_unknown = callable("takeUnknown", vec![("x", "unknown")]);
+        let mixed = callable("mixed", vec![("x", "any"), ("y", "number")]);
+        let decls = [take_any, take_unknown, mixed];
+        let clean = [
+            call("takeAny", span(0, 7), vec![(InitKind::String, span(8, 14))]),
+            call(
+                "takeUnknown",
+                span(0, 11),
+                vec![(InitKind::Number, span(12, 13))],
+            ),
+            call(
+                "mixed",
+                span(0, 5),
+                vec![
+                    (InitKind::String, span(6, 10)),
+                    (InitKind::Number, span(12, 13)),
+                ],
+            ),
+        ];
+        let report = check_calls(FILE, &decls, &clean, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(report.unsupported.is_empty());
+        let wrong = [call(
+            "mixed",
+            span(0, 5),
+            vec![
+                (InitKind::String, span(6, 10)),
+                (InitKind::String, span(12, 18)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &wrong, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'string' is not assignable to parameter of type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn never_param_declines() {
+        // Unprobed message shape: never forced, always recorded.
+        let binder = Binder::new();
+        let decls = [callable("takeNever", vec![("x", "never")])];
+        let calls = [call(
+            "takeNever",
+            span(0, 9),
+            vec![(InitKind::Number, span(10, 11))],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("never"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn declined_cast_argument_reports_both_families() {
+        // Probed tsc 7.0.2: `sn(("hello" as number))` against `(x: string)`
+        // reports `TS2345` plus `TS2352`.
+        let binder = Binder::new();
+        let decls = [callable("sn", vec![("x", "string")])];
+        let calls = [casted_call(InitKind::String, "number", CastKind::As)];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        // Sorted by span: the paren-inclusive argument span precedes the
+        // inner operand span, so the arg-type verdict orders first.
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'number' is not assignable to parameter of type 'string'."
+        );
+        assert_eq!(report.diagnostics[1].code, CODE_CAST);
+        assert!(report.unsupported.is_empty());
     }
 
     #[test]
@@ -5749,6 +6685,7 @@ mod tests {
                 annotation: None,
                 init: Some(InitKind::Number),
                 init_object: None,
+                cast: None,
             },
             decl("e", 18, 26, "number", InitKind::NonLiteral),
             ConstDecl {
@@ -5760,6 +6697,7 @@ mod tests {
                 annotation: Some("number".to_owned()),
                 init: None,
                 init_object: None,
+                cast: None,
             },
         ];
         let mut db = QueryDb::new();
@@ -5861,6 +6799,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: Some(init),
             init_object: None,
+            cast: None,
         }
     }
 
@@ -5902,6 +6841,7 @@ mod tests {
             annotation: Some("number".to_owned()),
             init: Some(InitKind::String),
             init_object: None,
+            cast: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[decl], &binder, &mut db);
@@ -5927,6 +6867,7 @@ mod tests {
             annotation: Some("string".to_owned()),
             init: Some(InitKind::Number),
             init_object: None,
+            cast: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[decl], &binder, &mut db);
@@ -5950,6 +6891,7 @@ mod tests {
             annotation: Some("string".to_owned()),
             init: Some(InitKind::Number),
             init_object: None,
+            cast: None,
         };
         let mut db = QueryDb::new();
         let other = FileId(41);
@@ -5966,10 +6908,12 @@ mod tests {
         let decls = [
             ConstDecl {
                 kind: DeclKind::Let,
+                cast: None,
                 ..decl("a", 0, 10, "number", InitKind::Number)
             },
             ConstDecl {
                 kind: DeclKind::Let,
+                cast: None,
                 ..decl("b", 11, 21, "number", InitKind::String)
             },
         ];
@@ -6280,6 +7224,7 @@ mod tests {
             annotation: Some("{ a: number }".to_owned()),
             init: Some(InitKind::Number),
             init_object: None,
+            cast: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[object_init, primitive_init], &binder, &mut db);
@@ -6388,6 +7333,7 @@ mod tests {
         FunctionBody::SingleReturn(FunctionReturn {
             kind: Some(kind),
             init_object: None,
+            cast: None,
         })
     }
 
@@ -6426,6 +7372,7 @@ mod tests {
                 .map(|(kind, arg_span)| CallArg {
                     kind,
                     span: arg_span,
+                    cast: None,
                 })
                 .collect(),
         }
@@ -6444,6 +7391,7 @@ mod tests {
                     .collect(),
                 fresh: true,
             }),
+            cast: None,
         })
     }
 
@@ -6452,6 +7400,7 @@ mod tests {
         FunctionReturn {
             kind: Some(kind),
             init_object: None,
+            cast: None,
         }
     }
 
@@ -6470,6 +7419,7 @@ mod tests {
                     .collect(),
                 fresh: true,
             }),
+            cast: None,
         }
     }
 
@@ -7315,6 +8265,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init,
             init_object: None,
+            cast: None,
         }
     }
 
@@ -7805,6 +8756,7 @@ mod tests {
                 annotation: Some("number | string".to_owned()),
                 init: None,
                 init_object: None,
+                cast: None,
             },
         ];
         let uses = [narrowing_use("a", 40, 50, "string", "x", 48, 49)];
@@ -7921,6 +8873,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
                 init_object: None,
+                cast: None,
             }),
         )
     }
@@ -7942,6 +8895,7 @@ mod tests {
                     .map(|(kind, lo, hi)| CallArg {
                         kind,
                         span: span(lo, hi),
+                        cast: None,
                     })
                     .collect(),
             },
@@ -8089,6 +9043,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::String),
                 init_object: None,
+                cast: None,
             }),
         )];
         let calls = [generic_call_args(
@@ -8130,6 +9085,7 @@ mod tests {
                     }],
                     fresh: true,
                 }),
+                cast: None,
             }),
         )];
         let report = generics_report(&decls, &[], &binder);
@@ -8155,6 +9111,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::Number),
                 init_object: None,
+                cast: None,
             }),
         )];
         let report = generics_report(&decls, &[], &binder);
@@ -8246,6 +9203,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
                 init_object: None,
+                cast: None,
             })
         };
         let decls = [
@@ -8457,6 +9415,7 @@ mod tests {
                 annotation: Some(annotation.to_owned()),
                 init: Some(init),
                 init_object: None,
+                cast: None,
             },
             init_text: text.map(str::to_owned),
             cross_file_deps: Vec::new(),
