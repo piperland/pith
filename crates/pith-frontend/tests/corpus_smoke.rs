@@ -7,17 +7,23 @@
 //! outside the checking subset (see `corpus/real/coverage-prescan.md`),
 //! so every construct here would decline rather than verdict.
 
+use std::time::Instant;
+
 use pith_frontend::parse_module;
 use pith_ids::FileId;
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
 /// One pinned real file: path hint, source, and its regression-pin counts
 /// `(scopes, symbols, decls, functions, calls, guards)`.
+///
+/// Prints `PITH_TIME <path> <ms>` for the parse+bind wall time (P026 timing
+/// table input — measurement only, no checker behavior).
 fn check_pinned(
     path: &str,
     source: &str,
     file: FileId,
 ) -> (usize, usize, usize, usize, usize, usize) {
+    let started = Instant::now();
     let parsed = parse_module(file, path, source);
     // Dense root-first scope indices (the P012 regression pin).
     let mut seen: Vec<u32> = parsed.scopes.iter().map(|scope| scope.index).collect();
@@ -85,6 +91,7 @@ fn check_pinned(
         "{path}: scopes={} symbols={} decls={} functions={} calls={} guards={}",
         counts.0, counts.1, counts.2, counts.3, counts.4, counts.5
     );
+    println!("PITH_TIME {path} {}", started.elapsed().as_millis());
     counts
 }
 
