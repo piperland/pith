@@ -1,0 +1,23 @@
+{
+  "oracle": "Version 7.0.2",
+  "flags": "--noEmit --strict --pretty false <entry>",
+  "note": "tsc wall ms only. No Pith times yet: the Rust pipeline cannot run locally (see .agent/scripts/REMOTE.md); the CTO records Pith times remotely.",
+  "pith_ms": null,
+  "cases": {
+    "defu": {
+      "entry": "corpus/real/defu/src/defu.ts",
+      "verdict": "clean",
+      "tsc_ms": 346
+    },
+    "destr": {
+      "entry": "corpus/real/destr/src/index.ts",
+      "verdict": "clean",
+      "tsc_ms": 357
+    },
+    "plimit-stress": {
+      "entry": "corpus/real/plimit-stress/index.d.ts",
+      "verdict": "clean",
+      "tsc_ms": 331
+    }
+  }
+}
