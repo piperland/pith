@@ -128,6 +128,46 @@
 //!   whole calls over one identifier argument would forfeit decidable arity
 //!   verdicts.
 //!
+//! Member calls on known values (P024, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p024-probes/`):
+//!
+//! - The adapter emits member facts only for static member calls on a closed
+//!   allowlist of known-value receivers (`JSON`, `Object`, `Array`,
+//!   `console`, `Math`); everything else keeps the existing non-emission, so
+//!   [`check_member_calls`] never verdicts a member call it has no
+//!   probe-grounded signature for. No lib `.d.ts` modeling anywhere: known
+//!   members carry opaque fixed-arity plus primitive-parameter signatures,
+//!   and every other shape declines with a lib reason.
+//! - Checked opaque signatures (each probed wrong-type, too-few, and
+//!   too-many unless noted):
+//!   - `Array.isArray(arg: any)`: exactly 1 argument; the parameter accepts
+//!     every literal (probed `isArray(1)` and `isArray(null)` clean).
+//!   - `Object.keys(o: object)`: exactly 1 argument; the `object` parameter
+//!     is uncheckable in-subset, so argument checks skip per-argument while
+//!     arity still enforces (literal `null`/`undefined` spell `TS2769` in
+//!     tsc — pinned oracle-error divergence, never a forced `TS2345`).
+//!   - `Math.floor/ceil/round/trunc/abs/sqrt/cbrt(x: number)` (exactly 1)
+//!     and `Math.pow/atan2(x: number, y: number)` (exactly 2): full
+//!     arity-plus-`TS2345` checking, exactly like direct calls.
+//! - Known members with uncheckable shapes decline per site with lib reasons
+//!   (never a forced verdict): `JSON.parse` takes a range of arities
+//!   (`Expected 1-2 arguments, but got 0.` in tsc) plus a function-typed
+//!   reviver; `JSON.stringify` is overloaded (`TS2769` in tsc);
+//!   `console.warn/log/error` and `Math.max/min` are variadic (the rest-arg
+//!   precedent). The destr `JSON.parse(value)` and `console.warn(...)` sites
+//!   land here: recorded, never silent, never mis-verdicted.
+//! - Unknown members on known receivers (`JSON.nope`) decline with a lib
+//!   reason (tsc spells `TS2339` — pinned oracle-error divergence); unknown
+//!   receivers consult the unresolved gate exactly like direct calls (tracked
+//!   names skip silently with tsc's `TS2304` pinned; untracked names decline
+//!   as driver skew, never silently dropped).
+//! - One family per site, same anchoring law as direct calls (too-few at the
+//!   member identifier, too-many at the first excess argument, arg-type at
+//!   the mismatched argument) — all spans from member facts, never
+//!   string-searching. A locally declared binding shadowing a known value
+//!   still routes opaque (documented limit: member facts carry no occurrence
+//!   scope, so shadowing is indistinguishable facts-side).
+//!
 //! Classes (P020, probed on tsc 7.0.2 `--strict --pretty false`; probes in
 //! `.agent/scratch/p020-probes/`):
 //!
@@ -1046,11 +1086,64 @@ fn check_one_call(
     let Some(params) = call_params(call, decl, file, report) else {
         return;
     };
-    if call.args.len() != params.len() {
-        let span = if call.args.len() < params.len() {
-            call.callee_span
+    let site = VerdictSite {
+        anchor: call.callee_span,
+        args: &call.args,
+    };
+    let params: Vec<CallParam> = params
+        .into_iter()
+        .map(|(expected, display)| CallParam {
+            expected: Some(expected),
+            display,
+        })
+        .collect();
+    emit_call_verdict(file, &site, &params, report);
+}
+
+/// One resolved call parameter: the expected type when checkable plus the
+/// display text for `TS2345` messages.
+///
+/// `expected` is `None` for accept-all (`any`) and uncheckable (`object`,
+/// function, union) parameters: those skip per-argument (the non-literal
+/// precedent), never decline whole calls, so decidable arity verdicts survive
+/// uncheckable shapes.
+#[derive(Clone, Debug)]
+struct CallParam {
+    /// Expected builtin [`TypeId`], or `None` when this position never
+    /// mismatches.
+    expected: Option<TypeId>,
+    /// Parameter type text for `TS2345` messages (`"number"`, `"any"`,
+    /// `"object"`, ...).
+    display: String,
+}
+
+/// One anchored call site for the shared verdict tail: direct calls anchor at
+/// the callee identifier, member calls at the member identifier (mirroring
+/// tsc's callee anchoring in both cases).
+struct VerdictSite<'a> {
+    /// Too-few-arity anchor (the callee or member identifier span).
+    anchor: Span,
+    /// Argument facts in source order.
+    args: &'a [CallArg],
+}
+
+/// Emits at most one diagnostic for one anchored call site: exact arity
+/// (`PITH2554`) beats argument types (`PITH2345`), and only the first
+/// mismatched argument reports (both probed on tsc 7.0.2).
+///
+/// Spans mirror the oracle: too-few arity at the anchor, too-many at the
+/// first excess argument, arg-type at the mismatched argument.
+fn emit_call_verdict(
+    file: FileId,
+    site: &VerdictSite<'_>,
+    params: &[CallParam],
+    report: &mut FileReport,
+) {
+    if site.args.len() != params.len() {
+        let span = if site.args.len() < params.len() {
+            site.anchor
         } else {
-            call.args[params.len()].span
+            site.args[params.len()].span
         };
         report.diagnostics.push(PithDiagnostic {
             code: CODE_ARITY.to_owned(),
@@ -1059,16 +1152,20 @@ fn check_one_call(
             message: format!(
                 "Expected {} arguments, but got {}.",
                 params.len(),
-                call.args.len()
+                site.args.len()
             ),
         });
         return;
     }
-    for (argument, (expected, display)) in call.args.iter().zip(params.iter()) {
+    for (argument, param) in site.args.iter().zip(params.iter()) {
         if argument.kind == InitKind::NonLiteral {
             continue;
         }
-        if argument.kind.type_id() != *expected {
+        let Some(expected) = param.expected else {
+            continue;
+        };
+        let display = param.display.as_str();
+        if argument.kind.type_id() != expected {
             report.diagnostics.push(PithDiagnostic {
                 code: CODE_ARG_TYPE.to_owned(),
                 file,
@@ -1184,6 +1281,210 @@ fn classify_param(param: &FunctionParam) -> Result<(TypeId, String), String> {
         },
         |expected| Ok((expected, text.to_owned())),
     )
+}
+
+/// One `JSON.parse(...)`-shaped member call site to check.
+///
+/// Fact-fed from the adapter's `MemberCallFact`: receiver and member names
+/// plus the member identifier span, the whole call span, and one [`CallArg`]
+/// per argument in source order (only the literal-kind enum mapping is
+/// driver-side, mechanical and exhaustive).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberCallSite {
+    /// Receiver name as written (`JSON` above).
+    pub receiver: String,
+    /// Member name as written (`parse` above).
+    pub member: String,
+    /// Span of the member identifier (too-few-arity anchor, mirroring tsc).
+    pub member_span: Span,
+    /// Span of the whole call expression.
+    pub span: Span,
+    /// Argument facts in source order.
+    pub args: Vec<CallArg>,
+}
+
+/// One opaque lib signature: an exact arity plus one [`CallParam`] per
+/// position in source order.
+///
+/// Only fixed-arity members with primitive-or-`any` parameters live here (see
+/// [`opaque_signature`]); ranges, overloads, and variadics decline per site
+/// with lib reasons instead of forcing verdicts.
+#[derive(Clone, Debug)]
+struct OpaqueSig {
+    /// Exact accepted argument count.
+    arity: usize,
+    /// Per-position expectations (`None` positions never mismatch).
+    params: Vec<CallParam>,
+}
+
+/// Builds one exact-arity opaque signature from per-position
+/// `(expected, display)` pairs.
+fn exact_sig(arity: usize, params: &[(Option<TypeId>, &str)]) -> OpaqueSig {
+    let mut out = Vec::with_capacity(params.len());
+    for (expected, display) in params {
+        out.push(CallParam {
+            expected: *expected,
+            display: (*display).to_owned(),
+        });
+    }
+    OpaqueSig { arity, params: out }
+}
+
+/// Whether a receiver names a known value with opaque lib signatures.
+///
+/// Mirrors the adapter's `pith_frontend::is_known_value_receiver` gate
+/// (kept as a local match: `pith-solver` takes no runtime dependency on
+/// `pith-frontend` by boundary law, dev-dependencies aside).
+#[must_use]
+fn is_known_value_receiver(name: &str) -> bool {
+    matches!(name, "JSON" | "Object" | "Array" | "console" | "Math")
+}
+
+/// Resolves one allowlisted member to its opaque signature, or `None` when
+/// the member is unknown or known-but-uncheckable (see
+/// [`member_shape_decline`]).
+///
+/// Every entry is probe-grounded on tsc 7.0.2 (see the module-level P024
+/// record): single-number `Math` members plus `pow`/`atan2` check fully,
+/// `Array.isArray` checks arity with an accept-all parameter, and
+/// `Object.keys` checks arity with an uncheckable `object` parameter.
+fn opaque_signature(receiver: &str, member: &str) -> Option<OpaqueSig> {
+    match (receiver, member) {
+        ("Array", "isArray") => Some(exact_sig(1, &[(None, "any")])),
+        ("Object", "keys") => Some(exact_sig(1, &[(None, "object")])),
+        ("Math", "floor" | "ceil" | "round" | "trunc" | "abs" | "sqrt" | "cbrt") => {
+            Some(exact_sig(1, &[(Some(TypeStore::NUMBER), "number")]))
+        }
+        ("Math", "pow" | "atan2") => {
+            let number = (Some(TypeStore::NUMBER), "number");
+            Some(exact_sig(2, &[number, number]))
+        }
+        _ => None,
+    }
+}
+
+/// Names the lib reason for one known-but-uncheckable member, or `None` when
+/// the member is unknown (the caller declines those separately).
+///
+/// Every entry is probe-grounded on tsc 7.0.2: `JSON.parse` spells a `1-2`
+/// range arity and a function-typed reviver, `JSON.stringify` spells
+/// `TS2769` overloads, and `console` methods plus `Math.max/min` accept any
+/// argument count (variadic, the rest-arg precedent).
+fn member_shape_decline(receiver: &str, member: &str) -> Option<&'static str> {
+    match (receiver, member) {
+        ("JSON", "parse") => Some("takes a range of arities (1-2 arguments), outside the subset"),
+        ("JSON", "stringify") => Some("overload resolution is outside the subset"),
+        ("console", "warn" | "log" | "error") => {
+            Some("takes variadic arguments, outside the subset")
+        }
+        ("Math", "max" | "min") => Some("takes variadic arguments, outside the subset"),
+        _ => None,
+    }
+}
+
+/// Mutable checking state for one [`check_member_calls`] run, bundled so the
+/// per-site helper stays lean (pedantic arity discipline, mirroring
+/// [`ClassRun`]).
+struct MemberRun<'a> {
+    file: FileId,
+    binder: &'a Binder,
+    report: &'a mut FileReport,
+}
+
+/// Checks every member call site in `calls` against the opaque lib table for
+/// `file`, returning the sorted [`FileReport`].
+///
+/// Member calls never resolve against user declarations: known receivers
+/// route through [`opaque_signature`] into the shared [`emit_call_verdict`]
+/// tail (one family per site, arity first, first mismatch only), and every
+/// other shape declines or skips, never verdicts. Per-site outcomes, in
+/// order:
+///
+/// - Unknown receiver: names already tracked as unresolved references skip
+///   silently (the [`check_calls`] precedent — diagnosing would
+///   double-report one signal); untracked names decline as driver skew.
+/// - Known receiver with an opaque signature: the shared verdict tail.
+/// - Known receiver with an uncheckable shape ([`member_shape_decline`]):
+///   one [`UnsupportedDecl`] with the lib reason.
+/// - Known receiver with an unknown member: one [`UnsupportedDecl`] naming
+///   the member (full lib types are outside the subset).
+///
+/// Spans mirror the oracle through the member identifier: declines anchor at
+/// [`MemberCallSite::member_span`], verdicts through [`VerdictSite`].
+#[must_use]
+pub fn check_member_calls(file: FileId, calls: &[MemberCallSite], binder: &Binder) -> FileReport {
+    let mut report = FileReport::default();
+    let mut run = MemberRun {
+        file,
+        binder,
+        report: &mut report,
+    };
+    for call in calls {
+        check_one_member_call(&mut run, call);
+    }
+    sort_report(run.report);
+    std::mem::take(run.report)
+}
+
+/// Checks one member call site, pushing into the run report.
+///
+/// At most one diagnostic ever fires per call (arity before types, first
+/// mismatch only, via [`emit_call_verdict`]); declines push exactly one
+/// [`UnsupportedDecl`].
+fn check_one_member_call(run: &mut MemberRun<'_>, call: &MemberCallSite) {
+    if !is_known_value_receiver(call.receiver.as_str()) {
+        if run
+            .binder
+            .unresolved()
+            .iter()
+            .any(|entry| entry.file == run.file && entry.name == call.receiver)
+        {
+            // Tracked as an unresolved reference already: skip, never
+            // double-diagnose (the direct-call precedent).
+            return;
+        }
+        run.report.unsupported.push(UnsupportedDecl {
+            file: run.file,
+            span: call.member_span,
+            reason: format!(
+                "member call on undeclared receiver '{}': nothing to check against",
+                call.receiver
+            ),
+        });
+        return;
+    }
+    if let Some(sig) = opaque_signature(call.receiver.as_str(), call.member.as_str()) {
+        // Constructor-built tables keep arity and positions in lockstep; the
+        // shared tail enforces `params.len()`, so this pins coherence.
+        debug_assert_eq!(sig.arity, sig.params.len());
+        let site = VerdictSite {
+            anchor: call.member_span,
+            args: &call.args,
+        };
+        emit_call_verdict(run.file, &site, &sig.params, &mut *run.report);
+        return;
+    }
+    if let Some(reason) = member_shape_decline(call.receiver.as_str(), call.member.as_str()) {
+        decline_member(run, call, reason);
+        return;
+    }
+    decline_member(
+        run,
+        call,
+        &format!(
+            "unknown member '{}' on known value '{}': full lib types are outside the subset",
+            call.member, call.receiver
+        ),
+    );
+}
+
+/// Pushes one member-site [`UnsupportedDecl`] at the member span.
+fn decline_member(run: &mut MemberRun<'_>, call: &MemberCallSite, reason: &str) {
+    run.report.unsupported.push(UnsupportedDecl {
+        file: run.file,
+        span: call.member_span,
+        reason: format!("member call '{}.{}': {reason}", call.receiver, call.member),
+    });
 }
 
 /// One class property: annotation plus initializer shapes for a synthetic
