@@ -26,6 +26,21 @@ feeds real files to `check_program`), so every Pith cell above is the P021
 parse+bind evidence restated, and the v2 1/33 is a projection for the CTO
 to confirm remotely — NEVER read it as a verdict.
 
+## P027 defu end-to-end driver (EXECUTED 2026-09-29, E2B Linux — CONFIRM)
+
+Driver: `crates/pith-solver/tests/e2e_check_real_defu.rs`
+(`real_defu_value_import_verdict`). Fed the 3 pinned defu files to
+`check_program` over a `ModuleGraph` rooted at their corpus-relative
+paths. Remote output: `DEFU_IMPORT_VERDICT: CONFIRM silent (1/33 holds)`.
+
+Per-file executed verdicts (`DEFU_FILE` lines): FileId(0) _utils —
+0 diagnostics + notes (1 unannotated-const note); FileId(1) types —
+0 diagnostics, 0 unsupported; FileId(2) defu.ts — 0 diagnostics,
+17 unsupported (all established reasons: generic `T` params, optional
+`merger` arity, unannotated decls, undeclared `merger`/`currentValue`,
+cross-file `DefuFunction` return). `DEFU_WALL_MS parse_bind=3 check=0`.
+The 1/33 prescan-v2 flip is now EXECUTED, not projected.
+
 ## Heuristic regex census (machine-counted, NOT a classification)
 
 Counts are textual occurrences across each case's files; see
