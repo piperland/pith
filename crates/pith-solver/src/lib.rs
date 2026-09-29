@@ -61,10 +61,10 @@
 //!
 //! Function declarations (P013): [`check_functions`] gates annotatedness
 //! (every identifier parameter plus the return annotation) and body shape
-//! (straight-line single `return` plus the three P023 joins only), then
-//! delegates checkable returns through synthetic [`ConstDecl`]s to the same
-//! primitive/object paths, so `TS2322`/`TS2304`/object-family verdicts match
-//! by construction.
+//! (straight-line single `return`, the three P023 joins, and the P031
+//! straight bodies only), then delegates each checkable position through
+//! synthetic [`ConstDecl`]s to the same primitive/object paths, so
+//! `TS2322`/`TS2304`/object-family verdicts match by construction.
 //! Occurrence nodes for synthetic returns live in a disjoint range (see
 //! `function_occurrence_node`), so consts and functions for one file may
 //! share a [`QueryDb`]. Params, return annotations, and body shapes are
@@ -91,6 +91,28 @@
 //!   `try`, `else-if` chains, `if/else` plus a tail return, `throw`/bare
 //!   branches, `continue`, and bare returns stay [`FunctionBody::Complex`]
 //!   with the control-flow reason.
+//!
+//! Straight-line multi-statement bodies (P031, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p031-probes/`):
+//!
+//! - Leading `const`/`let` declarators plus a terminal literal `return`
+//!   (at most four expanded items; multi-declarator statements expand per
+//!   declarator) check per position through the same synthetic delegation:
+//!   a wrong inner declarator and a wrong tail return each report at their
+//!   own span, independently (`s3`: two `TS2322`s; `s1`/`s2` one each).
+//!   Single-level blocks flatten when every inner statement is
+//!   straight-line (`s6`, `t6`); a lone block holding the terminal return
+//!   checks at the return span (`t1`).
+//! - Unannotated cast-less leading declarators are skipped (tsc infers
+//!   them — `t2` clean), as are nested `function` declarations (checked
+//!   through their own facts — `u2` reports the inner return at its own
+//!   span); `var`, destructured bindings, deeper nesting, non-terminal
+//!   returns, and bodies past the item cap stay [`FunctionBody::Complex`].
+//! - Identifier-initialized leading declarators decline per-position
+//!   (pinned oracle-error divergence: `t3` spells `TS2322` where the
+//!   subset has no value-type facts), and unannotated declined casts still
+//!   diagnose `TS2352` at the operand span (`u3`). Inner object literals
+//!   check through the object path (`t5`).
 //!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
@@ -670,13 +692,68 @@ pub struct FunctionReturn {
     pub cast: Option<CastInput>,
 }
 
+/// One leading `const`/`let` declarator inside a straight-line body.
+///
+/// Driver-mapped from the adapter's [`InnerDeclFact`] (mechanical field
+/// copies, exactly like [`FunctionReturn`]): binder identity plus the
+/// annotation text and the initializer shape. Object initializers park
+/// their shape in `init_object` (always fresh — only direct syntactic
+/// literals carry member facts) with `init` reading `None`; every other
+/// initializer classifies into `init` directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InnerDecl {
+    /// Declarator name, resolved scope-sensitively through the [`Binder`].
+    pub name: String,
+    /// Fallback span, used only when neither `symbol` nor scope-sensitive
+    /// resolution finds the declaration in the [`Binder`].
+    pub span: Span,
+    /// Per-file scope index of the declarator (from the adapter's facts).
+    pub scope: u32,
+    /// Exact binder identity when the driver resolved it (preferred over
+    /// scope-sensitive lookup); must come from the same `file`/`Binder`.
+    pub symbol: Option<SymbolId>,
+    /// `const` vs `let`; same checking rules (mutability unchecked).
+    pub kind: DeclKind,
+    /// Raw annotation text; `None` means unannotated.
+    pub annotation: Option<String>,
+    /// Initializer literal kind; `None` for object literals (whose shape
+    /// lives in `init_object`) or missing initializers.
+    pub init: Option<InitKind>,
+    /// Object-literal members when the initializer is `{ ... }`; `None`
+    /// otherwise.
+    pub init_object: Option<ObjectInit>,
+    /// Outermost assertion facts when the initializer is an `as` /
+    /// `satisfies` / angle assertion (`None` otherwise). Rides the synthetic
+    /// [`ConstDecl`] into [`check_one`], so leading positions share the
+    /// const cast rule exactly.
+    pub cast: Option<CastInput>,
+}
+
+/// A straight-line body: leading declarators plus the terminal return.
+///
+/// Driver-mapped from the adapter's straight [`FunctionBodyFact`] variant
+/// (mechanical field copies). Each position delegates through its own
+/// synthetic [`ConstDecl`] with its own occurrence node, so per-occurrence
+/// join state lives in [`FreshnessTable`] and the [`QueryDb`] memo à la
+/// H-002, and counts/messages match tsc's per-position verdicts (probed
+/// 7.0.2 P031).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StraightBody {
+    /// Leading declarator positions in source order (blocks flattened).
+    pub leading: Vec<InnerDecl>,
+    /// The terminal `return` position.
+    pub tail: FunctionReturn,
+}
+
 /// Body shapes of one function declaration.
 ///
 /// [`FunctionBody::SingleReturn`] plus the three P023 joins check through
 /// the synthetic-const delegation (each return gets its own synthetic
 /// [`ConstDecl`] with its own occurrence node, so per-occurrence join state
 /// lives in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002); the
-/// rest decline to [`UnsupportedDecl`] with distinct reasons.
+/// P031 [`FunctionBody::StraightBody`] delegates each leading declarator
+/// plus the terminal return the same way; the rest decline to
+/// [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
     /// Exactly one statement, `return <expr>;` with an argument.
@@ -691,6 +768,11 @@ pub enum FunctionBody {
     /// Exactly one statement, `if (c) { return A; } else { return B; }`:
     /// tsc checks each branch return independently (probed 7.0.2).
     BranchReturns(JoinedReturns),
+    /// Leading `const`/`let` declarators plus a terminal literal `return`
+    /// (single-level blocks flattened): tsc checks each position
+    /// independently (probed 7.0.2 P031). Each position delegates through
+    /// its own synthetic [`ConstDecl`].
+    StraightBody(StraightBody),
     /// No body node: `declared` tells `declare function` apart from an
     /// overload signature.
     NoBody {
@@ -1033,8 +1115,9 @@ fn sort_report(report: &mut FileReport) {
 /// unrepresentable parameter patterns, unannotated parameters, missing
 /// return annotation, then non-straight-line bodies all decline to
 /// [`UnsupportedDecl`]. Checkable declarations (identifier params all
-/// annotated, return annotated, single literal `return` or one of the three
-/// P023 joins) delegate to the same [`check_one`] path as [`check_file`]
+/// annotated, return annotated, single literal `return`, one of the three
+/// P023 joins, or a P031 straight body) delegate to the same [`check_one`]
+/// path as [`check_file`]
 /// through synthetic [`ConstDecl`]s — one per return position, each with its
 /// own occurrence node, the return literal as initializer, always fresh — so
 /// verdicts and messages match the const/object subset by construction, and
@@ -1043,6 +1126,12 @@ fn sort_report(report: &mut FileReport) {
 /// Occurrence identity lives in a disjoint node range (see
 /// `function_occurrence_node`): consts and functions for one file may share
 /// a [`QueryDb`] without aliasing memo entries.
+///
+/// Driver contract (no double-report): an inner `const` inside a straight
+/// body emits BOTH a `DeclFact` and an inner body position. Never feed one
+/// file to both [`check_file`] and [`check_functions`] (or merge their
+/// reports) without deduplicating inner consts — every current driver
+/// checks exactly one family per file.
 #[must_use]
 pub fn check_functions(
     file: FileId,
@@ -1058,12 +1147,12 @@ pub fn check_functions(
             Ok(shaped) => {
                 for shaped_return in shaped.returns {
                     synth.push(ConstDecl {
-                        name: decl.name.clone(),
-                        span: decl.span,
-                        scope: decl.scope,
-                        symbol: decl.symbol,
-                        kind: DeclKind::Function,
-                        annotation: Some(shaped.annotation.to_owned()),
+                        name: shaped_return.site.name,
+                        span: shaped_return.site.span,
+                        scope: shaped_return.site.scope,
+                        symbol: shaped_return.site.symbol,
+                        kind: shaped_return.site.kind,
+                        annotation: shaped_return.site.annotation,
                         init: shaped_return.kind,
                         init_object: shaped_return.init_object,
                         cast: shaped_return.cast,
@@ -1098,34 +1187,75 @@ pub fn check_functions(
     report
 }
 
-/// One checkable return position: the literal kind plus object members for
-/// its synthetic [`ConstDecl`] (one per checkable join position, in source
+/// Identity plus annotation for one synthetic checkable position:
+/// everything [`check_one`] needs beyond the literal shape. Return
+/// positions reuse the declaration's identity with the return annotation;
+/// straight-body leading positions carry the declarator's own identity
+/// with its own annotation, so per-position diagnostics anchor at their
+/// own spans (probed 7.0.2 P031).
+#[derive(Clone, Debug)]
+struct SynthSite {
+    /// Declared name, resolved scope-sensitively through the [`Binder`].
+    name: String,
+    /// Fallback span, used only when neither `symbol` nor scope-sensitive
+    /// resolution finds the declaration in the [`Binder`].
+    span: Span,
+    /// Per-file scope index of the declarator (from the adapter's facts).
+    scope: u32,
+    /// Exact binder identity when the driver resolved it (preferred over
+    /// scope-sensitive lookup).
+    symbol: Option<SymbolId>,
+    /// `const` vs `let` vs synthetic function return; same checking rules.
+    kind: DeclKind,
+    /// Raw annotation text driving the position's check; `None` means
+    /// unannotated (only leading positions: returns always annotate).
+    annotation: Option<String>,
+}
+
+/// One checkable position: the literal kind plus object members for its
+/// synthetic [`ConstDecl`] (one per checkable join position, in source
 /// order).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct SynthReturn {
-    /// Literal kind; `None` iff the return is an object literal.
+    /// Who and what this position checks.
+    site: SynthSite,
+    /// Literal kind; `None` iff the position is an object literal.
     kind: Option<InitKind>,
-    /// Object-literal members when the return is `{ ... }`; `None` otherwise.
+    /// Object-literal members when the position is `{ ... }`; `None`
+    /// otherwise.
     init_object: Option<ObjectInit>,
     /// Assertion facts riding into the synthetic [`ConstDecl`].
     cast: Option<CastInput>,
 }
 
-/// A checkable function shape: the return annotation text plus one
-/// [`SynthReturn`] per checkable return position (one for straight-line
-/// single returns, two for P023 joins, in source order).
+/// A checkable function shape: one [`SynthReturn`] per checkable position
+/// (one for straight-line single returns, two for P023 joins, leading
+/// declarators plus the tail return for P031 straight bodies — all in
+/// source order).
 #[derive(Debug)]
-struct ShapedBody<'a> {
-    /// Raw return annotation text.
-    annotation: &'a str,
-    /// One synthetic return per checkable position, in source order.
+struct ShapedBody {
+    /// One synthetic position per checkable declaration slot, in source
+    /// order.
     returns: Vec<SynthReturn>,
 }
 
-/// Gates one function declaration: `Ok` carries the [`ShapedBody`] (return
-/// annotation plus one [`SynthReturn`] per checkable position);
+/// The declaration-level identity for return positions: the function's own
+/// name, span, scope, and symbol with the synthetic [`DeclKind::Function`].
+fn return_site(decl: &FunctionDecl, annotation: &str) -> SynthSite {
+    SynthSite {
+        name: decl.name.clone(),
+        span: decl.span,
+        scope: decl.scope,
+        symbol: decl.symbol,
+        kind: DeclKind::Function,
+        annotation: Some(annotation.to_owned()),
+    }
+}
+
+/// Gates one function declaration: `Ok` carries the [`ShapedBody`] (one
+/// [`SynthReturn`] per checkable position, in source order);
 /// `Err` carries the unsupported reason.
-fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody<'_>, String> {
+fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
     if decl.params_complex {
         return Err("non-identifier parameter pattern is outside the subset".to_owned());
     }
@@ -1143,20 +1273,42 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody<'_>, String> {
     };
     let returns = match &decl.body {
         FunctionBody::SingleReturn(body) => {
-            vec![shape_return(body, "return", &decl.name)?]
+            vec![shape_return(body, "return", return_site(decl, annotation))?]
         }
         FunctionBody::SequenceReturns(join) => vec![
-            shape_return(&join.first, "first return", &decl.name)?,
-            shape_return(&join.second, "second return", &decl.name)?,
+            shape_return(&join.first, "first return", return_site(decl, annotation))?,
+            shape_return(&join.second, "second return", return_site(decl, annotation))?,
         ],
         FunctionBody::GuardReturn(join) => vec![
-            shape_return(&join.first, "guard return", &decl.name)?,
-            shape_return(&join.second, "tail return", &decl.name)?,
+            shape_return(&join.first, "guard return", return_site(decl, annotation))?,
+            shape_return(&join.second, "tail return", return_site(decl, annotation))?,
         ],
         FunctionBody::BranchReturns(join) => vec![
-            shape_return(&join.first, "then-branch return", &decl.name)?,
-            shape_return(&join.second, "else-branch return", &decl.name)?,
+            shape_return(
+                &join.first,
+                "then-branch return",
+                return_site(decl, annotation),
+            )?,
+            shape_return(
+                &join.second,
+                "else-branch return",
+                return_site(decl, annotation),
+            )?,
         ],
+        FunctionBody::StraightBody(straight) => {
+            let mut positions = Vec::with_capacity(straight.leading.len().saturating_add(1));
+            for inner in &straight.leading {
+                if let Some(position) = shape_leading(inner) {
+                    positions.push(position);
+                }
+            }
+            positions.push(shape_return(
+                &straight.tail,
+                "tail return",
+                return_site(decl, annotation),
+            )?);
+            positions
+        }
         FunctionBody::NoBody { declared: true } => {
             return Err(format!(
                 "declare function '{}' has no body to check",
@@ -1182,9 +1334,33 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody<'_>, String> {
             ));
         }
     };
-    Ok(ShapedBody {
-        annotation,
-        returns,
+    Ok(ShapedBody { returns })
+}
+
+/// Gates one straight-body leading declarator for the synthetic
+/// [`ConstDecl`]: unannotated cast-less declarators are skipped (tsc
+/// infers them — no verdict exists at that position, probed 7.0.2 P031),
+/// while every other shape delegates (non-literal initializers decline
+/// per-position inside `check_one`, never a partial verdict over the
+/// remaining positions). The impossible kind/member pairs (`Some` +
+/// `Some`, `None` + `None`) pass through into the shared
+/// contradictory/missing unsupported paths in [`check_one`].
+fn shape_leading(inner: &InnerDecl) -> Option<SynthReturn> {
+    if inner.annotation.is_none() && inner.cast.is_none() {
+        return None;
+    }
+    Some(SynthReturn {
+        site: SynthSite {
+            name: inner.name.clone(),
+            span: inner.span,
+            scope: inner.scope,
+            symbol: inner.symbol,
+            kind: inner.kind,
+            annotation: inner.annotation.clone(),
+        },
+        kind: inner.init,
+        init_object: inner.init_object.clone(),
+        cast: inner.cast.clone(),
     })
 }
 
@@ -1195,9 +1371,14 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody<'_>, String> {
 /// [`check_one`], so the gate must not swallow them. The impossible
 /// kind/member pairs (`Some` + `Some`, `None` + `None`) pass through into
 /// the shared contradictory/missing unsupported paths in [`check_one`].
-fn shape_return(body: &FunctionReturn, position: &str, name: &str) -> Result<SynthReturn, String> {
+fn shape_return(
+    body: &FunctionReturn,
+    position: &str,
+    site: SynthSite,
+) -> Result<SynthReturn, String> {
     if body.cast.is_some() {
         return Ok(SynthReturn {
+            site,
             kind: body.kind,
             init_object: body.init_object.clone(),
             cast: body.cast.clone(),
@@ -1205,10 +1386,12 @@ fn shape_return(body: &FunctionReturn, position: &str, name: &str) -> Result<Syn
     }
     if body.kind == Some(InitKind::NonLiteral) {
         return Err(format!(
-            "non-literal {position} in '{name}' is outside the subset"
+            "non-literal {position} in '{}' is outside the subset",
+            site.name
         ));
     }
     Ok(SynthReturn {
+        site,
         kind: body.kind,
         init_object: body.init_object.clone(),
         cast: None,
@@ -2466,9 +2649,11 @@ fn check_generic_decl(
         }
         FunctionBody::SequenceReturns(_)
         | FunctionBody::GuardReturn(_)
-        | FunctionBody::BranchReturns(_) => {
-            // Joined returns over a bare type parameter need per-position
-            // instantiation the subset refuses: decline like complex bodies.
+        | FunctionBody::BranchReturns(_)
+        | FunctionBody::StraightBody(_) => {
+            // Joined and straight returns over a bare type parameter need
+            // per-position instantiation the subset refuses: decline like
+            // complex bodies.
             let _: Option<GenericShape> = decline_to_none(
                 report,
                 file,
