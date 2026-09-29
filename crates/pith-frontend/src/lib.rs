@@ -143,15 +143,16 @@
 //! `const` targets cannot be reassigned, so straight-line refinement stays
 //! sound inside loop bodies.
 //!
-//! Type-parameter facts (P016): each [`FunctionFact`] additionally carries
-//! its declared type-parameter names in source order ([`TypeParamFact`],
-//! empty for non-generic functions). Only plain names feed the solver: any
-//! parameter with a constraint (`<T extends string>`), a default
-//! (`<T = number>`), or a variance/`const` modifier (`in`/`out`/`const T`)
-//! sets `type_params_complex` instead of mis-keying, and the solver declines
-//! those declarations (plus multi-parameter lists and nested `T` positions)
-//! with reasons. No other generic syntax facts: call-site type arguments,
-//! type references, and variance positions are out of scope.
+//! Type-parameter facts (P016, extended P032): each [`FunctionFact`]
+//! additionally carries its declared type-parameter names in source order
+//! ([`TypeParamFact`], empty for non-generic functions) plus each
+//! parameter's verbatim constraint and default texts (`Some("string")` for
+//! `<T extends string>`, `Some("number")` for `<T = number>`, `None` when
+//! absent). The solver admits single parameters bounded by primitives and
+//! declines every other bound shape with a reason. Only `in`/`out`/`const`
+//! modifiers (plus unsliceable names or bounds) set `type_params_complex`
+//! for the solver to decline. No other generic syntax facts: call-site type
+//! arguments, type references, and variance positions are out of scope.
 //!
 //! Interface facts (P017): [`ParsedFile::interfaces`] carries one
 //! [`InterfaceFact`] per `interface` declaration (including `export` and
@@ -289,7 +290,7 @@ use oxc_ast::ast::{
     MethodDefinitionKind, NewExpression, ObjectPropertyKind, Program, PropertyDefinition,
     PropertyDefinitionType, PropertyKey, PropertyKind, ReturnStatement, SimpleAssignmentTarget,
     Statement, StaticBlock, TSEnumDeclaration, TSEnumMemberName, TSInterfaceDeclaration,
-    TSNamespaceDeclaration, TSPropertySignature, TSSignature, TSTypeAliasDeclaration,
+    TSNamespaceDeclaration, TSPropertySignature, TSSignature, TSType, TSTypeAliasDeclaration,
     TSTypeAnnotation, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
     VariableDeclarator,
 };
@@ -513,11 +514,13 @@ pub struct FunctionFact {
     pub params_complex: bool,
     /// Declared type-parameter names in source order (empty for non-generic
     /// functions). Names record even when `type_params_complex` (the solver
-    /// declines on the flag, never on a miscount).
+    /// declines on the flag, never on a miscount); constraint and default
+    /// texts ride each [`TypeParamFact`] for the solver to admit or decline.
     pub type_params: Vec<TypeParamFact>,
-    /// `true` when any type parameter carries a constraint, a default, or
-    /// an `in`/`out`/`const` modifier: the solver declines instead of
-    /// instantiating it.
+    /// `true` when any type parameter carries an `in`/`out`/`const`
+    /// modifier or an unsliceable name or bound: the solver declines
+    /// instead of instantiating it. Plain constraints and defaults are
+    /// facts, not complexity.
     pub type_params_complex: bool,
     /// Raw return annotation text + span; `None` means unannotated.
     pub return_annotation: Option<AnnotationFact>,
@@ -526,16 +529,24 @@ pub struct FunctionFact {
     pub body: FunctionBodyFact,
 }
 
-/// One declared type parameter: its name as written (`T` in `id<T>`).
+/// One declared type parameter: its name plus its bound texts.
 ///
-/// Only the name crosses the boundary (sliced off the parameter's binding
-/// span, exactly like value-parameter names). Constraints, defaults, and
-/// modifiers never become facts — any one of them sets
-/// [`FunctionFact::type_params_complex`] instead.
+/// The name crosses the boundary sliced off the parameter's binding span,
+/// exactly like value-parameter names. The constraint and default cross as
+/// verbatim sliced texts (`Some("string")` for `<T extends string>`,
+/// `Some("number")` for `<T = number>`); each is `None` when absent. An
+/// unsliceable bound (only possible with recovery from parse errors) records
+/// `None` and sets [`FunctionFact::type_params_complex`] instead of
+/// inventing text. Variance/`const` modifiers never become facts — any one
+/// of them sets the complexity flag and the solver declines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeParamFact {
     /// Type-parameter name as written.
     pub name: String,
+    /// Verbatim constraint text; `None` when unconstrained or unsliceable.
+    pub constraint_text: Option<String>,
+    /// Verbatim default text; `None` when absent or unsliceable.
+    pub default_text: Option<String>,
 }
 
 /// One identifier parameter: its name plus whether it carries a type
@@ -1436,15 +1447,30 @@ fn param_annotation_text(
         .map(|fact| fact.text)
 }
 
+/// Slices one type-parameter bound (constraint or default) verbatim.
+///
+/// `None` when the parameter carries no bound; an unsliceable span marks
+/// `complex` (the caller declines) and records `None` rather than inventing
+/// text — the cast-target precedent.
+fn bound_text(source: &str, bound: Option<&TSType<'_>>, complex: &mut bool) -> Option<String> {
+    let bound = bound?;
+    if let Some(text) = slice_at(source, bound.span()) {
+        Some(text.trim().to_owned())
+    } else {
+        *complex = true;
+        None
+    }
+}
+
 /// Collects one function's declared type-parameter names in source order.
 ///
-/// Only plain names feed the solver: any parameter with a constraint
-/// (`<T extends string>`), a default (`<T = number>`), or an `in`/`out`/
-/// `const` modifier sets the complexity flag (the solver declines those
-/// instead of instantiating them). Names still record — the flag, never a
-/// miscount, drives the decline. An unsliceable name (only possible with
-/// recovery from parse errors) sets the flag and records nothing rather
-/// than inventing a key.
+/// Plain constraints and defaults ride each [`TypeParamFact`] as verbatim
+/// texts for the solver to admit (primitives) or decline (anything else).
+/// Only `in`/`out`/`const` modifiers and unsliceable names or bounds set
+/// the complexity flag (the solver declines those instead of instantiating
+/// them). Names still record — the flag, never a miscount, drives modifier
+/// declines. An unsliceable name (only possible with recovery from parse
+/// errors) sets the flag and records nothing rather than inventing a key.
 fn type_param_facts(source: &str, func: &Function<'_>) -> (Vec<TypeParamFact>, bool) {
     let Some(declared) = func.type_parameters.as_deref() else {
         return (Vec::new(), false);
@@ -1455,15 +1481,12 @@ fn type_param_facts(source: &str, func: &Function<'_>) -> (Vec<TypeParamFact>, b
         match slice_at(source, param.name.span) {
             Some(name) => params.push(TypeParamFact {
                 name: name.to_owned(),
+                constraint_text: bound_text(source, param.constraint.as_ref(), &mut complex),
+                default_text: bound_text(source, param.default.as_ref(), &mut complex),
             }),
             None => complex = true,
         }
-        if param.constraint.is_some()
-            || param.default.is_some()
-            || param.r#in
-            || param.out
-            || param.r#const
-        {
+        if param.r#in || param.out || param.r#const {
             complex = true;
         }
     }
@@ -5131,8 +5154,9 @@ export function f(a: string): string { return a + b; }
 
     #[test]
     fn function_facts_type_params_complex_shapes() {
-        // Constraints, defaults, and `const`/`in`/`out` modifiers all set the
-        // flag while still recording their names; multi-parameter lists
+        // Constraints and defaults ride as verbatim texts without the flag
+        // (the solver admits primitives, declines the rest); only
+        // `const`/`in`/`out` modifiers set it. Multi-parameter lists
         // record every name (the solver declines on count, never miscount).
         let src = "function constrained<T extends string>(x: T): T {\n  return x;\n}\n\
                    function defaulted<T = number>(x: T): T {\n  return x;\n}\n\
@@ -5152,16 +5176,47 @@ export function f(a: string): string { return a + b; }
             })
             .collect();
         assert_eq!(names, vec![vec!["T"], vec!["T"], vec!["T"], vec!["T", "U"]]);
-        for fact in &pf.functions[..3] {
-            assert!(
-                fact.type_params_complex,
-                "complex flag for {:?}",
-                fact.type_params
-            );
-        }
+        assert_eq!(
+            pf.functions[0].type_params[0].constraint_text.as_deref(),
+            Some("string")
+        );
+        assert_eq!(pf.functions[0].type_params[0].default_text, None);
+        assert_eq!(pf.functions[1].type_params[0].constraint_text, None);
+        assert_eq!(
+            pf.functions[1].type_params[0].default_text.as_deref(),
+            Some("number")
+        );
+        assert!(!pf.functions[0].type_params_complex);
+        assert!(!pf.functions[1].type_params_complex);
+        assert!(
+            pf.functions[2].type_params_complex,
+            "complex flag for {:?}",
+            pf.functions[2].type_params
+        );
         // Multi-parameter lists record every name without the flag: the
         // solver declines on count, never miscount.
         assert!(!pf.functions[3].type_params_complex);
+    }
+
+    #[test]
+    fn function_facts_type_params_bound_texts_slice_verbatim() {
+        // Non-primitive bounds slice verbatim (never mis-keyed): the solver
+        // declines each shape with its own reason.
+        let src = "function keyed<T extends keyof T>(x: T): T {\n  return x;\n}\n\
+                   function unioned<T extends string | number>(x: T): T {\n  return x;\n}\n";
+        let pf = parse_module(FileId(0), "b.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        assert_eq!(
+            pf.functions[0].type_params[0].constraint_text.as_deref(),
+            Some("keyof T")
+        );
+        assert_eq!(
+            pf.functions[1].type_params[0].constraint_text.as_deref(),
+            Some("string | number")
+        );
+        assert!(!pf.functions[0].type_params_complex);
+        assert!(!pf.functions[1].type_params_complex);
     }
 
     #[test]
