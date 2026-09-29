@@ -47,8 +47,13 @@
 //! divergent return plus a tail return ([`FunctionBodyFact::GuardReturn`]),
 //! and a lone `if/else` with a return in each branch
 //! ([`FunctionBodyFact::BranchReturns`]). Their literal kind + span (plus
-//! member facts for returned `{ ... }` literals) feed the solver; bodies
-//! without a node are
+//! member facts for returned `{ ... }` literals) feed the solver, as do the
+//! P031 straight bodies ([`FunctionBodyFact::StraightBody`]): leading
+//! `const`/`let` declarators (per-declarator identity, annotation, and
+//! initializer facts, plus member facts for `{ ... }` initializers) with a
+//! terminal literal `return`, single-level blocks flattened — each position
+//! checks independently solver-side (probed tsc 7.0.2). Bodies without a
+//! node are
 //! [`FunctionBodyFact::NoBody`], statement-less bodies are
 //! [`FunctionBodyFact::Empty`], and everything else (longer/multi-path
 //! bodies, loops, `switch`, `try`, bare or missing `return`) is
@@ -516,7 +521,8 @@ pub struct FunctionFact {
     pub type_params_complex: bool,
     /// Raw return annotation text + span; `None` means unannotated.
     pub return_annotation: Option<AnnotationFact>,
-    /// Body shape; single returns and the three P023 joins are checkable.
+    /// Body shape; single returns, the three P023 joins, and the P031
+    /// straight bodies are checkable.
     pub body: FunctionBodyFact,
 }
 
@@ -608,11 +614,41 @@ pub struct SingleReturnFact {
     pub cast: Option<CastFact>,
 }
 
+/// One leading `const`/`let` declarator inside a straight-line body.
+///
+/// Carries everything the solver needs for one per-position synthetic
+/// declaration: binder identity (`symbol`/`scope` plus the binding `span`
+/// fallback), the annotation text, and the initializer shape. Object
+/// initializers park their shape in `members` (mirroring
+/// [`SingleReturnFact`]) with `init` reading [`InitKind::NonLiteral`];
+/// every other initializer classifies into `init` directly. `init` is
+/// `None` only when the declarator has no initializer at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InnerDeclFact {
+    /// Declarator name as written.
+    pub name: String,
+    /// Per-file symbol index of the declarator's binding.
+    pub symbol: u32,
+    /// Owning scope (per-file scope index) of [`InnerDeclFact::symbol`].
+    pub scope: u32,
+    /// Span of the binding identifier (the oracle's inner-`TS2322` anchor).
+    pub span: Span,
+    /// `true` for `let` declarators (checked exactly like `const`).
+    pub is_let: bool,
+    /// Raw annotation text + span; `None` means unannotated.
+    pub annotation: Option<AnnotationFact>,
+    /// Initializer literal kind + span (+ cast); `None` means no initializer.
+    pub init: Option<InitFact>,
+    /// Member facts iff the initializer is a representable `{ ... }`.
+    pub members: Option<Vec<ReturnMemberFact>>,
+}
+
 /// Body shape of one function declaration.
 ///
-/// Only [`FunctionBodyFact::SingleReturn`] plus the P023 joins
+/// Only [`FunctionBodyFact::SingleReturn`], the P023 joins
 /// ([`FunctionBodyFact::SequenceReturns`], [`FunctionBodyFact::GuardReturn`],
-/// [`FunctionBodyFact::BranchReturns`]) feed the solver; every other shape
+/// [`FunctionBodyFact::BranchReturns`]), and the P031 straight bodies
+/// ([`FunctionBodyFact::StraightBody`]) feed the solver; every other shape
 /// declines to a solver `UnsupportedDecl` with a distinct reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBodyFact {
@@ -654,12 +690,24 @@ pub enum FunctionBodyFact {
         /// `true` for `declare function` (ambient, never has a body).
         declared: bool,
     },
+    /// A straight-line body: leading `const`/`let` declarators (plus
+    /// independently-checked nested `function` declarations) with a terminal
+    /// literal `return`, at most four items total. Single-level blocks
+    /// flatten one level when every inner statement is straight-line; the
+    /// solver checks each position independently (probed 7.0.2 P031).
+    StraightBody {
+        /// Leading declarator facts in source order (blocks flattened).
+        leading: Vec<InnerDeclFact>,
+        /// The terminal `return`'s expression facts.
+        tail: SingleReturnFact,
+    },
     /// A body with no statements (directives do not count).
     Empty,
     /// Anything else: longer/multi-path bodies, loops, `switch`, `try`,
-    /// `else-if` chains, `if/else` plus a tail return, `throw` or bare
-    /// branches, `continue`, bare or missing `return`, spreads/methods/
-    /// computed keys in a returned literal.
+    /// `else-if` chains, `if/else` plus a tail return, non-terminal returns,
+    /// `throw` or bare branches, `continue`, bare or missing `return`,
+    /// `var` declarators, spreads/methods/computed keys in a returned
+    /// literal.
     Complex,
 }
 
@@ -1966,10 +2014,12 @@ fn return_members(
 /// three P023 joins classify (each return checks independently solver-side,
 /// probed tsc 7.0.2): two sequential returns, an `if`-without-`else`
 /// divergent return plus a tail return, and a lone `if/else` with a return
-/// in each branch. Anything else is [`FunctionBodyFact::Complex`].
+/// in each branch. P031 straight bodies (leading `const`/`let` declarators
+/// plus a terminal literal return, single-level blocks flattened) classify
+/// into [`FunctionBodyFact::StraightBody`]. Anything else is
+/// [`FunctionBodyFact::Complex`].
 fn function_body_fact(
-    source: &str,
-    file: FileId,
+    collector: &DeclCollector<'_>,
     body: Option<&FunctionBody<'_>>,
     declared: bool,
 ) -> FunctionBodyFact {
@@ -1978,14 +2028,14 @@ fn function_body_fact(
     };
     match body.statements.as_slice() {
         [] => FunctionBodyFact::Empty,
-        [Statement::ReturnStatement(ret)] => single_statement_return(source, file, ret),
+        [Statement::ReturnStatement(ret)] => single_statement_return(collector, ret),
         [Statement::IfStatement(it)] => {
-            branch_returns(source, file, it).unwrap_or(FunctionBodyFact::Complex)
+            branch_returns(collector, it).unwrap_or(FunctionBodyFact::Complex)
         }
-        [first, second] => {
-            joined_pair(source, file, first, second).unwrap_or(FunctionBodyFact::Complex)
-        }
-        _ => FunctionBodyFact::Complex,
+        [first, second] => joined_pair(collector, first, second)
+            .or_else(|| straight_body(collector, body.statements.as_slice()))
+            .unwrap_or(FunctionBodyFact::Complex),
+        statements => straight_body(collector, statements).unwrap_or(FunctionBodyFact::Complex),
     }
 }
 
@@ -1993,15 +2043,14 @@ fn function_body_fact(
 /// `return;` and unrepresentable object members decline the whole body to
 /// [`FunctionBodyFact::Complex`] instead of mis-keying.
 fn single_statement_return(
-    source: &str,
-    file: FileId,
+    collector: &DeclCollector<'_>,
     ret: &ReturnStatement<'_>,
 ) -> FunctionBodyFact {
     let Some(argument) = ret.argument.as_ref() else {
         // Bare `return;`: no literal kind to record.
         return FunctionBodyFact::Complex;
     };
-    single_return_fact(source, file, argument)
+    single_return_fact(collector, argument)
         .map_or(FunctionBodyFact::Complex, FunctionBodyFact::SingleReturn)
 }
 
@@ -2012,10 +2061,11 @@ fn single_statement_return(
 /// body [`FunctionBodyFact::Complex`] instead of mis-keying.
 #[must_use]
 fn single_return_fact(
-    source: &str,
-    file: FileId,
+    collector: &DeclCollector<'_>,
     argument: &Expression<'_>,
 ) -> Option<SingleReturnFact> {
+    let source = collector.source;
+    let file = collector.file;
     let span = argument.span();
     let span = Span {
         file,
@@ -2055,26 +2105,254 @@ fn divergent_return_arg<'a>(statement: &'a Statement<'a>) -> Option<&'a Expressi
     }
 }
 
+/// Classifies one const initializer expression into its literal kind.
+///
+/// Only plain literals classify; identifiers other than `undefined` and
+/// every other shape are [`InitKind::NonLiteral`] — expression facts the
+/// adapter does not emit yet. Shared by top-level declarators and
+/// straight-body leading positions so both gates agree.
+fn init_kind(source: &str, expression: &Expression<'_>) -> InitKind {
+    match expression {
+        Expression::NumericLiteral(_) => InitKind::Number,
+        Expression::StringLiteral(_) => InitKind::String,
+        Expression::BooleanLiteral(_) => InitKind::Boolean,
+        Expression::NullLiteral(_) => InitKind::Null,
+        Expression::Identifier(ident) => {
+            if slice_at(source, ident.span).is_some_and(|text| text == "undefined") {
+                InitKind::Undefined
+            } else {
+                InitKind::NonLiteral
+            }
+        }
+        _ => InitKind::NonLiteral,
+    }
+}
+
+/// Maximum expanded items (leading declarators plus skipped nested
+/// `function` declarations plus the terminal return) in a straight body:
+/// multi-declarator statements expand per declarator because tsc verdicts
+/// each declarator independently (probed 7.0.2 P031).
+const MAX_STRAIGHT_ITEMS: usize = 4;
+
+/// Accumulator for one straight-body classification: leading declarator
+/// facts in source order, the count of skipped nested `function`
+/// declarations (toward the item cap), and the terminal return once seen.
+#[derive(Debug, Default)]
+struct StraightAcc {
+    /// Leading declarator facts in source order (blocks flattened).
+    leading: Vec<InnerDeclFact>,
+    /// Skipped nested `function` declarations (checked through their own
+    /// facts, but still statements toward the cap).
+    fns: u32,
+    /// The terminal `return`'s expression facts, once seen.
+    tail: Option<SingleReturnFact>,
+}
+
+/// P031 straight bodies: leading `const`/`let` declarators (plus
+/// skipped nested `function` declarations) with a terminal literal
+/// `return`, at most [`MAX_STRAIGHT_ITEMS`] expanded items. Single-level
+/// blocks flatten one level when every inner statement is straight-line.
+/// Anything else yields `None` (the caller marks the body
+/// [`FunctionBodyFact::Complex`]).
+fn straight_body(
+    collector: &DeclCollector<'_>,
+    statements: &[Statement<'_>],
+) -> Option<FunctionBodyFact> {
+    let mut acc = StraightAcc::default();
+    let last = statements.len().checked_sub(1)?;
+    for (index, statement) in statements.iter().enumerate() {
+        if !expand_statement(collector, &mut acc, statement, index == last) {
+            return None;
+        }
+    }
+    let tail = acc.tail?;
+    let items = acc
+        .leading
+        .len()
+        .saturating_add(usize::try_from(acc.fns).unwrap_or(usize::MAX))
+        .saturating_add(1);
+    if items > MAX_STRAIGHT_ITEMS {
+        return None;
+    }
+    Some(FunctionBodyFact::StraightBody {
+        leading: acc.leading,
+        tail,
+    })
+}
+
+/// Expands one top-level statement: declarations and returns delegate to
+/// the shared [`expand_inner`], while blocks flatten one nesting level.
+/// `terminal` is true only for the last top-level statement.
+fn expand_statement(
+    collector: &DeclCollector<'_>,
+    acc: &mut StraightAcc,
+    statement: &Statement<'_>,
+    terminal: bool,
+) -> bool {
+    match statement {
+        Statement::BlockStatement(block) => expand_block(collector, acc, &block.body, terminal),
+        other => expand_inner(collector, acc, other, terminal),
+    }
+}
+
+/// Expands one nesting level of a block: each inner statement shares the
+/// straight rule, with a `return` parking the tail only when the block is
+/// terminal and the return is its last statement. An empty block yields
+/// false (nothing to expand, and no tail can follow inside it).
+fn expand_block(
+    collector: &DeclCollector<'_>,
+    acc: &mut StraightAcc,
+    body: &[Statement<'_>],
+    terminal: bool,
+) -> bool {
+    let Some(last) = body.len().checked_sub(1) else {
+        return false;
+    };
+    for (index, statement) in body.iter().enumerate() {
+        if !expand_inner(collector, acc, statement, terminal && index == last) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Expands one straight-line statement into the accumulator: `const`/`let`
+/// declarators append positions, named nested `function` declarations count
+/// toward the cap (they check through their own facts), and a terminal
+/// single `return <expr>;` parks the tail. Anything else — deeper blocks,
+/// `var`, control flow, non-terminal or bare returns — yields false.
+fn expand_inner(
+    collector: &DeclCollector<'_>,
+    acc: &mut StraightAcc,
+    statement: &Statement<'_>,
+    terminal: bool,
+) -> bool {
+    match statement {
+        Statement::VariableDeclaration(decl) => expand_declarators(collector, acc, decl),
+        Statement::FunctionDeclaration(func) => {
+            if func.id.as_ref().is_none() {
+                return false;
+            }
+            acc.fns = acc.fns.saturating_add(1);
+            true
+        }
+        Statement::ReturnStatement(ret) => {
+            if !terminal || acc.tail.is_some() {
+                return false;
+            }
+            let Some(argument) = ret.argument.as_ref() else {
+                return false;
+            };
+            let Some(tail) = single_return_fact(collector, argument) else {
+                return false;
+            };
+            acc.tail = Some(tail);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Expands one `const`/`let` declaration statement per declarator (tsc
+/// verdicts each declarator independently — probed 7.0.2 P031). `var`
+/// yields false: hoisting is outside the subset, never silently admitted.
+fn expand_declarators(
+    collector: &DeclCollector<'_>,
+    acc: &mut StraightAcc,
+    decl: &VariableDeclaration<'_>,
+) -> bool {
+    if !matches!(
+        decl.kind,
+        VariableDeclarationKind::Const | VariableDeclarationKind::Let
+    ) {
+        return false;
+    }
+    for declarator in &decl.declarations {
+        let Some(inner) = straight_declarator(collector, declarator, decl.kind) else {
+            return false;
+        };
+        acc.leading.push(inner);
+    }
+    true
+}
+
+/// Classifies one leading declarator into its [`InnerDeclFact`]: binder
+/// identity from the same `(name, start)` keying as [`DeclFact`], the
+/// annotation text verbatim, the initializer kind plus cast, and member
+/// facts for representable `{ ... }` initializers (via [`return_members`]).
+/// Yields `None` for destructured bindings and unkeyed symbols (recovery
+/// only): the caller marks the body [`FunctionBodyFact::Complex`] instead
+/// of mis-keying.
+fn straight_declarator(
+    collector: &DeclCollector<'_>,
+    declarator: &VariableDeclarator<'_>,
+    kind: VariableDeclarationKind,
+) -> Option<InnerDeclFact> {
+    let BindingPattern::BindingIdentifier(binding) = &declarator.id else {
+        return None;
+    };
+    let name = slice_at(collector.source, binding.span)?;
+    let symbol = collector
+        .symbols
+        .get(&(name.to_owned(), binding.span.start))
+        .copied()?;
+    let init = declarator.init.as_ref().map(|expression| {
+        let span = expression.span();
+        InitFact {
+            kind: init_kind(collector.source, expression),
+            span: Span {
+                file: collector.file,
+                lo: span.start,
+                hi: span.end,
+            },
+            cast: cast_fact(collector.source, collector.file, expression),
+        }
+    });
+    let members = match declarator.init.as_ref() {
+        Some(Expression::ObjectExpression(object)) => Some(return_members(
+            collector.source,
+            collector.file,
+            &object.properties,
+        )?),
+        _ => None,
+    };
+    Some(InnerDeclFact {
+        name: name.to_owned(),
+        symbol,
+        scope: collector.scopes.get(&symbol).copied().unwrap_or(u32::MAX),
+        span: Span {
+            file: collector.file,
+            lo: binding.span.start,
+            hi: binding.span.end,
+        },
+        is_let: matches!(kind, VariableDeclarationKind::Let),
+        annotation: declarator
+            .type_annotation
+            .as_ref()
+            .and_then(|ann| annotation_fact(collector.source, collector.file, ann.span)),
+        init,
+        members,
+    })
+}
+
 /// Two-statement bodies beyond straight-line single returns: two sequential
 /// returns, then guard-then-tail. Anything else yields `None` (the caller
 /// marks the body [`FunctionBodyFact::Complex`]).
 #[must_use]
 fn joined_pair(
-    source: &str,
-    file: FileId,
+    collector: &DeclCollector<'_>,
     first: &Statement<'_>,
     second: &Statement<'_>,
 ) -> Option<FunctionBodyFact> {
-    sequence_returns(source, file, first, second)
-        .or_else(|| guard_tail_returns(source, file, first, second))
+    sequence_returns(collector, first, second)
+        .or_else(|| guard_tail_returns(collector, first, second))
 }
 
 /// Two top-level `return <expr>;` statements: tsc checks both, unreachable
 /// or not (probed 7.0.2 P023).
 #[must_use]
 fn sequence_returns(
-    source: &str,
-    file: FileId,
+    collector: &DeclCollector<'_>,
     first: &Statement<'_>,
     second: &Statement<'_>,
 ) -> Option<FunctionBodyFact> {
@@ -2087,8 +2365,8 @@ fn sequence_returns(
     let first_arg = first_ret.argument.as_ref()?;
     let second_arg = second_ret.argument.as_ref()?;
     Some(FunctionBodyFact::SequenceReturns {
-        first: single_return_fact(source, file, first_arg)?,
-        second: single_return_fact(source, file, second_arg)?,
+        first: single_return_fact(collector, first_arg)?,
+        second: single_return_fact(collector, second_arg)?,
     })
 }
 
@@ -2099,8 +2377,7 @@ fn sequence_returns(
 /// tail return is three paths, [`FunctionBodyFact::Complex`].
 #[must_use]
 fn guard_tail_returns(
-    source: &str,
-    file: FileId,
+    collector: &DeclCollector<'_>,
     first: &Statement<'_>,
     second: &Statement<'_>,
 ) -> Option<FunctionBodyFact> {
@@ -2116,8 +2393,8 @@ fn guard_tail_returns(
     };
     let tail_arg = tail.argument.as_ref()?;
     Some(FunctionBodyFact::GuardReturn {
-        guard: single_return_fact(source, file, guard_arg)?,
-        tail: single_return_fact(source, file, tail_arg)?,
+        guard: single_return_fact(collector, guard_arg)?,
+        tail: single_return_fact(collector, tail_arg)?,
     })
 }
 
@@ -2126,7 +2403,7 @@ fn guard_tail_returns(
 /// branches, and missing arguments yield `None` (the caller marks the body
 /// [`FunctionBodyFact::Complex`]).
 #[must_use]
-fn branch_returns(source: &str, file: FileId, it: &IfStatement<'_>) -> Option<FunctionBodyFact> {
+fn branch_returns(collector: &DeclCollector<'_>, it: &IfStatement<'_>) -> Option<FunctionBodyFact> {
     let alternate: &Statement<'_> = it.alternate.as_ref()?;
     if matches!(alternate, Statement::IfStatement(_)) {
         return None;
@@ -2134,8 +2411,8 @@ fn branch_returns(source: &str, file: FileId, it: &IfStatement<'_>) -> Option<Fu
     let then_arg = divergent_return_arg(&it.consequent)?;
     let else_arg = divergent_return_arg(alternate)?;
     Some(FunctionBodyFact::BranchReturns {
-        then_branch: single_return_fact(source, file, then_arg)?,
-        else_branch: single_return_fact(source, file, else_arg)?,
+        then_branch: single_return_fact(collector, then_arg)?,
+        else_branch: single_return_fact(collector, else_arg)?,
     })
 }
 
@@ -2279,22 +2556,8 @@ impl DeclCollector<'_> {
 
         let init = declarator.init.as_ref().map(|expression| {
             let span = expression.span();
-            let kind = match expression {
-                Expression::NumericLiteral(_) => InitKind::Number,
-                Expression::StringLiteral(_) => InitKind::String,
-                Expression::BooleanLiteral(_) => InitKind::Boolean,
-                Expression::NullLiteral(_) => InitKind::Null,
-                Expression::Identifier(ident) => {
-                    if slice_at(self.source, ident.span).is_some_and(|text| text == "undefined") {
-                        InitKind::Undefined
-                    } else {
-                        InitKind::NonLiteral
-                    }
-                }
-                _ => InitKind::NonLiteral,
-            };
             InitFact {
-                kind,
+                kind: init_kind(self.source, expression),
                 span: Span {
                     file: self.file,
                     lo: span.start,
@@ -2400,7 +2663,7 @@ impl DeclCollector<'_> {
             .return_type
             .as_ref()
             .and_then(|ann| annotation_fact(self.source, self.file, ann.span));
-        let body = function_body_fact(self.source, self.file, func.body.as_deref(), func.declare);
+        let body = function_body_fact(self, func.body.as_deref(), func.declare);
         let (type_params, type_params_complex) = type_param_facts(self.source, func);
         self.functions.push(FunctionFact {
             symbol,
@@ -4563,9 +4826,15 @@ export function f(a: string): string { return a + b; }
         assert_eq!(ident.kind, ReturnKind::NonLiteral);
         assert_eq!(slice_of(src, ident.span), "n");
         assert!(ident.members.is_none());
-        // An inner declaration is a statement: the outer body is complex
-        // while the nested declaration still gets its own fact.
-        assert_eq!(pf.functions[5].body, FunctionBodyFact::Complex);
+        // A nested `function` declaration is a skipped straight item (P031):
+        // the outer body admits with no leading positions while the nested
+        // declaration still gets its own fact.
+        let FunctionBodyFact::StraightBody { leading, tail } = &pf.functions[5].body else {
+            panic!("expected straight body, got {:?}", pf.functions[5].body);
+        };
+        assert!(leading.is_empty());
+        assert_eq!(tail.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tail.span), "1");
         let FunctionBodyFact::SingleReturn(inner) = &pf.functions[6].body else {
             panic!("expected single return, got {:?}", pf.functions[6].body);
         };
@@ -4623,6 +4892,106 @@ export function f(a: string): string { return a + b; }
                    function continued(n: number): number {\n  while (n > 0) {\n    n = n - 1;\n\
                    continue;\n  }\n  return n;\n}\n";
         let pf = parse_module(FileId(0), "u.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 8);
+        for fact in &pf.functions {
+            assert_eq!(fact.body, FunctionBodyFact::Complex);
+        }
+    }
+
+    #[test]
+    fn function_facts_straight_body_exact_spans() {
+        let src = "function headed(n: number): number {\n  const x: number = 1;\n  return 1;\n}\n\
+                    function multi(n: number): number {\n  const a: number = 1, b = \"s\";\n\
+                    \n  let c: string = n;\n  return \"ok\";\n}\n";
+        let pf = parse_module(FileId(0), "s.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let FunctionBodyFact::StraightBody { leading, tail } = &pf.functions[0].body else {
+            panic!("expected straight body, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(leading.len(), 1);
+        assert_eq!(leading[0].name, "x");
+        assert!(!leading[0].is_let);
+        assert_eq!(
+            leading[0].annotation.as_ref().map(|ann| ann.text.as_str()),
+            Some("number")
+        );
+        let init = leading[0].init.as_ref().expect("initializer");
+        assert_eq!(init.kind, InitKind::Number);
+        assert_eq!(slice_of(src, init.span), "1");
+        assert!(init.cast.is_none());
+        assert!(leading[0].members.is_none());
+        assert_eq!(slice_of(src, leading[0].span), "x");
+        assert_eq!(tail.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tail.span), "1");
+        // Multi-declarator statements expand per declarator in source
+        // order; unannotated and identifier-initialized declarators still
+        // record (the solver owns the skip/decline policy).
+        let FunctionBodyFact::StraightBody { leading, tail } = &pf.functions[1].body else {
+            panic!("expected straight body, got {:?}", pf.functions[1].body);
+        };
+        assert_eq!(leading.len(), 3);
+        let names: Vec<&str> = leading.iter().map(|inner| inner.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert!(leading[1].annotation.is_none());
+        assert!(leading[2].is_let);
+        let kinds: Vec<InitKind> = leading
+            .iter()
+            .map(|inner| inner.init.as_ref().expect("initializer").kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [InitKind::Number, InitKind::String, InitKind::NonLiteral]
+        );
+        assert_eq!(tail.kind, ReturnKind::String);
+        assert_eq!(slice_of(src, tail.span), "\"ok\"");
+        for inner in leading {
+            let symbol = &pf.symbols[usize::try_from(inner.symbol).expect("dense symbol index")];
+            assert_eq!(symbol.name, inner.name);
+            assert_eq!(symbol.scope, inner.scope);
+        }
+    }
+
+    #[test]
+    fn function_facts_straight_nested_block_flattens() {
+        let src = "function boxed(n: number): number {\n  const a: number = 1;\n  {\n\
+                    const b: string = \"s\";\n  }\n  return 1;\n}\n\
+                    function lone(n: number): number {\n  {\n    return 2;\n  }\n}\n";
+        let pf = parse_module(FileId(0), "b.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let FunctionBodyFact::StraightBody { leading, tail } = &pf.functions[0].body else {
+            panic!("expected straight body, got {:?}", pf.functions[0].body);
+        };
+        let names: Vec<&str> = leading.iter().map(|inner| inner.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(tail.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tail.span), "1");
+        // A lone block holding the terminal return admits with no leading.
+        let FunctionBodyFact::StraightBody { leading, tail } = &pf.functions[1].body else {
+            panic!("expected straight body, got {:?}", pf.functions[1].body);
+        };
+        assert!(leading.is_empty());
+        assert_eq!(tail.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tail.span), "2");
+    }
+
+    #[test]
+    fn function_facts_straight_unadmitted_stay_complex() {
+        let src = "function varied(n: number): number {\n  var x: number = 1;\n  return 1;\n}\n\
+                    function destr(n: number): number {\n  const { a } = { a: 1 };\n  return 1;\n}\n\
+                    function long(n: number): number {\n  const a: number = 1;\n\
+                    const b: number = 2;\n  const c: number = 3;\n  const d: number = 4;\n\
+                    return 1;\n}\n\
+                    function early(n: number): number {\n  return 1;\n  const a: number = 1;\n}\n\
+                    function looped(n: number): number {\n  const a: number = 1;\n\
+                    for (;;) {\n    break;\n  }\n  return 1;\n}\n\
+                    function deep(n: number): number {\n  {\n    {\n      return 1;\n    }\n  }\n}\n\
+                    function leaked(n: number): number {\n  {\n    return 1;\n  }\n  return 2;\n}\n\
+                    function guarded(n: number): number {\n  if (n > 0) {\n    return 1;\n  }\n\
+                    const a: number = 1;\n  return 2;\n}\n";
+        let pf = parse_module(FileId(0), "x.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
         assert_eq!(pf.functions.len(), 8);
         for fact in &pf.functions {
