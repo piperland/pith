@@ -17,5 +17,10 @@ oxc_semantic = "=0.152.0"
 oxc_span = "=0.152.0"
 oxc_syntax = "=0.152.0"
 
+[dev-dependencies]
+# Test-only, mirroring pith-symbols: the corpus smoke test binds real-file
+# facts to prove parse+bind robustness. Never a runtime dep (boundary law).
+pith-symbols = { path = "../pith-symbols" }
+
 [lints]
 workspace = true
