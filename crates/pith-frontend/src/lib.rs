@@ -101,6 +101,19 @@
 //! are declined by the solver; unresolved callees are already tracked as
 //! [`UnresolvedFact`]s, so the solver does not double-report them.
 //!
+//! Cast facts (P025): [`InitFact`], [`CallArgFact`], and [`SingleReturnFact`]
+//! each carry an optional [`CastFact`] for `as` / `satisfies` / angle
+//! assertions (`<T>x` admits and declines exactly like `as`, probed tsc
+//! 7.0.2). The fact records the operand's literal kind plus its span (the
+//! oracle's `TS2352` anchor) and the sliced target text. Only the outermost
+//! assertion records at its position (parentheses peel transparently; nested
+//! casts record at their own spans, so a cast-valued operand reads
+//! [`CastOperandKind::NonLiteral`]). Non-literal operands and unsliceable
+//! targets mark the fact complex — never mis-recorded. Positions without a
+//! cast channel (`new` arguments, class property values, returned-object
+//! members) keep classifying the whole assertion [`InitKind::NonLiteral`],
+//! exactly like any other unmodeled expression.
+//!
 //! Parameter enabling (P014, entailed by the call checker): each
 //! [`FunctionParamFact`] additionally carries its annotation text plus
 //! `optional`/`is_rest` markers. Exact-arity checking needs to decline range
@@ -438,10 +451,16 @@ pub enum InitKind {
 ///
 /// `span` is the initializer expression's own range (`None` on
 /// [`DeclFact::init`] means no initializer at all, e.g. `declare const`).
+/// `cast` carries the outermost `as` / `satisfies` / angle assertion when
+/// the initializer is one (parentheses peel transparently); the `kind`
+/// stays [`InitKind::NonLiteral` either way — the solver evaluates the cast
+/// fact instead of the kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitFact {
     pub kind: InitKind,
     pub span: Span,
+    /// Outermost assertion facts; `None` for non-assertion initializers.
+    pub cast: Option<CastFact>,
 }
 
 /// One `const` declarator's declaration facts, keyed to its symbol.
@@ -571,6 +590,11 @@ pub struct ReturnMemberFact {
 
 /// A straight-line `return <expr>;`: literal kind + span, plus member facts
 /// when the returned expression is an object literal (literal order).
+///
+/// `cast` carries the outermost `as` / `satisfies` / angle assertion when
+/// the returned expression is one (parentheses peel transparently); the
+/// `kind` stays [`ReturnKind::NonLiteral` either way — the solver evaluates
+/// the cast fact instead of the kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SingleReturnFact {
     /// Literal kind of the returned expression (`NonLiteral` for object
@@ -580,6 +604,8 @@ pub struct SingleReturnFact {
     pub span: Span,
     /// Member facts iff the returned expression is `{ ... }`.
     pub members: Option<Vec<ReturnMemberFact>>,
+    /// Outermost assertion facts; `None` for non-assertion returns.
+    pub cast: Option<CastFact>,
 }
 
 /// Body shape of one function declaration.
@@ -664,12 +690,80 @@ pub enum CallArgKind {
 ///
 /// `span` is the argument expression's own range, so the solver anchors
 /// `TS2345`-family diagnostics at the mismatched argument exactly like tsc.
+/// `cast` carries the outermost `as` / `satisfies` / angle assertion when
+/// the argument is one (parentheses peel transparently); the `kind` stays
+/// [`CallArgKind::NonLiteral` either way — the solver evaluates the cast
+/// fact instead of the kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallArgFact {
     /// Literal kind of the argument expression.
     pub kind: CallArgKind,
     /// Span of the argument expression.
     pub span: Span,
+    /// Outermost assertion facts; `None` for non-assertion arguments.
+    pub cast: Option<CastFact>,
+}
+
+/// Which assertion form one [`CastFact`] records.
+///
+/// `as` and angle assertions share the oracle rule (`TS2352` on decline,
+/// probed tsc 7.0.2); `satisfies` declines differ (`TS1360`) and admit
+/// transparently to the operand type instead of the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastKind {
+    /// `expr as T`.
+    As,
+    /// `expr satisfies T`.
+    Satisfies,
+    /// `<T>expr`.
+    Angle,
+}
+
+/// Operand literal kind of a cast expression, mirroring [`CallArgKind`].
+///
+/// Only primitive literals classify; everything else (identifiers, objects,
+/// calls, templates, `-1`, nested casts, …) is
+/// [`CastOperandKind::NonLiteral`]. Deliberately payload-free: the oracle's
+/// `TS2352`/`TS1360` elaborations spell widened names only (probed 7.0.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastOperandKind {
+    /// A numeric literal (`1`, `0x10`, …).
+    Number,
+    /// A string literal (`"ok"`, …).
+    String,
+    /// `true` / `false`.
+    Boolean,
+    /// `null`.
+    Null,
+    /// The `undefined` identifier.
+    Undefined,
+    /// Any non-literal operand: the solver declines the position instead of
+    /// mis-checking it.
+    NonLiteral,
+}
+
+/// One `as` / `satisfies` / angle assertion on a checkable position.
+///
+/// The operand-kind-plus-target pair is the whole contract: literal operands
+/// with sliceable targets feed the solver's admit/decline rule, while
+/// [`CastOperandKind::NonLiteral`] operands and `None` targets mark the fact
+/// complex (unsliceable spans happen only with recovery from parse errors).
+/// `span` is the assertion's own range (paren-exclusive);
+/// [`CastFact::operand_span`] is the operand's range — the oracle's
+/// `TS2352` anchor (probed tsc 7.0.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CastFact {
+    /// Literal kind of the operand (`NonLiteral` marks a complex operand).
+    pub operand_kind: CastOperandKind,
+    /// Sliced target text (`Some("number")`); `None` when the span does not
+    /// slice — also complex.
+    pub target_text: Option<String>,
+    /// Span of the whole assertion expression.
+    pub span: Span,
+    /// Span of the operand expression.
+    pub operand_span: Span,
+    /// Which assertion form.
+    pub kind: CastKind,
 }
 
 /// One direct `f(...)` call's call-site facts.
@@ -1629,6 +1723,65 @@ fn call_arg_kind(source: &str, expression: &Expression<'_>) -> CallArgKind {
     }
 }
 
+/// Classifies one cast operand into its literal kind.
+///
+/// A thin exhaustive map over [`return_kind`] (no duplicated match arms):
+/// the boolean payload is dropped because `TS2352`/`TS1360` messages spell
+/// widened names only (probed 7.0.2) — exactly like call arguments.
+fn cast_operand_kind(source: &str, expression: &Expression<'_>) -> CastOperandKind {
+    match return_kind(source, expression) {
+        ReturnKind::Number => CastOperandKind::Number,
+        ReturnKind::String => CastOperandKind::String,
+        ReturnKind::Boolean(_) => CastOperandKind::Boolean,
+        ReturnKind::Null => CastOperandKind::Null,
+        ReturnKind::Undefined => CastOperandKind::Undefined,
+        ReturnKind::NonLiteral => CastOperandKind::NonLiteral,
+    }
+}
+
+/// Records one cast fact for the outermost `as` / `satisfies` / angle
+/// assertion, or `None` for any other expression.
+///
+/// Parenthesized layers peel transparently (mirroring the `typeof`-guard
+/// transparency); only the outermost assertion records here — the visitor
+/// walk recurses into the operand, so nested casts record at their own
+/// spans and read [`CastOperandKind::NonLiteral`] from the outside. Target
+/// text is the verbatim slice (the solver declines unparseable shapes);
+/// an unsliceable span records `None` rather than inventing text.
+fn cast_fact(source: &str, file: FileId, expression: &Expression<'_>) -> Option<CastFact> {
+    let mut inner = expression;
+    while let Expression::ParenthesizedExpression(parenthesized) = inner {
+        inner = &parenthesized.expression;
+    }
+    let (operand, target, kind) = match inner {
+        Expression::TSAsExpression(cast) => (&cast.expression, &cast.type_annotation, CastKind::As),
+        Expression::TSSatisfiesExpression(cast) => {
+            (&cast.expression, &cast.type_annotation, CastKind::Satisfies)
+        }
+        Expression::TSTypeAssertion(cast) => {
+            (&cast.expression, &cast.type_annotation, CastKind::Angle)
+        }
+        _ => return None,
+    };
+    let span = inner.span();
+    let operand_span = operand.span();
+    Some(CastFact {
+        operand_kind: cast_operand_kind(source, operand),
+        target_text: slice_at(source, target.span()).map(|text| text.trim().to_owned()),
+        span: Span {
+            file,
+            lo: span.start,
+            hi: span.end,
+        },
+        operand_span: Span {
+            file,
+            lo: operand_span.start,
+            hi: operand_span.end,
+        },
+        kind,
+    })
+}
+
 /// Classifies one class property value into its literal kind.
 ///
 /// A thin exhaustive map over [`return_kind`] (no duplicated match arms):
@@ -1875,12 +2028,14 @@ fn single_return_fact(
             kind: ReturnKind::NonLiteral,
             span,
             members: Some(members),
+            cast: None,
         })
     } else {
         Some(SingleReturnFact {
             kind: return_kind(source, argument),
             span,
             members: None,
+            cast: cast_fact(source, file, argument),
         })
     }
 }
@@ -2145,6 +2300,7 @@ impl DeclCollector<'_> {
                     lo: span.start,
                     hi: span.end,
                 },
+                cast: cast_fact(self.source, self.file, expression),
             }
         });
 
@@ -2456,6 +2612,7 @@ impl DeclCollector<'_> {
                     lo: span.start,
                     hi: span.end,
                 },
+                cast: cast_fact(self.source, self.file, expression),
             });
         }
         let callee_span = Span {
@@ -2520,6 +2677,7 @@ impl DeclCollector<'_> {
                     lo: span.start,
                     hi: span.end,
                 },
+                cast: cast_fact(self.source, self.file, expression),
             });
         }
         self.member_calls.push(MemberCallFact {
@@ -3934,6 +4092,79 @@ export function f(a: string): string { return a + b; }
         let init = decl.init.as_ref().expect("initialized");
         assert_eq!(init.kind, InitKind::Number);
         assert_eq!((init.span.lo, init.span.hi), (45, 46));
+    }
+
+    #[test]
+    fn cast_facts_cover_assertion_forms() {
+        // `as` / `satisfies` / angle assertions record operand kind plus
+        // target text plus both spans; parentheses peel transparently and the
+        // initializer kind stays `NonLiteral` either way (offsets
+        // cross-checked with the oxc parser).
+        let src = "const n: number = (1 as number);\n\
+            const s: string = (\"hello\" satisfies string);\n\
+            function sn(x: string): number {\n  return 1;\n}\n\
+            sn((1 as string));\n\
+            const t: number = (<string>1);\n";
+        let pf = parse_module(FileId(4), "t.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 3);
+        let first = pf.decls[0].init.as_ref().expect("initialized");
+        assert_eq!(first.kind, InitKind::NonLiteral);
+        assert_eq!((first.span.lo, first.span.hi), (18, 31));
+        let cast = first.cast.as_ref().expect("cast");
+        assert_eq!(cast.kind, CastKind::As);
+        assert_eq!(cast.operand_kind, CastOperandKind::Number);
+        assert_eq!(cast.target_text.as_deref(), Some("number"));
+        assert_eq!((cast.span.lo, cast.span.hi), (19, 30));
+        assert_eq!((cast.operand_span.lo, cast.operand_span.hi), (19, 20));
+        let second = pf.decls[1].init.as_ref().expect("initialized");
+        let cast = second.cast.as_ref().expect("cast");
+        assert_eq!(cast.kind, CastKind::Satisfies);
+        assert_eq!(cast.operand_kind, CastOperandKind::String);
+        assert_eq!(cast.target_text.as_deref(), Some("string"));
+        assert_eq!((cast.span.lo, cast.span.hi), (52, 76));
+        assert_eq!((cast.operand_span.lo, cast.operand_span.hi), (52, 59));
+        assert_eq!(pf.calls.len(), 1);
+        let arg = &pf.calls[0].args[0];
+        assert_eq!(arg.kind, CallArgKind::NonLiteral);
+        assert_eq!((arg.span.lo, arg.span.hi), (129, 142));
+        let cast = arg.cast.as_ref().expect("cast");
+        assert_eq!(cast.kind, CastKind::As);
+        assert_eq!(cast.operand_kind, CastOperandKind::Number);
+        assert_eq!(cast.target_text.as_deref(), Some("string"));
+        assert_eq!((cast.span.lo, cast.span.hi), (130, 141));
+        assert_eq!((cast.operand_span.lo, cast.operand_span.hi), (130, 131));
+        let third = pf.decls[2].init.as_ref().expect("initialized");
+        let cast = third.cast.as_ref().expect("cast");
+        assert_eq!(cast.kind, CastKind::Angle);
+        assert_eq!(cast.operand_kind, CastOperandKind::Number);
+        assert_eq!(cast.target_text.as_deref(), Some("string"));
+        assert_eq!((cast.span.lo, cast.span.hi), (164, 173));
+        assert_eq!((cast.operand_span.lo, cast.operand_span.hi), (172, 173));
+        let FunctionBodyFact::SingleReturn(ret) = &pf.functions[0].body else {
+            panic!("single return")
+        };
+        assert!(ret.cast.is_none());
+    }
+
+    #[test]
+    fn cast_facts_mark_complex_operands() {
+        // Non-literal operands (identifiers, nested casts) read
+        // `NonLiteral` — never a forced literal kind.
+        let src = "declare const v: number;\n\
+            const a: number = (v as number);\n\
+            const b: number = ((\"x\" as unknown) as number);\n";
+        let pf = parse_module(FileId(5), "u.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let first = pf.decls[1].init.as_ref().expect("initialized");
+        let cast = first.cast.as_ref().expect("cast");
+        assert_eq!(cast.kind, CastKind::As);
+        assert_eq!(cast.operand_kind, CastOperandKind::NonLiteral);
+        assert_eq!(cast.target_text.as_deref(), Some("number"));
+        let second = pf.decls[2].init.as_ref().expect("initialized");
+        let cast = second.cast.as_ref().expect("cast");
+        assert_eq!(cast.operand_kind, CastOperandKind::NonLiteral);
+        assert_eq!(cast.target_text.as_deref(), Some("number"));
     }
 
     #[test]
