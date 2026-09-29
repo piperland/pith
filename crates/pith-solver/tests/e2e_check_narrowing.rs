@@ -19,6 +19,10 @@
 //!   span). Every other shape stays a [`ConstDecl`] and keeps today's
 //!   verdicts — including unannotated identifier inits and non-identifier
 //!   non-literals.
+//! - Unknown targets ride the same driver with no new facts: `declare const
+//!   uv: unknown` maps to a [`ConstDecl`] (annotation text verbatim, no
+//!   init) and `const a: string = uv` to a [`NarrowedUse`] through the
+//!   bare-identifier seam above.
 //! - Guards and decline regions map field-for-field (mechanical, exhaustive).
 //!
 //! Differential rule: oracle lines are `file:TSNNNN: message` plus
@@ -28,9 +32,10 @@
 //! solver probe record), so the baseline fold drops non-header lines and the
 //! comparison runs on sorted `(numeric-code, first-line-message)` multisets
 //! (`TS2322` <-> `PITH2322`) plus the unsupported count. Decline fixtures
-//! (complex/nested/non-typeof guards) assert the designed divergence
-//! instead: zero diagnostics plus recorded decline reasons, with the oracle
-//! baseline kept alongside as the record of what was declined.
+//! (complex/nested/non-typeof guards, genuinely-unknown targets) assert the
+//! designed divergence instead: zero diagnostics plus recorded decline
+//! reasons, with the oracle baseline kept alongside as the record of what
+//! was declined.
 
 use pith_frontend::{parse_module, InitKind as FrontendInitKind, ParsedFile};
 use pith_ids::{FileId, Span, SymbolId};
@@ -367,9 +372,38 @@ refine_test!(
     "early-return.expected.txt",
     1
 );
+refine_test!(
+    unknown_unguarded_matches_ts2322_unknown_spelling,
+    "unknown-unguarded.ts",
+    "unknown-unguarded.expected.txt",
+    1
+);
+refine_test!(
+    unknown_guarded_match_is_silent,
+    "unknown-guarded-match.ts",
+    "unknown-guarded-match.expected.txt",
+    1
+);
+refine_test!(
+    unknown_guarded_mismatch_matches_ts2322,
+    "unknown-guarded-mismatch.ts",
+    "unknown-guarded-mismatch.expected.txt",
+    1
+);
+refine_test!(
+    unknown_to_unknown_is_silent,
+    "unknown-to-unknown.ts",
+    "unknown-to-unknown.expected.txt",
+    1
+);
 decline_test!(complex_guard_is_declined, "complex-guard.ts", 2);
 decline_test!(nested_guard_is_declined, "nested-guard.ts", 2);
 decline_test!(nontypeof_guard_is_declined, "nontypeof-guard.ts", 2);
+decline_test!(
+    genuinely_unknown_is_declined,
+    "unknown-genuinely-unknown.ts",
+    2
+);
 
 #[test]
 fn pipeline_is_deterministic_across_runs() {
