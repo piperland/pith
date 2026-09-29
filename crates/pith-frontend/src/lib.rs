@@ -47,8 +47,9 @@
 //! [`FunctionBodyFact::Empty`], and everything else (multiple returns,
 //! branches, loops, bare or missing `return`) is
 //! [`FunctionBodyFact::Complex`] for the solver to decline. Out of scope, no
-//! facts: function expressions, arrow functions, object and class methods,
-//! accessors, constructors. Anonymous `export default function …` has no
+//! facts: function expressions, arrow functions, object methods (class methods,
+//! accessors, and constructors feed class facts instead — see the class
+//! note). Anonymous `export default function …` has no
 //! binding and is skipped. `this` parameters are not listed in `params`;
 //! parenthesized returns (`return (1)`) classify
 //! [`ReturnKind::NonLiteral`], exactly like const initializers; directives
@@ -208,15 +209,48 @@
 //! for the same decline. Type-only imports/exports (`import type`,
 //! `export type`) record identically to value ones: elision is unobservable
 //! to checking, so no fork exists.
+//!
+//! Class facts (P020): [`ParsedFile::classes`] carries one [`ClassFact`] per
+//! named `class` declaration or named class expression (anonymous classes
+//! have no binding and are skipped, mirroring function declarations), in
+//! visitor (pre-order) order. Symbol linkage reuses the `(name, binding
+//! start)` keying of [`DeclFact`]. Each fact records instance property facts
+//! ([`ClassPropFact`]: name plus colon-stripped annotation text plus the
+//! literal initializer with its span, mirroring const declarators — including
+//! member facts for `{ ... }` values, mirroring returned literals) in source
+//! order, plus the constructor's identifier parameter facts
+//! ([`ClassCtorParamFact`]: names, annotation text, optional/rest markers,
+//! mirroring [`FunctionParamFact`]; `this` parameters are skipped). Only
+//! plain non-static properties with identifier or `#private` keys feed the
+//! solver: static members, computed or non-identifier keys, accessors,
+//! methods, heritage, decorators, index signatures, type parameters,
+//! abstract/declare forms, class expressions, and `this`-assignments each
+//! mark a flag so the solver declines them with reasons instead of
+//! mis-checking. Unannotated properties and properties without initializers
+//! record `None` and decline solver-side (definite assignment needs flow
+//! facts). `readonly`, accessibility, `override`, and `!` need no flag: they
+//! never affect literal assignability (same probe basis as interfaces).
+//!
+//! New facts (P020): [`ParsedFile::news`] carries one [`NewFact`] per
+//! `new C(...)` expression with a plain `Identifier` callee, in visitor
+//! (pre-order) order — the construction-site analogue of [`CallFact`]
+//! (callee name plus identifier span, whole-expression span, one
+//! [`NewArgFact`] per argument). Member callees (`new obj.C()`), calls with
+//! any spread element, and non-identifier callees emit no fact, mirroring
+//! the call exclusions. Constructor bodies are never facts: only parameter
+//! lists feed arity/argument checks, exactly like function declarations.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Class, ExportDeclaration,
-    ExportDefaultDeclaration, Expression, Function, FunctionBody, FunctionType, IfStatement,
-    ObjectPropertyKind, Program, PropertyKey, PropertyKind, Statement, TSEnumDeclaration,
-    TSEnumMemberName, TSInterfaceDeclaration, TSNamespaceDeclaration, TSPropertySignature,
-    TSSignature, TSTypeAliasDeclaration, TSTypeAnnotation, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    Argument, ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingPattern,
+    CallExpression, Class, ClassElement, ClassType, ExportDeclaration, ExportDefaultDeclaration,
+    Expression, Function, FunctionBody, FunctionType, IfStatement, MethodDefinition,
+    MethodDefinitionKind, NewExpression, ObjectPropertyKind, Program, PropertyDefinition,
+    PropertyDefinitionType, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
+    StaticBlock, TSEnumDeclaration, TSEnumMemberName, TSInterfaceDeclaration,
+    TSNamespaceDeclaration, TSPropertySignature, TSSignature, TSTypeAliasDeclaration,
+    TSTypeAnnotation, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -822,6 +856,226 @@ pub struct NamespaceFact {
     pub exported_members: Vec<String>,
 }
 
+/// Literal kind of a class property initializer, mirroring [`ReturnKind`].
+///
+/// A separate type so the boolean payload rides along: fresh boolean members
+/// of `{ ... }` property values spell literally in missing-member
+/// elaborations while every other kind widens (same probe as const objects),
+/// so member facts need the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassPropKind {
+    /// A numeric literal (`1`, `0x10`, …).
+    Number,
+    /// A string literal (`"ok"`, …).
+    String,
+    /// `true` / `false` (payload is the literal value).
+    Boolean(bool),
+    /// `null`.
+    Null,
+    /// The `undefined` identifier.
+    Undefined,
+    /// Any non-literal value (identifier, call, parenthesized, …).
+    NonLiteral,
+}
+
+/// One `{ ... }` member of a class property initializer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassPropMemberFact {
+    /// Member name (identifier keys only; anything else makes the value
+    /// [`ClassPropKind::NonLiteral`]).
+    pub name: String,
+    /// Literal kind of the member value.
+    pub kind: ClassPropKind,
+    /// Span of the member value expression.
+    pub span: Span,
+}
+
+/// Initializer on one class property: literal kind + span, plus member facts
+/// when the value is an object literal (literal order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassPropInitFact {
+    /// Literal kind of the value (`NonLiteral` for object literals, whose
+    /// shape lives in `members`).
+    pub kind: ClassPropKind,
+    /// Span of the value expression.
+    pub span: Span,
+    /// Member facts iff the value is a representable `{ ... }`.
+    pub members: Option<Vec<ClassPropMemberFact>>,
+}
+
+/// One instance property of a `class`: name plus annotation/init facts.
+///
+/// Checkable properties (plain non-static, identifier or `#private` keys)
+/// carry the colon-stripped annotation text (`None` when unannotated) and the
+/// initializer (`None` when absent); the solver checks present literal
+/// initializers against present annotations and declines every other shape.
+/// Member shapes the subset cannot spell — decorated properties, `declare`
+/// and abstract properties — carry a `complex_reason` instead, so the solver
+/// declines with a per-property reason, never a forced verdict. Static,
+/// computed, and non-identifier-keyed properties never reach facts: the
+/// class-level flags cover them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassPropFact {
+    /// Property name as written (`#x` for private identifiers, sliced).
+    pub name: String,
+    /// Colon-stripped annotation text; `None` when unannotated.
+    pub annotation_text: Option<String>,
+    /// Initializer kind + span (+ members for `{ ... }`); `None` when absent.
+    pub init: Option<ClassPropInitFact>,
+    /// Span of the whole property definition.
+    pub span: Span,
+    /// Why this property is outside the subset; `None` when checkable.
+    pub complex_reason: Option<String>,
+}
+
+/// One constructor parameter: name plus annotation facts.
+///
+/// Mirrors [`FunctionParamFact`] field for field: the solver reuses its
+/// call-arity gating for `new` expressions unchanged, so constructor params
+/// check exactly like function params (exact arity, first-mismatch arg
+/// types, range/variadic declines).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassCtorParamFact {
+    /// Parameter name as written.
+    pub name: String,
+    /// Whether the parameter carries a type annotation.
+    pub annotated: bool,
+    /// Raw annotation text (`Some("number")`); `None` when unannotated.
+    pub annotation_text: Option<String>,
+    /// `true` for `b?: number` and defaulted `b: T = …` (arity is a range).
+    pub optional: bool,
+    /// `true` for `...rest: T[]` (variadic).
+    pub is_rest: bool,
+}
+
+/// Whole-declaration form of one `class`: expression, abstract, and declare
+/// markers travel together (at most three flags, so the struct stays lean).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClassForm {
+    /// `true` for class expressions (`ClassType::ClassExpression`).
+    pub is_expression: bool,
+    /// `true` for `abstract class`.
+    pub is_abstract: bool,
+    /// `true` for `declare class` (ambient, never instantiated here).
+    pub is_declare: bool,
+}
+
+/// One out-of-subset family present on a class declaration.
+///
+/// Families travel as a deduplicated list ([`ClassFact::declined`]) instead
+/// of one bool per family, so the fact struct stays lean while every shape
+/// still declines with its own reason solver-side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassFamily {
+    /// Any non-constructor instance method.
+    Methods,
+    /// Any `accessor` property or getter/setter.
+    Accessors,
+    /// Any `extends` clause or `implements` list.
+    Heritage,
+    /// Any static member (properties, methods, blocks).
+    Statics,
+    /// Decorators on the class or any member.
+    Decorators,
+    /// Computed or non-identifier, non-`#private` keys.
+    Computed,
+    /// Any index signature.
+    IndexSignature,
+    /// Any method, constructor, or static-block body assigning or updating
+    /// a `this` member (flow facts the subset refuses).
+    ThisAssignments,
+}
+
+/// One `class` declaration's declaration facts, keyed to its symbol.
+///
+/// `symbol`/`scope` link exactly like [`DeclFact`]: the per-file index of
+/// the [`SymbolFact`] for the class name (matched on name + binding start)
+/// plus that symbol's owning scope. Only named classes produce facts (see
+/// the module-level class note).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassFact {
+    /// Per-file symbol index of the class name binding.
+    pub symbol: u32,
+    /// Owning scope (per-file scope index) of [`ClassFact::symbol`].
+    pub scope: u32,
+    /// Class name as written.
+    pub name: String,
+    /// Span of the whole declaration.
+    pub span: Span,
+    /// Instance property facts in source order.
+    pub properties: Vec<ClassPropFact>,
+    /// Constructor identifier parameters in source order (empty for the
+    /// implicit constructor: `new` then takes 0 arguments).
+    pub ctor_params: Vec<ClassCtorParamFact>,
+    /// `true` when the constructor holds a pattern no name can represent:
+    /// `ctor_params` is then a prefix and the solver declines `new` sites.
+    pub ctor_complex: bool,
+    /// `true` when overload signatures (or several implementations) leave no
+    /// single parameter list: `ctor_params` is empty and the solver declines
+    /// the constructor (properties still check).
+    pub ctor_overloads: bool,
+    /// Out-of-subset families present on the declaration, in first-seen
+    /// order without duplicates (solver declines one note per family).
+    pub declined: Vec<ClassFamily>,
+    /// Whole-declaration form markers.
+    pub form: ClassForm,
+    /// `true` when the class declares type parameters.
+    pub has_type_params: bool,
+}
+
+/// Argument literal kind of a `new C(...)` expression, mirroring
+/// [`CallArgKind`].
+///
+/// Only primitive literals classify; everything else is
+/// [`NewArgKind::NonLiteral`]. Deliberately payload-free: `TS2345`
+/// elaborations spell widened names only (probed 7.0.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewArgKind {
+    /// A numeric literal (`1`, `0x10`, …).
+    Number,
+    /// A string literal (`"ok"`, …).
+    String,
+    /// `true` / `false`.
+    Boolean,
+    /// `null`.
+    Null,
+    /// The `undefined` identifier.
+    Undefined,
+    /// Any non-literal argument (identifier, object, call, …).
+    NonLiteral,
+}
+
+/// One argument of a `new C(...)`: literal kind plus span.
+///
+/// `span` is the argument expression's own range, so the solver anchors
+/// `TS2345`-family diagnostics at the mismatched argument exactly like tsc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewArgFact {
+    /// Literal kind of the argument expression.
+    pub kind: NewArgKind,
+    /// Span of the argument expression.
+    pub span: Span,
+}
+
+/// One `new C(...)` expression's construction-site facts.
+///
+/// `callee_span` is the class-name identifier's own range (too-few-arity
+/// diagnostics anchor here, mirroring tsc); `span` is the whole `new`
+/// expression's range. `args` is source order, one fact per argument —
+/// including non-literals (the solver skips those per-argument, never the
+/// whole site, so arity still checks).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewFact {
+    /// Class name as written.
+    pub class_name: String,
+    /// Span of the class-name identifier.
+    pub callee_span: Span,
+    /// Span of the whole `new` expression.
+    pub span: Span,
+    /// Argument facts in source order.
+    pub args: Vec<NewArgFact>,
+}
+
 /// Everything Pith owns after a frontend pass. Arenas are dropped on return.
 #[derive(Clone, Debug)]
 pub struct ParsedFile {
@@ -863,6 +1117,12 @@ pub struct ParsedFile {
     /// One fact per `namespace`/`module` block, in visitor (pre-order)
     /// order. Empty when the file declares no namespaces.
     pub namespaces: Vec<NamespaceFact>,
+    /// One fact per named `class` declaration or named class expression, in
+    /// visitor (pre-order) order. Empty when the file declares no classes.
+    pub classes: Vec<ClassFact>,
+    /// One fact per direct `new C(...)` expression, in visitor (pre-order)
+    /// order. Empty when the file constructs nothing directly.
+    pub news: Vec<NewFact>,
     /// Parser + semantic diagnostics as plain strings (codes deferred to P008).
     pub errors: Vec<String>,
 }
@@ -902,6 +1162,8 @@ struct DeclCollector<'a> {
     interfaces: Vec<InterfaceFact>,
     enums: Vec<EnumFact>,
     namespaces: Vec<NamespaceFact>,
+    classes: Vec<ClassFact>,
+    news: Vec<NewFact>,
     /// `if` statements enclosing the current visit point: anything above zero
     /// means a nested guard (decline, never refine).
     if_depth: u32,
@@ -1267,6 +1529,147 @@ fn call_arg_kind(source: &str, expression: &Expression<'_>) -> CallArgKind {
         ReturnKind::Null => CallArgKind::Null,
         ReturnKind::Undefined => CallArgKind::Undefined,
         ReturnKind::NonLiteral => CallArgKind::NonLiteral,
+    }
+}
+
+/// Classifies one class property value into its literal kind.
+///
+/// A thin exhaustive map over [`return_kind`] (no duplicated match arms):
+/// the boolean payload is kept because `{ ... }` member facts need tsc's
+/// fresh-literal spelling (same probe as const objects).
+fn class_prop_kind(source: &str, expression: &Expression<'_>) -> ClassPropKind {
+    match return_kind(source, expression) {
+        ReturnKind::Number => ClassPropKind::Number,
+        ReturnKind::String => ClassPropKind::String,
+        ReturnKind::Boolean(value) => ClassPropKind::Boolean(value),
+        ReturnKind::Null => ClassPropKind::Null,
+        ReturnKind::Undefined => ClassPropKind::Undefined,
+        ReturnKind::NonLiteral => ClassPropKind::NonLiteral,
+    }
+}
+
+/// Classifies one `new C(...)` argument into its literal kind.
+///
+/// A thin exhaustive map over [`return_kind`] (no duplicated match arms):
+/// the boolean payload is dropped because `TS2345` messages spell widened
+/// names only (probed 7.0.2) — exactly like call arguments.
+fn new_arg_kind(source: &str, expression: &Expression<'_>) -> NewArgKind {
+    match return_kind(source, expression) {
+        ReturnKind::Number => NewArgKind::Number,
+        ReturnKind::String => NewArgKind::String,
+        ReturnKind::Boolean(_) => NewArgKind::Boolean,
+        ReturnKind::Null => NewArgKind::Null,
+        ReturnKind::Undefined => NewArgKind::Undefined,
+        ReturnKind::NonLiteral => NewArgKind::NonLiteral,
+    }
+}
+
+/// Names one class property key: identifier keys verbatim, `#private` keys
+/// sliced whole, anything else `None` (the caller marks the class
+/// [`ClassFact::has_computed`] instead of mis-keying).
+fn class_prop_key_name(source: &str, key: &PropertyKey<'_>) -> Option<String> {
+    match key {
+        PropertyKey::StaticIdentifier(found) => slice_at(source, found.span).map(str::to_owned),
+        PropertyKey::PrivateIdentifier(found) => slice_at(source, found.span()).map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// Classifies a `{ ... }` class property value into member facts (literal
+/// order), or `None` when a member is unrepresentable (spread, method,
+/// accessor, computed or non-identifier key): the caller degrades the value
+/// to [`ClassPropKind::NonLiteral`] instead of mis-keying.
+fn class_prop_members(
+    source: &str,
+    file: FileId,
+    properties: &[ObjectPropertyKind<'_>],
+) -> Option<Vec<ClassPropMemberFact>> {
+    let mut members = Vec::with_capacity(properties.len());
+    for property in properties {
+        let ObjectPropertyKind::ObjectProperty(member) = property else {
+            return None;
+        };
+        if member.method || member.computed || member.kind != PropertyKind::Init {
+            return None;
+        }
+        let PropertyKey::StaticIdentifier(key) = &member.key else {
+            return None;
+        };
+        let name = slice_at(source, key.span)?;
+        let span = member.value.span();
+        members.push(ClassPropMemberFact {
+            name: name.to_owned(),
+            kind: class_prop_kind(source, &member.value),
+            span: Span {
+                file,
+                lo: span.start,
+                hi: span.end,
+            },
+        });
+    }
+    Some(members)
+}
+
+/// Whether `object` is a bare `this`: the instance test for `this`-targets.
+fn member_of_this(object: &Expression<'_>) -> bool {
+    matches!(object, Expression::ThisExpression(_))
+}
+
+/// Whether a simple assignment target writes a `this` member (`this.x`,
+/// `this.#x`, `this[k]`): the precise `this`-assignment test for classes.
+fn is_this_simple_target(target: &SimpleAssignmentTarget<'_>) -> bool {
+    match target {
+        SimpleAssignmentTarget::ComputedMemberExpression(member) => member_of_this(&member.object),
+        SimpleAssignmentTarget::StaticMemberExpression(member) => member_of_this(&member.object),
+        SimpleAssignmentTarget::PrivateFieldExpression(member) => member_of_this(&member.object),
+        _ => false,
+    }
+}
+
+/// Whether an assignment target writes a `this` member: destructuring
+/// patterns are never `this`-writes (only the three member shapes qualify).
+fn is_this_target(target: &AssignmentTarget<'_>) -> bool {
+    match target {
+        AssignmentTarget::ComputedMemberExpression(member) => member_of_this(&member.object),
+        AssignmentTarget::StaticMemberExpression(member) => member_of_this(&member.object),
+        AssignmentTarget::PrivateFieldExpression(member) => member_of_this(&member.object),
+        _ => false,
+    }
+}
+
+/// Scans method, constructor, and static-block bodies for `this`-member
+/// writes (`this.x = …`, `this.#x++`, …).
+///
+/// Nested functions, methods, and classes bind their own `this` (or none),
+/// so the scan never descends into them — only arrow functions inherit the
+/// enclosing instance and stay transparent. Reports presence only: the flag
+/// ([`ClassFact::has_this_assignments`]) declines solver-side.
+#[derive(Debug, Default)]
+struct ThisAssignScan {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for ThisAssignScan {
+    fn visit_function(&mut self, _it: &Function<'a>, _flags: ScopeFlags) {
+        // Own `this` binding (or none): never the enclosing instance.
+    }
+
+    fn visit_class(&mut self, _it: &Class<'a>) {
+        // Nested class bodies assign their own instances, never the outer.
+    }
+
+    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        if is_this_target(&it.left) {
+            self.found = true;
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+
+    fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
+        if is_this_simple_target(&it.argument) {
+            self.found = true;
+        }
+        walk::walk_update_expression(self, it);
     }
 }
 
@@ -1847,6 +2250,433 @@ impl DeclCollector<'_> {
         });
     }
 
+    /// Records one `new C(...)` expression when the callee is a plain
+    /// identifier.
+    ///
+    /// Anything else emits no fact, never a wrong one: member callees
+    /// (`new obj.C()`), every other non-identifier callee, and any spread
+    /// element (`new C(...xs)`) fail the gates (arity is unknowable without
+    /// expression facts). Unclassifiable arguments still occupy their
+    /// position as [`NewArgKind::NonLiteral`] so arity checks keep working.
+    fn record_new(&mut self, it: &NewExpression<'_>) {
+        let Expression::Identifier(ident) = &it.callee else {
+            return;
+        };
+        if it.arguments.iter().any(Argument::is_spread) {
+            return;
+        }
+        let mut args = Vec::with_capacity(it.arguments.len());
+        for argument in &it.arguments {
+            // Only `SpreadElement` converts to `None`, already excluded
+            // above: this skips rather than mis-records on skew.
+            let Some(expression) = argument.as_expression() else {
+                return;
+            };
+            let span = expression.span();
+            args.push(NewArgFact {
+                kind: new_arg_kind(self.source, expression),
+                span: Span {
+                    file: self.file,
+                    lo: span.start,
+                    hi: span.end,
+                },
+            });
+        }
+        let callee_span = Span {
+            file: self.file,
+            lo: ident.span.start,
+            hi: ident.span.end,
+        };
+        self.news.push(NewFact {
+            class_name: ident.name.to_string(),
+            callee_span,
+            span: Span {
+                file: self.file,
+                lo: it.span.start,
+                hi: it.span.end,
+            },
+            args,
+        });
+    }
+
+    /// Collects one constructor's identifier parameters in source order.
+    ///
+    /// Mirrors [`DeclCollector::record_function`]'s parameter loop field for
+    /// field (names, annotated-ness, annotation text, optional/rest
+    /// markers): constructor params check exactly like function params. A
+    /// `this` parameter is skipped (it names the receiver, never an
+    /// argument); any other non-identifier pattern sets `complex` and stops
+    /// the list rather than mis-keying.
+    fn record_ctor_params(&self, func: &Function<'_>) -> (Vec<ClassCtorParamFact>, bool) {
+        let mut params = Vec::new();
+        let mut complex = false;
+        for item in &func.params.items {
+            let BindingPattern::BindingIdentifier(binding) = &item.pattern else {
+                complex = true;
+                break;
+            };
+            let Some(param) = slice_at(self.source, binding.span) else {
+                complex = true;
+                break;
+            };
+            if param == "this" {
+                continue;
+            }
+            params.push(ClassCtorParamFact {
+                name: param.to_owned(),
+                annotated: item.type_annotation.is_some(),
+                annotation_text: param_annotation_text(
+                    self.source,
+                    self.file,
+                    item.type_annotation.as_deref(),
+                ),
+                // A defaulted `b: T = …` widens arity to a range exactly
+                // like `b?: T`, so both mark `optional` for the new checker.
+                optional: item.optional || item.initializer.is_some(),
+                is_rest: false,
+            });
+        }
+        if !complex {
+            if let Some(rest) = func.params.rest.as_ref() {
+                match &rest.rest.argument {
+                    BindingPattern::BindingIdentifier(binding) => {
+                        match slice_at(self.source, binding.span) {
+                            Some(param) => params.push(ClassCtorParamFact {
+                                name: param.to_owned(),
+                                annotated: rest.type_annotation.is_some(),
+                                annotation_text: param_annotation_text(
+                                    self.source,
+                                    self.file,
+                                    rest.type_annotation.as_deref(),
+                                ),
+                                optional: false,
+                                is_rest: true,
+                            }),
+                            None => {
+                                complex = true;
+                            }
+                        }
+                    }
+                    _ => {
+                        complex = true;
+                    }
+                }
+            }
+        }
+        (params, complex)
+    }
+
+    /// Builds the initializer fact for one class property value: literal
+    /// kind + span, plus member facts for representable `{ ... }` values.
+    /// Unrepresentable object values degrade to [`ClassPropKind::NonLiteral`]
+    /// (the solver declines those) instead of mis-keying.
+    fn class_prop_init(&self, value: &Expression<'_>) -> ClassPropInitFact {
+        let span = value.span();
+        let span = Span {
+            file: self.file,
+            lo: span.start,
+            hi: span.end,
+        };
+        if let Expression::ObjectExpression(object) = value {
+            let members = class_prop_members(self.source, self.file, &object.properties);
+            // `Some` members ride along for the object path; `None` (a
+            // spread, method, or computed key inside) is still a
+            // `NonLiteral` value — never a wrong member list.
+            return ClassPropInitFact {
+                kind: ClassPropKind::NonLiteral,
+                span,
+                members,
+            };
+        }
+        ClassPropInitFact {
+            kind: class_prop_kind(self.source, value),
+            span,
+            members: None,
+        }
+    }
+
+    /// Records one declined class property: real span, recorded name, reason.
+    ///
+    /// Every uncheckable property shape funnels here so none is ever
+    /// silently dropped; the solver quotes `complex_reason` in its
+    /// per-property decline.
+    fn declined_class_prop(&mut self, span: Span, name: String, reason: String) {
+        if let Some(fact) = self.classes.last_mut() {
+            fact.properties.push(ClassPropFact {
+                name,
+                annotation_text: None,
+                init: None,
+                span,
+                complex_reason: Some(reason),
+            });
+        }
+    }
+
+    /// Builds the shell of one [`ClassFact`]: symbol linkage plus the
+    /// whole-declaration flags (heritage, decorators, type parameters,
+    /// expression/abstract/declare forms). Element flags and facts accumulate
+    /// on the pushed fact as the body walk proceeds.
+    fn new_class_fact(
+        file: FileId,
+        symbol: u32,
+        scope: u32,
+        name: &str,
+        it: &Class<'_>,
+    ) -> ClassFact {
+        let span = it.span;
+        ClassFact {
+            symbol,
+            scope,
+            name: name.to_owned(),
+            span: Span {
+                file,
+                lo: span.start,
+                hi: span.end,
+            },
+            properties: Vec::new(),
+            ctor_params: Vec::new(),
+            ctor_complex: false,
+            ctor_overloads: false,
+            declined: {
+                let mut declined = Vec::new();
+                if it.heritage.is_some() || !it.implements.is_empty() {
+                    declined.push(ClassFamily::Heritage);
+                }
+                if !it.decorators.is_empty() {
+                    declined.push(ClassFamily::Decorators);
+                }
+                declined
+            },
+            form: ClassForm {
+                is_expression: matches!(it.r#type, ClassType::ClassExpression),
+                is_abstract: it.r#abstract,
+                is_declare: it.declare,
+            },
+            has_type_params: it.type_parameters.is_some(),
+        }
+    }
+
+    /// Records one named class declaration or named class expression.
+    ///
+    /// Symbol linkage reuses the `(name, binding start)` keying of
+    /// [`DeclFact`]: anonymous classes have no binding and are skipped
+    /// (mirroring function declarations). Instance properties, constructor
+    /// parameters, and out-of-subset shapes record per the module-level
+    /// class note; constructor bodies and method bodies are never facts
+    /// (only the `this`-assignment scan reads them).
+    fn record_class(&mut self, it: &Class<'_>) {
+        let Some(id) = it.id.as_ref() else {
+            return;
+        };
+        let Some(name) = slice_at(self.source, id.span) else {
+            return;
+        };
+        self.note_exported(name);
+        let Some(&symbol) = self.symbols.get(&(name.to_owned(), id.span.start)) else {
+            // No matching symbol (only possible with recovery from parse
+            // errors): skip rather than invent a key.
+            return;
+        };
+        let scope = self.scopes.get(&symbol).copied().unwrap_or(u32::MAX);
+        let file = self.file;
+        self.classes
+            .push(Self::new_class_fact(file, symbol, scope, name, it));
+        // Constructor overload state: `None` before the first constructor,
+        // `Some(false)` past one body-bearing implementation, `Some(true)`
+        // once overload signatures (or a second implementation) remove the
+        // single parameter list.
+        let mut overloaded: Option<bool> = None;
+        for element in &it.body.body {
+            self.record_class_element(element, &mut overloaded);
+        }
+        if overloaded == Some(true) {
+            if let Some(fact) = self.classes.last_mut() {
+                fact.ctor_params.clear();
+                fact.ctor_complex = false;
+                fact.ctor_overloads = true;
+            }
+        }
+    }
+
+    /// Records one out-of-subset family on the open [`ClassFact`],
+    /// deduplicated (families repeat across members; notes fire once each).
+    fn decline_family(&mut self, family: ClassFamily) {
+        if let Some(fact) = self.classes.last_mut() {
+            if !fact.declined.contains(&family) {
+                fact.declined.push(family);
+            }
+        }
+    }
+
+    /// Records one class body element against the open [`ClassFact`].
+    ///
+    /// Bundles the element plus the constructor-overload state so the
+    /// per-element helper stays lean; every shape lands in a property fact
+    /// or a class flag, never nowhere.
+    fn record_class_element(&mut self, element: &ClassElement<'_>, overloaded: &mut Option<bool>) {
+        match element {
+            ClassElement::StaticBlock(block) => {
+                self.decline_family(ClassFamily::Statics);
+                self.scan_this_assignments_block(block);
+            }
+            ClassElement::MethodDefinition(def) => {
+                self.record_method_definition(def, overloaded);
+            }
+            ClassElement::PropertyDefinition(def) => {
+                self.record_property_definition(def);
+            }
+            ClassElement::AccessorProperty(accessor) => {
+                let mut scan = ThisAssignScan::default();
+                if let Some(value) = accessor.value.as_ref() {
+                    scan.visit_expression(value);
+                }
+                let found = scan.found;
+                self.decline_family(ClassFamily::Accessors);
+                if accessor.r#static {
+                    self.decline_family(ClassFamily::Statics);
+                }
+                if !accessor.decorators.is_empty() {
+                    self.decline_family(ClassFamily::Decorators);
+                }
+                if found {
+                    self.decline_family(ClassFamily::ThisAssignments);
+                }
+            }
+            ClassElement::TSIndexSignature(_) => {
+                self.decline_family(ClassFamily::IndexSignature);
+            }
+        }
+    }
+
+    /// Scans one static block body for `this`-member writes.
+    fn scan_this_assignments_block(&mut self, block: &StaticBlock<'_>) {
+        let mut scan = ThisAssignScan::default();
+        scan.visit_static_block(block);
+        if scan.found {
+            self.decline_family(ClassFamily::ThisAssignments);
+        }
+    }
+
+    /// Records one method definition: kind flags, constructor parameters, or
+    /// the constructor-overload state — plus the `this`-assignment scan over
+    /// the body when one exists.
+    fn record_method_definition(
+        &mut self,
+        def: &MethodDefinition<'_>,
+        overloaded: &mut Option<bool>,
+    ) {
+        let mut scan = ThisAssignScan::default();
+        if let Some(body) = def.value.body.as_deref() {
+            scan.visit_function_body(body);
+        }
+        let found = scan.found;
+        if !def.decorators.is_empty() {
+            self.decline_family(ClassFamily::Decorators);
+        }
+        if found {
+            self.decline_family(ClassFamily::ThisAssignments);
+        }
+        if def.r#static {
+            // Static methods fold into statics only: one family, one note.
+            self.decline_family(ClassFamily::Statics);
+            return;
+        }
+        if class_prop_key_name(self.source, &def.key).is_none() {
+            self.decline_family(ClassFamily::Computed);
+            return;
+        }
+        match def.kind {
+            MethodDefinitionKind::Constructor => {
+                self.record_constructor(def, overloaded);
+            }
+            MethodDefinitionKind::Method => {
+                self.decline_family(ClassFamily::Methods);
+            }
+            MethodDefinitionKind::Get | MethodDefinitionKind::Set => {
+                self.decline_family(ClassFamily::Accessors);
+            }
+        }
+    }
+
+    /// Records one constructor toward the single parameter list.
+    ///
+    /// The first body-bearing implementation feeds `ctor_params`; any
+    /// body-less overload signature (or a second implementation) flips the
+    /// overload state so the class declines constructor checking while its
+    /// properties still check.
+    fn record_constructor(&mut self, def: &MethodDefinition<'_>, overloaded: &mut Option<bool>) {
+        if def.value.body.is_none() {
+            *overloaded = Some(true);
+            return;
+        }
+        if overloaded.is_some() {
+            *overloaded = Some(true);
+            return;
+        }
+        let (params, complex) = self.record_ctor_params(&def.value);
+        if let Some(fact) = self.classes.last_mut() {
+            fact.ctor_params = params;
+            fact.ctor_complex = complex;
+        }
+        *overloaded = Some(false);
+    }
+
+    /// Records one instance property definition.
+    ///
+    /// Static properties fold into [`ClassFact::has_statics`]; computed and
+    /// non-identifier keys into [`ClassFact::has_computed`]; decorated,
+    /// `declare`, and abstract properties decline per-property with a reason.
+    /// Everything else records name, annotation text, and initializer facts.
+    fn record_property_definition(&mut self, def: &PropertyDefinition<'_>) {
+        if def.r#static {
+            self.decline_family(ClassFamily::Statics);
+            if !def.decorators.is_empty() {
+                self.decline_family(ClassFamily::Decorators);
+            }
+            return;
+        }
+        let prop_span = Span {
+            file: self.file,
+            lo: def.span.start,
+            hi: def.span.end,
+        };
+        let Some(prop_name) = class_prop_key_name(self.source, &def.key) else {
+            self.decline_family(ClassFamily::Computed);
+            return;
+        };
+        if !def.decorators.is_empty() {
+            self.declined_class_prop(
+                prop_span,
+                prop_name.clone(),
+                format!("decorated property '{prop_name}' is outside the subset"),
+            );
+            self.decline_family(ClassFamily::Decorators);
+            return;
+        }
+        if def.declare || !matches!(def.r#type, PropertyDefinitionType::PropertyDefinition) {
+            self.declined_class_prop(
+                prop_span,
+                prop_name.clone(),
+                format!("declare or abstract property '{prop_name}' is outside the subset"),
+            );
+            return;
+        }
+        let annotation = def
+            .type_annotation
+            .as_ref()
+            .and_then(|ann| annotation_fact(self.source, self.file, ann.span));
+        let init = def.value.as_ref().map(|value| self.class_prop_init(value));
+        if let Some(fact) = self.classes.last_mut() {
+            fact.properties.push(ClassPropFact {
+                name: prop_name,
+                annotation_text: annotation.map(|ann| ann.text),
+                init,
+                span: prop_span,
+                complex_reason: None,
+            });
+        }
+    }
+
     /// Records one `if` statement: a [`TypeofGuardFact`] for top-level simple
     /// typeof guards, otherwise a [`DeclineRegionFact`] over the whole
     /// statement (never a wrong guard fact).
@@ -2012,15 +2842,12 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
 
     fn visit_class(&mut self, it: &Class<'a>) {
         // Named classes count for namespace visibility (their qualified
-        // uses decline as non-types solver-side); anonymous class
-        // expressions carry no member name. The scope-membership guard
-        // keeps expression-local names from ever matching.
-        if let Some(id) = it.id.as_ref() {
-            if let Some(name) = slice_at(self.source, id.span) {
-                self.note_exported(name);
-            }
-        }
-        // Keep walking: static blocks and computed keys nest declarators.
+        // uses decline as non-types solver-side); recording covers named
+        // declarations and named expressions, while anonymous class
+        // expressions carry no member name (mirroring function declarations).
+        self.record_class(it);
+        // Keep walking: static blocks and computed keys nest declarators,
+        // and nested classes/new expressions carry their own facts.
         walk::walk_class(self, it);
     }
 
@@ -2052,6 +2879,13 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
         // Keep walking: arguments nest further calls (`f(g(1))` yields a fact
         // per call) and declarations inside them.
         walk::walk_call_expression(self, it);
+    }
+
+    fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
+        self.record_new(it);
+        // Keep walking: arguments nest further constructions (`new C(new D())`
+        // yields a fact per site) and declarations inside them.
+        walk::walk_new_expression(self, it);
     }
 }
 
@@ -2167,6 +3001,8 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         interfaces: collected.interfaces,
         enums: collected.enums,
         namespaces: collected.namespaces,
+        classes: collected.classes,
+        news: collected.news,
         errors,
     }
 }
@@ -2367,6 +3203,8 @@ struct CollectedFacts {
     interfaces: Vec<InterfaceFact>,
     enums: Vec<EnumFact>,
     namespaces: Vec<NamespaceFact>,
+    classes: Vec<ClassFact>,
+    news: Vec<NewFact>,
 }
 
 /// Runs the targeted declarator walk and returns owned facts.
@@ -2405,6 +3243,8 @@ fn collect_decls<'a>(
         interfaces: Vec::new(),
         enums: Vec::new(),
         namespaces: Vec::new(),
+        classes: Vec::new(),
+        news: Vec::new(),
         if_depth: 0,
         fn_depth: 0,
         export_depth: 0,
@@ -2420,6 +3260,8 @@ fn collect_decls<'a>(
         interfaces,
         mut namespaces,
         enums,
+        classes,
+        news,
         ..
     } = collector;
     assign_namespace_body_scopes(scopes, symbols, &mut namespaces);
@@ -2432,6 +3274,8 @@ fn collect_decls<'a>(
         interfaces,
         enums,
         namespaces,
+        classes,
+        news,
     }
 }
 
@@ -4014,5 +4858,130 @@ export function f(a: string): string { return a + b; }
         }
         assert!(!fact.exported_members.contains(&"Hid".to_owned()));
         assert_eq!(pf.namespaces[1].name, "N");
+    }
+
+    #[test]
+    fn class_facts_record_properties_ctor_and_flags() {
+        let src = "class C {\nx: number = 1;\n#priv: string = \"ok\";\nbare = 2;\nempty: boolean;\nstatic s: number = 3;\nconstructor(a: number, b?: string) {}\nm(): void {}\nget g(): number { return 1; }\n}\n";
+        let pf = parse_module(FileId(0), "c.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.classes.len(), 1);
+        let fact = &pf.classes[0];
+        assert_eq!(fact.name, "C");
+        assert_eq!(fact.span.file, FileId(0));
+        assert!(fact.span.lo < fact.span.hi);
+        // Instance properties record in order; statics never reach facts.
+        let names: Vec<&str> = fact.properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["x", "#priv", "bare", "empty"]);
+        assert_eq!(
+            fact.properties[0].annotation_text.as_deref(),
+            Some("number")
+        );
+        assert!(matches!(
+            fact.properties[0].init.as_ref().map(|init| init.kind),
+            Some(ClassPropKind::Number)
+        ));
+        assert_eq!(
+            fact.properties[1].annotation_text.as_deref(),
+            Some("string")
+        );
+        assert!(fact.properties[2].annotation_text.is_none());
+        assert!(fact.properties[3].init.is_none());
+        for prop in &fact.properties {
+            assert!(prop.complex_reason.is_none());
+            assert_eq!(prop.span.file, FileId(0));
+            assert!(prop.span.lo < prop.span.hi);
+            if let Some(init) = prop.init.as_ref() {
+                assert_eq!(init.span.file, FileId(0));
+                assert!(init.span.lo < init.span.hi);
+            }
+        }
+        // Constructor params mirror function params; methods/getters/statics
+        // mark flags.
+        assert_eq!(fact.ctor_params.len(), 2);
+        assert_eq!(fact.ctor_params[0].name, "a");
+        assert_eq!(
+            fact.ctor_params[0].annotation_text.as_deref(),
+            Some("number")
+        );
+        assert!(!fact.ctor_params[0].optional);
+        assert!(fact.ctor_params[1].optional);
+        assert!(!fact.ctor_complex && !fact.ctor_overloads);
+        assert!(fact.declined.contains(&ClassFamily::Methods));
+        assert!(fact.declined.contains(&ClassFamily::Accessors));
+        assert!(fact.declined.contains(&ClassFamily::Statics));
+        assert!(!fact.declined.contains(&ClassFamily::Heritage));
+        assert!(!fact.declined.contains(&ClassFamily::Computed));
+        assert!(!fact.declined.contains(&ClassFamily::Decorators));
+        assert!(!fact.declined.contains(&ClassFamily::IndexSignature));
+        assert!(!fact.has_type_params);
+        assert!(!fact.declined.contains(&ClassFamily::ThisAssignments));
+        assert_eq!(
+            fact.form,
+            ClassForm {
+                is_expression: false,
+                is_abstract: false,
+                is_declare: false,
+            }
+        );
+        // Symbol linkage matches the class binding.
+        let symbol = &pf.symbols[usize::try_from(fact.symbol).expect("dense symbol index")];
+        assert_eq!(symbol.name, "C");
+        assert_eq!(fact.scope, symbol.scope);
+    }
+
+    #[test]
+    fn class_facts_cover_heritage_this_assignments_and_object_values() {
+        let src = "class B {}\nclass D extends B {\npoint: { x: number } = { x: 1 };\nconstructor(v: number) { this.point = { x: v }; }\n}\n";
+        let pf = parse_module(FileId(0), "d.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.classes.len(), 2);
+        assert!(!pf.classes[0].declined.contains(&ClassFamily::Heritage));
+        let fact = &pf.classes[1];
+        assert_eq!(fact.name, "D");
+        assert!(fact.declined.contains(&ClassFamily::Heritage));
+        assert!(fact.declined.contains(&ClassFamily::ThisAssignments));
+        assert_eq!(fact.properties.len(), 1);
+        let init = fact.properties[0].init.as_ref().expect("object value");
+        assert!(matches!(init.kind, ClassPropKind::NonLiteral));
+        let members = init.members.as_ref().expect("member facts");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "x");
+        assert!(matches!(members[0].kind, ClassPropKind::Number));
+    }
+
+    #[test]
+    fn class_facts_decline_expression_and_abstract_forms() {
+        let src = "const K = class Named {\nx: number = \"oops\";\n};\nabstract class A {\ny: number = 1;\n}\n";
+        let pf = parse_module(FileId(0), "e.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.classes.len(), 2);
+        assert_eq!(pf.classes[0].name, "Named");
+        assert!(pf.classes[0].form.is_expression);
+        assert!(!pf.classes[0].form.is_abstract);
+        assert_eq!(pf.classes[1].name, "A");
+        assert!(pf.classes[1].form.is_abstract);
+        assert!(!pf.classes[1].form.is_expression);
+    }
+
+    #[test]
+    fn new_facts_record_sites_and_exclude_shapes() {
+        let src = "declare const C: unknown;\nconst a = new C(1, \"ok\");\nconst b = new C();\nconst c = new obj.C(1);\nconst xs = [1];\nconst d = new C(...xs);\n";
+        let pf = parse_module(FileId(0), "n.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.news.len(), 2);
+        let first = &pf.news[0];
+        assert_eq!(first.class_name, "C");
+        assert_eq!(first.callee_span.file, FileId(0));
+        assert!(first.callee_span.lo < first.callee_span.hi);
+        assert_eq!(first.span.file, FileId(0));
+        assert!(first.span.lo <= first.callee_span.lo);
+        let kinds: Vec<NewArgKind> = first.args.iter().map(|arg| arg.kind).collect();
+        assert_eq!(kinds, [NewArgKind::Number, NewArgKind::String]);
+        for arg in &first.args {
+            assert_eq!(arg.span.file, FileId(0));
+            assert!(arg.span.lo < arg.span.hi);
+        }
+        assert!(pf.news[1].args.is_empty());
     }
 }
