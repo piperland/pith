@@ -115,6 +115,7 @@ fn decls_from_handfed(
                         .collect(),
                     fresh: true,
                 }),
+                cast: None,
             }
         })
         .collect()

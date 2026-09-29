@@ -170,6 +170,7 @@ fn narrowing_inputs_from_facts(
             annotation,
             init,
             init_object: None,
+            cast: None,
         });
     }
     let guards = parsed

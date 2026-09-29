@@ -100,6 +100,7 @@ fn member_calls_from_facts(parsed: &ParsedFile) -> Vec<MemberCallSite> {
                 .map(|arg| CallArg {
                     kind: map_member_arg_kind(arg.kind),
                     span: arg.span,
+                    cast: None,
                 })
                 .collect(),
         })

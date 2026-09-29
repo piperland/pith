@@ -128,6 +128,7 @@ fn decls_from_handfed(
                             .collect(),
                         fresh: true,
                     }),
+                    cast: None,
                 },
                 init_text: spec.init_text.map(str::to_owned),
                 cross_file_deps: Vec::new(),

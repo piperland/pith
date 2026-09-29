@@ -125,7 +125,11 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     } else {
         Some(map_return_kind(ret.kind))
     };
-    FunctionReturn { kind, init_object }
+    FunctionReturn {
+        kind,
+        init_object,
+        cast: None,
+    }
 }
 
 /// Maps one joined frontend return pair to the solver's joined shape.

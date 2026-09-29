@@ -257,6 +257,7 @@ fn news_from_facts(parsed: &ParsedFile) -> Vec<NewSite> {
                 .map(|arg| CallArg {
                     kind: map_new_arg_kind(arg.kind),
                     span: arg.span,
+                    cast: None,
                 })
                 .collect(),
         })
