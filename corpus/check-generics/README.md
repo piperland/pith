@@ -18,10 +18,21 @@ kept in the baselines and folded by the differential, like check-narrowing).
 | defaulted-declined.ts | clean | 1 UNSUPPORTED |
 | union-member-declined.ts | 1x TS2322 (`Type 'string | T' …`) | 1 UNSUPPORTED |
 | object-member-declined.ts | 1x TS2322 (`Type 'T' … '{ v: T; }'`) | 1 UNSUPPORTED |
+| constrained-correct.ts | clean | silent calls (constraint satisfied) + 1 UNSUPPORTED (body) |
+| constrained-wrong.ts | 1x TS2345 (inferred `number` vs constraint) + 1x TS2344 (explicit `number` violates) | 1x PITH2345 + 1x PITH2344 + 1 UNSUPPORTED (body) |
+| defaulted-correct.ts | clean | silent calls (inferred `number`; explicit `string` overrides) + 1 UNSUPPORTED (body) |
+| defaulted-inference-override.ts | 1x TS2345 (explicit `string` vs defaulted `number`) | 1x PITH2345 + 1 UNSUPPORTED (body) |
+| conditional-return-declined.ts | 1x TS2322 on the body | 1 UNSUPPORTED (conditional return) |
+| keyof-param-declined.ts | 1x TS2322 on the body (+ elaboration) | 1 UNSUPPORTED (keyof parameter) |
+| mapped-return-declined.ts | 1x TS2353 on the body | 1 UNSUPPORTED (mapped return) |
 
-Differential: 2/2 diagnostic pairs match on the checkable subset
-(explicit-wrong TS2345, inferred-wrong TS2322-first-line); 8/8 divergences
-pinned explicitly. No generic declaration is ever decl-silent, by tsc's own
+Differential: 5 diagnostic pairs match (explicit-wrong TS2345,
+inferred-wrong TS2322-first-line, constrained-wrong TS2345 + TS2344,
+defaulted-override TS2345); 4 clean admission matches
+(explicit/inferred/constrained/defaulted-correct); 9 declined fixtures
+pin their divergence explicitly (inference-failure, multi-param,
+constrained/defaulted-declined, union, object, keyof, conditional,
+mapped). No generic declaration is ever decl-silent, by tsc's own
 rule: literal bodies always fail against bare `T`, and pass-through
 (`return x`) bodies need expression facts the adapter does not emit — so
 every oracle-clean fixture pins a decline, never a false match.

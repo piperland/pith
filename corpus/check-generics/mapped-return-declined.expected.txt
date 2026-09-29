@@ -1,0 +1,1 @@
+mapped-return-declined.ts:TS2353: Object literal may only specify known properties, and 'v' does not exist in type '{ [K in keyof T]: T[K]; }'.

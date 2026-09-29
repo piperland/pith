@@ -1,0 +1,2 @@
+constrained-wrong.ts:TS2345: Argument of type 'number' is not assignable to parameter of type 'string'.
+constrained-wrong.ts:TS2344: Type 'number' does not satisfy the constraint 'string'.

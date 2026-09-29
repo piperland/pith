@@ -1,0 +1,2 @@
+keyof-param-declined.ts:TS2322: Type 'keyof T' is not assignable to type 'T'.
+  'T' could be instantiated with an arbitrary type which could be unrelated to 'keyof T'.
