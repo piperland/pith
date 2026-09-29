@@ -17,8 +17,9 @@ case while `*-shared`/`*-mid` baselines pin the supporting files clean.
 | missing-main.ts (+ missing-shared.ts) | 1x TS2305 (at `NOPE`) + 1x TS2307 (at the specifier) | 1x PITH2305 at the imported-name span + 1x PITH2307 at the specifier span |
 | chain-main.ts (+ chain-mid.ts, chain-shared.ts) | clean | silent (named re-exports resolve transitively) |
 | barrel-main.ts (+ barrel-index.ts, barrel-shared.ts) | clean | silent (`export *` barrels resolve transitively) |
+| checked-main.ts (+ checked-utils.ts, checked-types.ts) | 1x TS2322 (`Type 'string' …`) + 1x TS2345 (`Argument of type 'string' …`) | 1x PITH2322 at the declarator + 1x PITH2345 at the argument; imported const/function/interface/enum values with correct types check clean |
 
-Differential: 5/5 match on the checkable subset (3 silent/clean +
+Differential: 6/6 match on the checkable subset (4 silent/clean +
 2 diagnostic pairs). Probe rules (tsc 7.0.2, recorded in `pith-solver`
 docs): `TS2305` anchors at the imported name (one per binding, nothing at
 uses), `TS2307` fires once per statement at the specifier, re-export chains
@@ -29,5 +30,8 @@ Out of scope (declined with reasons, unit-pinned in
 `e2e_check_multifile.rs`; no corpus fixture): default/namespace imports,
 namespace re-exports, ambiguous star exports, re-export cycles, non-relative
 specifiers (node_modules, tsconfig-paths), value uses of imported types
-(oracle `TS2693`), function-typed value uses, and non-literal cross-file
-initializers.
+(oracle `TS2693`), function-typed value uses, non-literal cross-file
+initializers, and failed `import type` resolutions (type aliases emit no
+facts, so diagnosing would risk false verdicts where tsc stays clean —
+a pinned divergence; value imports keep the exact `PITH2305`/`PITH2307`
+mirrors).
