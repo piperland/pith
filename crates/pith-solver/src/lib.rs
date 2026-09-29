@@ -61,14 +61,36 @@
 //!
 //! Function declarations (P013): [`check_functions`] gates annotatedness
 //! (every identifier parameter plus the return annotation) and body shape
-//! (straight-line single `return` only), then delegates checkable returns
-//! through synthetic [`ConstDecl`]s to the same primitive/object paths, so
-//! `TS2322`/`TS2304`/object-family verdicts match by construction.
+//! (straight-line single `return` plus the three P023 joins only), then
+//! delegates checkable returns through synthetic [`ConstDecl`]s to the same
+//! primitive/object paths, so `TS2322`/`TS2304`/object-family verdicts match
+//! by construction.
 //! Occurrence nodes for synthetic returns live in a disjoint range (see
 //! `function_occurrence_node`), so consts and functions for one file may
 //! share a [`QueryDb`]. Params, return annotations, and body shapes are
 //! fact-fed from the adapter's function declarator facts; only the
 //! literal-kind enum mapping is driver-side (mechanical and exhaustive).
+//!
+//! Straight-line joins (P023, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p023-probes/`):
+//!
+//! - `return "a"; return "b";` against `: number` reports two `TS2322`s, one
+//!   per return; `return 1; return "b";` still reports the second and
+//!   `return "a"; return 2;` the first only (unreachable returns still
+//!   check). Each admitted return delegates through its own synthetic
+//!   [`ConstDecl`] with its own occurrence node, so counts and first-line
+//!   messages match by construction.
+//! - `if/else` with a return in each branch reports per branch (one side
+//!   wrong reports once; both wrong report twice).
+//! - `if (c) return <e>; return <t>;` reports per position (a wrong guard
+//!   return and a wrong tail return each report at their own line), for
+//!   `typeof` guards and plain conditions alike — returns check
+//!   independently of narrowing, so any condition qualifies.
+//! - A non-literal position declines the whole declaration with a
+//!   position-naming reason (never a partial verdict); loops, `switch`,
+//!   `try`, `else-if` chains, `if/else` plus a tail return, `throw`/bare
+//!   branches, `continue`, and bare returns stay [`FunctionBody::Complex`]
+//!   with the control-flow reason.
 //!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
@@ -550,12 +572,25 @@ pub struct FunctionReturn {
 
 /// Body shapes of one function declaration.
 ///
-/// Only [`FunctionBody::SingleReturn`] is checkable; the rest decline to
-/// [`UnsupportedDecl`] with distinct reasons.
+/// [`FunctionBody::SingleReturn`] plus the three P023 joins check through
+/// the synthetic-const delegation (each return gets its own synthetic
+/// [`ConstDecl`] with its own occurrence node, so per-occurrence join state
+/// lives in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002); the
+/// rest decline to [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
     /// Exactly one statement, `return <expr>;` with an argument.
     SingleReturn(FunctionReturn),
+    /// Exactly two statements, `return <expr>;` twice: tsc checks both
+    /// (unreachable or not — probed 7.0.2, see the module probe record).
+    SequenceReturns(JoinedReturns),
+    /// Exactly two statements, `if (c) <divergent return>;` with no `else`
+    /// plus a trailing `return <expr>;`: tsc checks the guard-branch return
+    /// and the tail return independently (probed 7.0.2).
+    GuardReturn(JoinedReturns),
+    /// Exactly one statement, `if (c) { return A; } else { return B; }`:
+    /// tsc checks each branch return independently (probed 7.0.2).
+    BranchReturns(JoinedReturns),
     /// No body node: `declared` tells `declare function` apart from an
     /// overload signature.
     NoBody {
@@ -564,9 +599,27 @@ pub enum FunctionBody {
     },
     /// A body with no statements.
     Empty,
-    /// Anything else: multiple returns, branches, loops, bare or missing
-    /// `return`.
+    /// Anything else: longer/multi-path bodies, loops, `switch`, `try`,
+    /// `else-if` chains, `if/else` plus a tail return, `throw`/bare
+    /// branches, `continue`, bare or missing `return`.
     Complex,
+}
+
+/// Two checkable returns sharing one return annotation (P023 joins).
+///
+/// Driver-mapped from the adapter's joined [`FunctionBodyFact`] variants
+/// (mechanical field copies, each return exactly like [`FunctionReturn`]).
+/// Field order is source order; which end is the guard/tail or then/else
+/// branch is fixed by the enclosing [`FunctionBody`] variant. Each return
+/// delegates through its own synthetic [`ConstDecl`] with its own occurrence
+/// node (see [`check_functions`]), so join state stays per-occurrence
+/// (H-002) and counts/messages match tsc's per-return verdicts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinedReturns {
+    /// The first return in source order (guard return / then-branch return).
+    pub first: FunctionReturn,
+    /// The second return in source order (tail return / else-branch return).
+    pub second: FunctionReturn,
 }
 
 /// One `function name(params): ret` declaration to check.
@@ -595,7 +648,7 @@ pub struct FunctionDecl {
     pub params_complex: bool,
     /// Raw return annotation text; `None` means unannotated.
     pub return_annotation: Option<String>,
-    /// Body shape; only [`FunctionBody::SingleReturn`] is checkable.
+    /// Body shape; single returns and the three P023 joins are checkable.
     pub body: FunctionBody,
 }
 
@@ -699,10 +752,12 @@ fn sort_report(report: &mut FileReport) {
 /// unrepresentable parameter patterns, unannotated parameters, missing
 /// return annotation, then non-straight-line bodies all decline to
 /// [`UnsupportedDecl`]. Checkable declarations (identifier params all
-/// annotated, return annotated, single literal `return`) delegate to the
-/// same [`check_one`] path as [`check_file`] through a synthetic
-/// [`ConstDecl`] — the return literal as initializer, always fresh — so
-/// verdicts and messages match the const/object subset by construction.
+/// annotated, return annotated, single literal `return` or one of the three
+/// P023 joins) delegate to the same [`check_one`] path as [`check_file`]
+/// through synthetic [`ConstDecl`]s — one per return position, each with its
+/// own occurrence node, the return literal as initializer, always fresh — so
+/// verdicts and messages match the const/object subset by construction, and
+/// per-return counts match tsc's per-return verdicts (probed 7.0.2).
 ///
 /// Occurrence identity lives in a disjoint node range (see
 /// `function_occurrence_node`): consts and functions for one file may share
@@ -719,16 +774,20 @@ pub fn check_functions(
     for decl in decls {
         let span = binder_span_for(binder, file, &decl.name, decl.scope, decl.symbol, decl.span);
         match function_shape(decl) {
-            Ok((annotation, kind, init_object)) => synth.push(ConstDecl {
-                name: decl.name.clone(),
-                span: decl.span,
-                scope: decl.scope,
-                symbol: decl.symbol,
-                kind: DeclKind::Function,
-                annotation: Some(annotation.to_owned()),
-                init: kind,
-                init_object,
-            }),
+            Ok(shaped) => {
+                for shaped_return in shaped.returns {
+                    synth.push(ConstDecl {
+                        name: decl.name.clone(),
+                        span: decl.span,
+                        scope: decl.scope,
+                        symbol: decl.symbol,
+                        kind: DeclKind::Function,
+                        annotation: Some(shaped.annotation.to_owned()),
+                        init: shaped_return.kind,
+                        init_object: shaped_return.init_object,
+                    });
+                }
+            }
             Err(reason) => report
                 .unsupported
                 .push(UnsupportedDecl { file, span, reason }),
@@ -757,12 +816,32 @@ pub fn check_functions(
     report
 }
 
-/// Gates one function declaration: `Ok` carries the return annotation text,
-/// return literal kind, and object members for the synthetic [`ConstDecl`];
+/// One checkable return position: the literal kind plus object members for
+/// its synthetic [`ConstDecl`] (one per checkable join position, in source
+/// order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SynthReturn {
+    /// Literal kind; `None` iff the return is an object literal.
+    kind: Option<InitKind>,
+    /// Object-literal members when the return is `{ ... }`; `None` otherwise.
+    init_object: Option<ObjectInit>,
+}
+
+/// A checkable function shape: the return annotation text plus one
+/// [`SynthReturn`] per checkable return position (one for straight-line
+/// single returns, two for P023 joins, in source order).
+#[derive(Debug)]
+struct ShapedBody<'a> {
+    /// Raw return annotation text.
+    annotation: &'a str,
+    /// One synthetic return per checkable position, in source order.
+    returns: Vec<SynthReturn>,
+}
+
+/// Gates one function declaration: `Ok` carries the [`ShapedBody`] (return
+/// annotation plus one [`SynthReturn`] per checkable position);
 /// `Err` carries the unsupported reason.
-fn function_shape(
-    decl: &FunctionDecl,
-) -> Result<(&str, Option<InitKind>, Option<ObjectInit>), String> {
+fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody<'_>, String> {
     if decl.params_complex {
         return Err("non-identifier parameter pattern is outside the subset".to_owned());
     }
@@ -778,8 +857,22 @@ fn function_shape(
             decl.name
         ));
     };
-    let body = match &decl.body {
-        FunctionBody::SingleReturn(body) => body,
+    let returns = match &decl.body {
+        FunctionBody::SingleReturn(body) => {
+            vec![shape_return(body, "return", &decl.name)?]
+        }
+        FunctionBody::SequenceReturns(join) => vec![
+            shape_return(&join.first, "first return", &decl.name)?,
+            shape_return(&join.second, "second return", &decl.name)?,
+        ],
+        FunctionBody::GuardReturn(join) => vec![
+            shape_return(&join.first, "guard return", &decl.name)?,
+            shape_return(&join.second, "tail return", &decl.name)?,
+        ],
+        FunctionBody::BranchReturns(join) => vec![
+            shape_return(&join.first, "then-branch return", &decl.name)?,
+            shape_return(&join.second, "else-branch return", &decl.name)?,
+        ],
         FunctionBody::NoBody { declared: true } => {
             return Err(format!(
                 "declare function '{}' has no body to check",
@@ -805,13 +898,27 @@ fn function_shape(
             ));
         }
     };
+    Ok(ShapedBody {
+        annotation,
+        returns,
+    })
+}
+
+/// Gates one return position for the synthetic [`ConstDecl`]: non-literal
+/// returns decline the whole declaration with a position-naming reason
+/// (never a partial verdict over the remaining positions). The impossible
+/// kind/member pairs (`Some` + `Some`, `None` + `None`) pass through into
+/// the shared contradictory/missing unsupported paths in [`check_one`].
+fn shape_return(body: &FunctionReturn, position: &str, name: &str) -> Result<SynthReturn, String> {
     if body.kind == Some(InitKind::NonLiteral) {
         return Err(format!(
-            "non-literal return in '{}' is outside the subset",
-            decl.name
+            "non-literal {position} in '{name}' is outside the subset"
         ));
     }
-    Ok((annotation, body.kind, body.init_object.clone()))
+    Ok(SynthReturn {
+        kind: body.kind,
+        init_object: body.init_object.clone(),
+    })
 }
 
 /// One call-site argument: literal kind plus span.
@@ -1753,6 +1860,21 @@ fn check_generic_decl(
             );
         }
         FunctionBody::Complex => {
+            let _: Option<GenericShape> = decline_to_none(
+                report,
+                file,
+                span,
+                format!(
+                    "complex body on '{}': control flow is outside the subset",
+                    decl.name
+                ),
+            );
+        }
+        FunctionBody::SequenceReturns(_)
+        | FunctionBody::GuardReturn(_)
+        | FunctionBody::BranchReturns(_) => {
+            // Joined returns over a bare type parameter need per-position
+            // instantiation the subset refuses: decline like complex bodies.
             let _: Option<GenericShape> = decline_to_none(
                 report,
                 file,
@@ -6024,6 +6146,53 @@ mod tests {
         })
     }
 
+    /// One literal return position for join tests.
+    fn lit(kind: InitKind) -> FunctionReturn {
+        FunctionReturn {
+            kind: Some(kind),
+            init_object: None,
+        }
+    }
+
+    /// One object-literal return position for join tests (always fresh: only
+    /// direct syntactic literals carry member facts).
+    fn obj(members: Vec<(&str, ObjectMemberKind)>) -> FunctionReturn {
+        FunctionReturn {
+            kind: None,
+            init_object: Some(ObjectInit {
+                members: members
+                    .into_iter()
+                    .map(|(name, kind)| ObjectMemberInit {
+                        name: name.to_owned(),
+                        kind,
+                    })
+                    .collect(),
+                fresh: true,
+            }),
+        }
+    }
+
+    /// Two sequential returns for join tests.
+    fn sequence(first: FunctionReturn, second: FunctionReturn) -> FunctionBody {
+        FunctionBody::SequenceReturns(JoinedReturns { first, second })
+    }
+
+    /// A guard-then-tail join for join tests.
+    fn guard_join(guard: FunctionReturn, tail: FunctionReturn) -> FunctionBody {
+        FunctionBody::GuardReturn(JoinedReturns {
+            first: guard,
+            second: tail,
+        })
+    }
+
+    /// An if/else branch join for join tests.
+    fn branches(then_branch: FunctionReturn, else_branch: FunctionReturn) -> FunctionBody {
+        FunctionBody::BranchReturns(JoinedReturns {
+            first: then_branch,
+            second: else_branch,
+        })
+    }
+
     #[test]
     fn function_correct_is_silent_and_memoized() {
         let binder = binder_with(&[("add", span(0, 10)), ("point", span(11, 21))]);
@@ -6270,6 +6439,237 @@ mod tests {
         assert_eq!(
             report.diagnostics[0].message,
             "Type 'string' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
+    fn sequence_returns_check_each_position() {
+        // P023 join rule (probed tsc 7.0.2): two wrong sequential returns
+        // report twice, once per position. Per-position occurrence nodes
+        // memoize separately (two recomputes, never one aliased entry).
+        let binder = binder_with(&[("pair", span(0, 10))]);
+        let decls = [function(
+            "pair",
+            0,
+            10,
+            Vec::new(),
+            Some("number"),
+            sequence(lit(InitKind::String), lit(InitKind::String)),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+        for diag in &report.diagnostics {
+            assert_eq!(diag.code, CODE_MISMATCH);
+            assert_eq!(
+                diag.message,
+                "Type 'string' is not assignable to type 'number'."
+            );
+        }
+        assert_eq!(db.recompute_count(), 2);
+    }
+
+    #[test]
+    fn unreachable_return_still_checks() {
+        // Probed tsc 7.0.2: the unreachable position still verdicts, so a
+        // clean-then-wrong sequence reports its second return and a
+        // wrong-then-clean one its first.
+        let binder = binder_with(&[("second_wrong", span(0, 10)), ("first_wrong", span(11, 21))]);
+        let decls = [
+            function(
+                "second_wrong",
+                0,
+                10,
+                Vec::new(),
+                Some("number"),
+                sequence(lit(InitKind::Number), lit(InitKind::String)),
+            ),
+            function(
+                "first_wrong",
+                11,
+                21,
+                Vec::new(),
+                Some("number"),
+                sequence(lit(InitKind::String), lit(InitKind::Number)),
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+        for diag in &report.diagnostics {
+            assert_eq!(diag.code, CODE_MISMATCH);
+            assert_eq!(
+                diag.message,
+                "Type 'string' is not assignable to type 'number'."
+            );
+        }
+    }
+
+    #[test]
+    fn branch_returns_diagnose_per_branch() {
+        // Probed tsc 7.0.2: `if/else` with a return in each branch reports
+        // per branch (one side wrong reports once; both wrong report twice).
+        let binder = binder_with(&[("pick", span(0, 10)), ("both", span(11, 21))]);
+        let decls = [
+            function(
+                "pick",
+                0,
+                10,
+                vec![("flag", true)],
+                Some("number"),
+                branches(lit(InitKind::Number), lit(InitKind::String)),
+            ),
+            function(
+                "both",
+                11,
+                21,
+                vec![("flag", true)],
+                Some("number"),
+                branches(lit(InitKind::String), lit(InitKind::String)),
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 3);
+        for diag in &report.diagnostics {
+            assert_eq!(diag.code, CODE_MISMATCH);
+            assert_eq!(
+                diag.message,
+                "Type 'string' is not assignable to type 'number'."
+            );
+        }
+    }
+
+    #[test]
+    fn guard_tail_checks_both_positions() {
+        // Probed tsc 7.0.2: a wrong guard return and a wrong tail return
+        // each report at their own position.
+        let binder = binder_with(&[("guarded", span(0, 10)), ("tailed", span(11, 21))]);
+        let decls = [
+            function(
+                "guarded",
+                0,
+                10,
+                vec![("x", true)],
+                Some("string"),
+                guard_join(lit(InitKind::Number), lit(InitKind::String)),
+            ),
+            function(
+                "tailed",
+                11,
+                21,
+                vec![("x", true)],
+                Some("string"),
+                guard_join(lit(InitKind::String), lit(InitKind::Number)),
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+        for diag in &report.diagnostics {
+            assert_eq!(diag.code, CODE_MISMATCH);
+            assert_eq!(
+                diag.message,
+                "Type 'number' is not assignable to type 'string'."
+            );
+        }
+    }
+
+    #[test]
+    fn join_non_literal_position_declines_whole_body() {
+        // No partial verdicts: one unrepresentable position declines the
+        // whole declaration with a position-naming reason.
+        let binder = binder_with(&[("guarded", span(0, 10)), ("pick", span(11, 21))]);
+        let decls = [
+            function(
+                "guarded",
+                0,
+                10,
+                vec![("x", true)],
+                Some("string"),
+                guard_join(lit(InitKind::String), lit(InitKind::NonLiteral)),
+            ),
+            function(
+                "pick",
+                11,
+                21,
+                vec![("flag", true)],
+                Some("string"),
+                branches(lit(InitKind::NonLiteral), lit(InitKind::String)),
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 2);
+        let reasons: Vec<&str> = report
+            .unsupported
+            .iter()
+            .map(|u| u.reason.as_str())
+            .collect();
+        assert!(reasons[0].contains("tail return"), "reason: {}", reasons[0]);
+        assert!(
+            reasons[1].contains("then-branch return"),
+            "reason: {}",
+            reasons[1]
+        );
+    }
+
+    #[test]
+    fn join_object_excess_is_per_occurrence() {
+        // Freshness is per return position (H-002): the clean first object
+        // stays silent while the second diagnoses its excess member.
+        let binder = binder_with(&[("point", span(0, 10))]);
+        let decls = [function(
+            "point",
+            0,
+            10,
+            Vec::new(),
+            Some("{ x: number }"),
+            sequence(
+                obj(vec![("x", ObjectMemberKind::Number)]),
+                obj(vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("extra", ObjectMemberKind::String),
+                ]),
+            ),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_EXCESS_MEMBER);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Object literal may only specify known properties, and 'extra' does not exist in type '{ x: number; }'."
         );
     }
 
