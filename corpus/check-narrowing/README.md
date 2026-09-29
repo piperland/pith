@@ -15,9 +15,14 @@ continuation lines kept verbatim).
 | complex-guard.ts | 1x TS2322 + elaboration | UNSUPPORTED (declined, never diagnosed) |
 | nested-guard.ts | clean (`never`) | UNSUPPORTED (declined, never silent-dropped) |
 | nontypeof-guard.ts | 1x TS2322 | UNSUPPORTED (declined, never diagnosed) |
+| unknown-unguarded.ts | 1x TS2322 (`unknown` spelling) | 1x PITH2322 over `unknown` (flips the P025 decline) |
+| unknown-guarded-match.ts | clean | silent diagnostics (1 UNSUPPORTED: no initializer) |
+| unknown-guarded-mismatch.ts | 1x TS2322 | 1x PITH2322 in the guarded region |
+| unknown-to-unknown.ts | clean | silent diagnostics (1 UNSUPPORTED: no initializer) |
+| unknown-genuinely-unknown.ts | clean (infers `unknown`) | UNSUPPORTED (declined, never diagnosed) |
 
-Differential: 5/5 refine fixtures match on (code family, first-line
-message); 3/3 decline fixtures are silent with recorded reasons. The
+Differential: 9/9 refine fixtures match on (code family, first-line
+message); 4/4 decline fixtures are silent with recorded reasons. The
 elaboration continuation lines tsc appends to union-actual diagnostics
 (`  Type 'string' is not assignable …`) are oracle-only detail: the e2e
 folds them away and compares first lines (documented in
