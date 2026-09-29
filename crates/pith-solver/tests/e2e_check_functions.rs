@@ -18,18 +18,24 @@
 //! Differential rule: same as check-const — oracle lines are
 //! `file:TSNNNN: message`, compared as sorted `(numeric-code, message)`
 //! multisets (`TS2322` <-> `PITH2322`) plus the unsupported count.
-//! Two fixtures diverge by design (the oracle errors where the subset
-//! declines): `unannotated-param` (oracle `TS7006`) and `branching`
-//! (oracle `TS2322` hidden in a branch). Those pin the divergence
-//! explicitly — oracle error present, solver silent with one unsupported
-//! note — instead of forcing a false match.
+//! Straight-line joins check per return (P023): `branching` (oracle `TS2322`
+//! in the `else` branch) and the two-return/guard fixtures match their
+//! baselines with zero unsupported notes, while `multi-return` (oracle
+//! clean) is silent with zero notes. One fixture still diverges by design
+//! (the oracle errors where the subset declines): `unannotated-param`
+//! (oracle `TS7006`). That pins the divergence explicitly — oracle error
+//! present, solver silent with one unsupported note — instead of forcing a
+//! false match.
 
-use pith_frontend::{parse_module, FunctionBodyFact, ParsedFile, ReturnKind as FrontendReturnKind};
+use pith_frontend::{
+    parse_module, FunctionBodyFact, ParsedFile, ReturnKind as FrontendReturnKind,
+    SingleReturnFact as FrontendReturn,
+};
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
     check_functions, FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn,
-    InitKind, ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    InitKind, JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -97,6 +103,39 @@ fn map_member_kind(kind: FrontendReturnKind) -> ObjectMemberKind {
     }
 }
 
+/// Maps one frontend return expression to the solver's return shape.
+///
+/// Object returns become member facts (always fresh: only direct syntactic
+/// literals carry them); every other return becomes its literal kind.
+/// Exhaustive through [`map_return_kind`]/[`map_member_kind`], so a new
+/// frontend variant fails to compile instead of silently mis-checking.
+fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
+    let init_object = ret.members.as_ref().map(|members| ObjectInit {
+        members: members
+            .iter()
+            .map(|member| ObjectMemberInit {
+                name: member.name.clone(),
+                kind: map_member_kind(member.kind),
+            })
+            .collect(),
+        fresh: true,
+    });
+    let kind = if init_object.is_some() {
+        None
+    } else {
+        Some(map_return_kind(ret.kind))
+    };
+    FunctionReturn { kind, init_object }
+}
+
+/// Maps one joined frontend return pair to the solver's joined shape.
+fn map_joined(first: &FrontendReturn, second: &FrontendReturn) -> JoinedReturns {
+    JoinedReturns {
+        first: map_function_return(first),
+        second: map_function_return(second),
+    }
+}
+
 /// Scope-sensitive span + identity for one function declarator, mirroring
 /// the check-const driver's fallback: `symbol` indexes
 /// `ParsedFile.symbols`, resolved through the binder from the fact's scope.
@@ -129,23 +168,18 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
             let (name, span, symbol) = fallback_span(parsed, binder, func.symbol, func.scope);
             let body = match &func.body {
                 FunctionBodyFact::SingleReturn(ret) => {
-                    let init_object = ret.members.as_ref().map(|members| ObjectInit {
-                        members: members
-                            .iter()
-                            .map(|member| ObjectMemberInit {
-                                name: member.name.clone(),
-                                kind: map_member_kind(member.kind),
-                            })
-                            .collect(),
-                        fresh: true,
-                    });
-                    let kind = if init_object.is_some() {
-                        None
-                    } else {
-                        Some(map_return_kind(ret.kind))
-                    };
-                    FunctionBody::SingleReturn(FunctionReturn { kind, init_object })
+                    FunctionBody::SingleReturn(map_function_return(ret))
                 }
+                FunctionBodyFact::SequenceReturns { first, second } => {
+                    FunctionBody::SequenceReturns(map_joined(first, second))
+                }
+                FunctionBodyFact::GuardReturn { guard, tail } => {
+                    FunctionBody::GuardReturn(map_joined(guard, tail))
+                }
+                FunctionBodyFact::BranchReturns {
+                    then_branch,
+                    else_branch,
+                } => FunctionBody::BranchReturns(map_joined(then_branch, else_branch)),
                 FunctionBodyFact::NoBody { declared } => FunctionBody::NoBody {
                     declared: *declared,
                 },
@@ -281,10 +315,28 @@ fixture_test!(
     1
 );
 fixture_test!(
-    multi_return_is_unsupported,
+    multi_return_sequence_is_silent,
     "multi-return.ts",
     "multi-return.expected.txt",
-    1
+    0
+);
+fixture_test!(
+    branching_matches_ts2322,
+    "branching.ts",
+    "branching.expected.txt",
+    0
+);
+fixture_test!(
+    guard_return_matches_ts2322,
+    "guard-return.ts",
+    "guard-return.expected.txt",
+    0
+);
+fixture_test!(
+    two_returns_match_ts2322_twice,
+    "two-returns.ts",
+    "two-returns.expected.txt",
+    0
 );
 fixture_test!(
     object_return_is_silent,
@@ -319,34 +371,6 @@ fn unannotated_param_divergence_pins_ts7006() {
         report.unsupported[0]
             .reason
             .contains("unannotated parameter"),
-        "reason: {}",
-        report.unsupported[0].reason
-    );
-}
-
-#[test]
-fn branching_divergence_pins_hidden_ts2322() {
-    // The flow-phase gap, pinned: tsc reports the `else`-branch mismatch
-    // while the straight-line subset declines the whole body.
-    let source = include_str!("../../../corpus/check-functions/branching.ts");
-    let expected = include_str!("../../../corpus/check-functions/branching.expected.txt");
-    assert_eq!(
-        parse_baseline(expected),
-        [(
-            "TS2322".to_owned(),
-            "Type 'string' is not assignable to type 'number'.".to_owned()
-        )],
-        "oracle baseline pins the divergence"
-    );
-    let (_, report) = run_pipeline(source);
-    assert!(
-        report.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        report.diagnostics
-    );
-    assert_eq!(report.unsupported.len(), 1);
-    assert!(
-        report.unsupported[0].reason.contains("complex"),
         "reason: {}",
         report.unsupported[0].reason
     );

@@ -35,13 +35,13 @@
 
 use pith_frontend::{
     parse_module, CallArgKind as FrontendCallArgKind, FunctionBodyFact, ParsedFile,
-    ReturnKind as FrontendReturnKind,
+    ReturnKind as FrontendReturnKind, SingleReturnFact as FrontendReturn,
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_solver::{
     check_generics, CallArg, CallSite, FileReport, FunctionBody, FunctionDecl, FunctionParam,
-    FunctionReturn, GenericCall, GenericDecl, InitKind, ObjectInit, ObjectMemberInit,
-    ObjectMemberKind,
+    FunctionReturn, GenericCall, GenericDecl, InitKind, JoinedReturns, ObjectInit,
+    ObjectMemberInit, ObjectMemberKind,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -140,13 +140,46 @@ fn fallback_span(
     (symbol.name.clone(), span, id)
 }
 
+/// Maps one frontend return expression to the solver's return shape.
+///
+/// Object returns become member facts (always fresh: only direct syntactic
+/// literals carry them); every other return becomes its literal kind.
+fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
+    let init_object = ret.members.as_ref().map(|members| ObjectInit {
+        members: members
+            .iter()
+            .map(|member| ObjectMemberInit {
+                name: member.name.clone(),
+                kind: map_member_kind(member.kind),
+            })
+            .collect(),
+        fresh: true,
+    });
+    let kind = if init_object.is_some() {
+        None
+    } else {
+        Some(map_return_kind(ret.kind))
+    };
+    FunctionReturn { kind, init_object }
+}
+
+/// Maps one joined frontend return pair to the solver's joined shape
+/// (P023 joins map faithfully in every pipeline).
+fn map_joined(first: &FrontendReturn, second: &FrontendReturn) -> JoinedReturns {
+    JoinedReturns {
+        first: map_function_return(first),
+        second: map_function_return(second),
+    }
+}
+
 /// The declaration driver: every [`GenericDecl`] field comes from adapter facts.
 ///
 /// - `name`/`scope`/`symbol` via symbol linkage + binder resolution;
 /// - `params` as names + annotated-ness + annotation text + optional/rest
 ///   markers verbatim; `return_annotation` as the colon-stripped text;
 /// - `type_params` as declared names verbatim plus the complexity flag;
-/// - `body` mapped variant by variant (object returns become member facts,
+/// - `body` mapped variant by variant, joins faithfully like the
+///   check-functions driver (object returns become member facts,
 ///   always fresh: only direct syntactic literals carry them).
 ///   Only declarations carrying type-parameter facts route here; plain
 ///   functions belong to the check-functions/check-calls pipelines.
@@ -159,23 +192,18 @@ fn generics_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<GenericDecl>
             let (name, span, symbol) = fallback_span(parsed, binder, func.symbol, func.scope);
             let body = match &func.body {
                 FunctionBodyFact::SingleReturn(ret) => {
-                    let init_object = ret.members.as_ref().map(|members| ObjectInit {
-                        members: members
-                            .iter()
-                            .map(|member| ObjectMemberInit {
-                                name: member.name.clone(),
-                                kind: map_member_kind(member.kind),
-                            })
-                            .collect(),
-                        fresh: true,
-                    });
-                    let kind = if init_object.is_some() {
-                        None
-                    } else {
-                        Some(map_return_kind(ret.kind))
-                    };
-                    FunctionBody::SingleReturn(FunctionReturn { kind, init_object })
+                    FunctionBody::SingleReturn(map_function_return(ret))
                 }
+                FunctionBodyFact::SequenceReturns { first, second } => {
+                    FunctionBody::SequenceReturns(map_joined(first, second))
+                }
+                FunctionBodyFact::GuardReturn { guard, tail } => {
+                    FunctionBody::GuardReturn(map_joined(guard, tail))
+                }
+                FunctionBodyFact::BranchReturns {
+                    then_branch,
+                    else_branch,
+                } => FunctionBody::BranchReturns(map_joined(then_branch, else_branch)),
                 FunctionBodyFact::NoBody { declared } => FunctionBody::NoBody {
                     declared: *declared,
                 },
