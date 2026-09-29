@@ -526,6 +526,7 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "pith-ids",
+ "pith-symbols",
 ]
 
 [[package]]
