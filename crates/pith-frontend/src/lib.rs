@@ -40,12 +40,18 @@
 //! only — patterns that are not plain identifiers set `params_complex`
 //! instead of mis-keying), the return annotation text + span
 //! ([`AnnotationFact`], `None` when unannotated), and the body shape
-//! ([`FunctionBodyFact`]). Only straight-line single-`return` bodies with an
-//! argument are checkable: their literal kind + span (plus member facts for
-//! returned `{ ... }` literals) feed the solver; bodies without a node are
+//! ([`FunctionBodyFact`]). Straight-line single-`return` bodies with an
+//! argument are checkable, as are the three P023 joins (each return checks
+//! independently solver-side): two sequential returns
+//! ([`FunctionBodyFact::SequenceReturns`]), an `if`-without-`else`
+//! divergent return plus a tail return ([`FunctionBodyFact::GuardReturn`]),
+//! and a lone `if/else` with a return in each branch
+//! ([`FunctionBodyFact::BranchReturns`]). Their literal kind + span (plus
+//! member facts for returned `{ ... }` literals) feed the solver; bodies
+//! without a node are
 //! [`FunctionBodyFact::NoBody`], statement-less bodies are
-//! [`FunctionBodyFact::Empty`], and everything else (multiple returns,
-//! branches, loops, bare or missing `return`) is
+//! [`FunctionBodyFact::Empty`], and everything else (longer/multi-path
+//! bodies, loops, `switch`, `try`, bare or missing `return`) is
 //! [`FunctionBodyFact::Complex`] for the solver to decline. Out of scope, no
 //! facts: function expressions, arrow functions, object methods (class methods,
 //! accessors, and constructors feed class facts instead — see the class
@@ -246,8 +252,8 @@ use oxc_ast::ast::{
     CallExpression, Class, ClassElement, ClassType, ExportDeclaration, ExportDefaultDeclaration,
     Expression, Function, FunctionBody, FunctionType, IfStatement, MethodDefinition,
     MethodDefinitionKind, NewExpression, ObjectPropertyKind, Program, PropertyDefinition,
-    PropertyDefinitionType, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
-    StaticBlock, TSEnumDeclaration, TSEnumMemberName, TSInterfaceDeclaration,
+    PropertyDefinitionType, PropertyKey, PropertyKind, ReturnStatement, SimpleAssignmentTarget,
+    Statement, StaticBlock, TSEnumDeclaration, TSEnumMemberName, TSInterfaceDeclaration,
     TSNamespaceDeclaration, TSPropertySignature, TSSignature, TSTypeAliasDeclaration,
     TSTypeAnnotation, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
     VariableDeclarator,
@@ -474,7 +480,7 @@ pub struct FunctionFact {
     pub type_params_complex: bool,
     /// Raw return annotation text + span; `None` means unannotated.
     pub return_annotation: Option<AnnotationFact>,
-    /// Body shape; only [`FunctionBodyFact::SingleReturn`] is checkable.
+    /// Body shape; single returns and the three P023 joins are checkable.
     pub body: FunctionBodyFact,
 }
 
@@ -561,12 +567,44 @@ pub struct SingleReturnFact {
 
 /// Body shape of one function declaration.
 ///
-/// Only [`FunctionBodyFact::SingleReturn`] feeds the solver; every other
-/// shape declines to a solver `UnsupportedDecl` with a distinct reason.
+/// Only [`FunctionBodyFact::SingleReturn`] plus the P023 joins
+/// ([`FunctionBodyFact::SequenceReturns`], [`FunctionBodyFact::GuardReturn`],
+/// [`FunctionBodyFact::BranchReturns`]) feed the solver; every other shape
+/// declines to a solver `UnsupportedDecl` with a distinct reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBodyFact {
     /// Exactly one statement, `return <expr>;` with an argument.
     SingleReturn(SingleReturnFact),
+    /// Exactly two statements, `return <expr>;` twice: tsc checks both
+    /// (the second is unreachable but still verdicts — probed 7.0.2 P023).
+    SequenceReturns {
+        /// The first `return`'s expression facts.
+        first: SingleReturnFact,
+        /// The second `return`'s expression facts.
+        second: SingleReturnFact,
+    },
+    /// Exactly two statements, `if (c) <divergent return>;` with no `else`
+    /// plus a trailing `return <expr>;`: tsc checks the guard-branch return
+    /// and the tail return independently (probed 7.0.2 P023). Any condition
+    /// qualifies — returns check independently of narrowing, so no guard
+    /// fact is required here (a simple `typeof` test additionally emits its
+    /// usual [`TypeofGuardFact`], which narrowing consumes separately).
+    GuardReturn {
+        /// The guard branch's `return` expression facts.
+        guard: SingleReturnFact,
+        /// The trailing `return`'s expression facts.
+        tail: SingleReturnFact,
+    },
+    /// Exactly one statement, `if (c) { return A; } else { return B; }`:
+    /// tsc checks each branch return independently (probed 7.0.2 P023).
+    /// `else if` chains never reach facts (the whole statement declines
+    /// like any other non-simple guard shape).
+    BranchReturns {
+        /// The `then` branch's `return` expression facts.
+        then_branch: SingleReturnFact,
+        /// The plain-`else` branch's `return` expression facts.
+        else_branch: SingleReturnFact,
+    },
     /// No body node: `declared` tells `declare function` apart from an
     /// overload signature.
     NoBody {
@@ -575,8 +613,10 @@ pub enum FunctionBodyFact {
     },
     /// A body with no statements (directives do not count).
     Empty,
-    /// Anything else: multiple returns, branches, loops, bare or missing
-    /// `return`, spreads/methods/computed keys in a returned literal.
+    /// Anything else: longer/multi-path bodies, loops, `switch`, `try`,
+    /// `else-if` chains, `if/else` plus a tail return, `throw` or bare
+    /// branches, `continue`, bare or missing `return`, spreads/methods/
+    /// computed keys in a returned literal.
     Complex,
 }
 
@@ -1712,7 +1752,11 @@ fn return_members(
 ///
 /// `declared` is the `declare` modifier off the `Function` node (ambient
 /// declarations never carry a body node); it only surfaces on
-/// [`FunctionBodyFact::NoBody`].
+/// [`FunctionBodyFact::NoBody`]. Beyond straight-line single returns, the
+/// three P023 joins classify (each return checks independently solver-side,
+/// probed tsc 7.0.2): two sequential returns, an `if`-without-`else`
+/// divergent return plus a tail return, and a lone `if/else` with a return
+/// in each branch. Anything else is [`FunctionBodyFact::Complex`].
 fn function_body_fact(
     source: &str,
     file: FileId,
@@ -1722,19 +1766,46 @@ fn function_body_fact(
     let Some(body) = body else {
         return FunctionBodyFact::NoBody { declared };
     };
-    if body.statements.is_empty() {
-        return FunctionBodyFact::Empty;
+    match body.statements.as_slice() {
+        [] => FunctionBodyFact::Empty,
+        [Statement::ReturnStatement(ret)] => single_statement_return(source, file, ret),
+        [Statement::IfStatement(it)] => {
+            branch_returns(source, file, it).unwrap_or(FunctionBodyFact::Complex)
+        }
+        [first, second] => {
+            joined_pair(source, file, first, second).unwrap_or(FunctionBodyFact::Complex)
+        }
+        _ => FunctionBodyFact::Complex,
     }
-    if body.statements.len() != 1 {
-        return FunctionBodyFact::Complex;
-    }
-    let Statement::ReturnStatement(ret) = &body.statements[0] else {
-        return FunctionBodyFact::Complex;
-    };
+}
+
+/// Classifies the body's lone `return <expr>;` (the P013 shape): bare
+/// `return;` and unrepresentable object members decline the whole body to
+/// [`FunctionBodyFact::Complex`] instead of mis-keying.
+fn single_statement_return(
+    source: &str,
+    file: FileId,
+    ret: &ReturnStatement<'_>,
+) -> FunctionBodyFact {
     let Some(argument) = ret.argument.as_ref() else {
         // Bare `return;`: no literal kind to record.
         return FunctionBodyFact::Complex;
     };
+    single_return_fact(source, file, argument)
+        .map_or(FunctionBodyFact::Complex, FunctionBodyFact::SingleReturn)
+}
+
+/// Classifies one returned expression into its [`SingleReturnFact`]:
+/// literal kind + span, plus member facts for representable `{ ... }`
+/// literals. Returns `None` for unrepresentable object members (spread,
+/// method, accessor, computed or non-identifier key): the caller marks the
+/// body [`FunctionBodyFact::Complex`] instead of mis-keying.
+#[must_use]
+fn single_return_fact(
+    source: &str,
+    file: FileId,
+    argument: &Expression<'_>,
+) -> Option<SingleReturnFact> {
     let span = argument.span();
     let span = Span {
         file,
@@ -1742,21 +1813,118 @@ fn function_body_fact(
         hi: span.end,
     };
     if let Expression::ObjectExpression(object) = argument {
-        let Some(members) = return_members(source, file, &object.properties) else {
-            return FunctionBodyFact::Complex;
-        };
-        FunctionBodyFact::SingleReturn(SingleReturnFact {
+        let members = return_members(source, file, &object.properties)?;
+        Some(SingleReturnFact {
             kind: ReturnKind::NonLiteral,
             span,
             members: Some(members),
         })
     } else {
-        FunctionBodyFact::SingleReturn(SingleReturnFact {
+        Some(SingleReturnFact {
             kind: return_kind(source, argument),
             span,
             members: None,
         })
     }
+}
+
+/// The returned expression of a divergent branch: `return <expr>;` directly
+/// or as the only statement of a block (mirroring [`is_divergent`}). `throw`,
+/// bare `return;`, and every other shape yield `None` (the caller declines
+/// the whole body).
+#[must_use]
+fn divergent_return_arg<'a>(statement: &'a Statement<'a>) -> Option<&'a Expression<'a>> {
+    match statement {
+        Statement::ReturnStatement(ret) => ret.argument.as_ref(),
+        Statement::BlockStatement(block) if block.body.len() == 1 => {
+            divergent_return_arg(&block.body[0])
+        }
+        _ => None,
+    }
+}
+
+/// Two-statement bodies beyond straight-line single returns: two sequential
+/// returns, then guard-then-tail. Anything else yields `None` (the caller
+/// marks the body [`FunctionBodyFact::Complex`]).
+#[must_use]
+fn joined_pair(
+    source: &str,
+    file: FileId,
+    first: &Statement<'_>,
+    second: &Statement<'_>,
+) -> Option<FunctionBodyFact> {
+    sequence_returns(source, file, first, second)
+        .or_else(|| guard_tail_returns(source, file, first, second))
+}
+
+/// Two top-level `return <expr>;` statements: tsc checks both, unreachable
+/// or not (probed 7.0.2 P023).
+#[must_use]
+fn sequence_returns(
+    source: &str,
+    file: FileId,
+    first: &Statement<'_>,
+    second: &Statement<'_>,
+) -> Option<FunctionBodyFact> {
+    let Statement::ReturnStatement(first_ret) = first else {
+        return None;
+    };
+    let Statement::ReturnStatement(second_ret) = second else {
+        return None;
+    };
+    let first_arg = first_ret.argument.as_ref()?;
+    let second_arg = second_ret.argument.as_ref()?;
+    Some(FunctionBodyFact::SequenceReturns {
+        first: single_return_fact(source, file, first_arg)?,
+        second: single_return_fact(source, file, second_arg)?,
+    })
+}
+
+/// `if (c) <divergent return>;` with no `else` plus a trailing
+/// `return <expr>;`: tsc checks the guard-branch return and the tail return
+/// independently (probed 7.0.2 P023). Any condition qualifies (returns check
+/// independently of narrowing); an `else` disqualifies — `if/else` plus a
+/// tail return is three paths, [`FunctionBodyFact::Complex`].
+#[must_use]
+fn guard_tail_returns(
+    source: &str,
+    file: FileId,
+    first: &Statement<'_>,
+    second: &Statement<'_>,
+) -> Option<FunctionBodyFact> {
+    let Statement::IfStatement(it) = first else {
+        return None;
+    };
+    if it.alternate.is_some() {
+        return None;
+    }
+    let guard_arg = divergent_return_arg(&it.consequent)?;
+    let Statement::ReturnStatement(tail) = second else {
+        return None;
+    };
+    let tail_arg = tail.argument.as_ref()?;
+    Some(FunctionBodyFact::GuardReturn {
+        guard: single_return_fact(source, file, guard_arg)?,
+        tail: single_return_fact(source, file, tail_arg)?,
+    })
+}
+
+/// A lone `if (c) { return A; } else { return B; }`: tsc checks each branch
+/// return independently (probed 7.0.2 P023). `else if` chains, `throw`/bare
+/// branches, and missing arguments yield `None` (the caller marks the body
+/// [`FunctionBodyFact::Complex`]).
+#[must_use]
+fn branch_returns(source: &str, file: FileId, it: &IfStatement<'_>) -> Option<FunctionBodyFact> {
+    let alternate: &Statement<'_> = it.alternate.as_ref()?;
+    if matches!(alternate, Statement::IfStatement(_)) {
+        return None;
+    }
+    let then_arg = divergent_return_arg(&it.consequent)?;
+    let else_arg = divergent_return_arg(alternate)?;
+    Some(FunctionBodyFact::BranchReturns {
+        then_branch: single_return_fact(source, file, then_arg)?,
+        else_branch: single_return_fact(source, file, else_arg)?,
+    })
 }
 
 /// Pushes one narrowing decline region onto the collector.
@@ -4009,9 +4177,26 @@ export function f(a: string): string { return a + b; }
             names,
             ["multi", "branch", "bare", "silent", "ident", "outer", "inner"]
         );
-        for fact in pf.functions.iter().take(4) {
+        for fact in pf.functions.iter().skip(2).take(2) {
             assert_eq!(fact.body, FunctionBodyFact::Complex);
         }
+        // Two sequential returns classify (each checks independently
+        // solver-side): literal kinds plus exact expression spans.
+        let FunctionBodyFact::SequenceReturns { first, second } = &pf.functions[0].body else {
+            panic!("expected sequence returns, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(first.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, first.span), "1");
+        assert_eq!(second.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, second.span), "2");
+        // A divergent `if` plus a tail return classifies as a guard join.
+        let FunctionBodyFact::GuardReturn { guard, tail } = &pf.functions[1].body else {
+            panic!("expected guard return, got {:?}", pf.functions[1].body);
+        };
+        assert_eq!(guard.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, guard.span), "1");
+        assert_eq!(tail.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tail.span), "2");
         // A single non-literal return stays a single return (the solver, not
         // the adapter, declines it).
         let FunctionBodyFact::SingleReturn(ident) = &pf.functions[4].body else {
@@ -4028,6 +4213,63 @@ export function f(a: string): string { return a + b; }
         };
         assert_eq!(inner.kind, ReturnKind::Number);
         assert_eq!(slice_of(src, inner.span), "2");
+    }
+
+    #[test]
+    fn function_facts_branch_returns_exact_spans() {
+        let src = "function pick(flag: boolean): number {\n  if (flag) {\n    return 1;\n\
+                   } else {\n    return \"oops\";\n  }\n}\n\
+                   function tight(flag: boolean): number {\n  if (flag) return 1;\n  else return 2;\n}\n";
+        let pf = parse_module(FileId(0), "b.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let FunctionBodyFact::BranchReturns {
+            then_branch,
+            else_branch,
+        } = &pf.functions[0].body
+        else {
+            panic!("expected branch returns, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(then_branch.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, then_branch.span), "1");
+        assert!(then_branch.members.is_none());
+        assert_eq!(else_branch.kind, ReturnKind::String);
+        assert_eq!(slice_of(src, else_branch.span), "\"oops\"");
+        // Unbraced single-statement branches classify identically.
+        let FunctionBodyFact::BranchReturns {
+            then_branch: tight_then,
+            else_branch: tight_else,
+        } = &pf.functions[1].body
+        else {
+            panic!("expected branch returns, got {:?}", pf.functions[1].body);
+        };
+        assert_eq!(tight_then.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tight_then.span), "1");
+        assert_eq!(tight_else.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tight_else.span), "2");
+    }
+
+    #[test]
+    fn function_facts_unadmitted_bodies_stay_complex() {
+        let src = "function chain(flag: boolean): number {\n  if (flag) {\n    return 1;\n\
+                   } else if (!flag) {\n    return 2;\n  } else {\n    return 3;\n  }\n}\n\
+                   function tail(flag: boolean): number {\n  if (flag) {\n    return 1;\n  } else {\n\
+                   return 2;\n  }\n  return 3;\n}\n\
+                   function throwing(flag: boolean): number {\n  if (flag) {\n    throw new Error(\"x\");\n\
+                   } else {\n    return 2;\n  }\n}\n\
+                   function bare_branch(flag: boolean): number {\n  if (flag) {\n    return;\n  }\n  return 2;\n}\n\
+                   function looped(n: number): number {\n  for (;;) {\n    return 1;\n  }\n}\n\
+                   function switched(n: number): number {\n  switch (n) {\n    case 1:\n      return 1;\n\
+                   default:\n      return 2;\n  }\n}\n\
+                   function tried(n: number): number {\n  try {\n    return 1;\n  } catch {\n    return 2;\n  }\n}\n\
+                   function continued(n: number): number {\n  while (n > 0) {\n    n = n - 1;\n\
+                   continue;\n  }\n  return n;\n}\n";
+        let pf = parse_module(FileId(0), "u.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 8);
+        for fact in &pf.functions {
+            assert_eq!(fact.body, FunctionBodyFact::Complex);
+        }
     }
 
     #[test]
