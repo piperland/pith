@@ -8,9 +8,9 @@
 //! `.expected.txt` baselines.
 //!
 //! Division of labor: declaration names, scopes, spans, parameter facts,
-//! return annotations, body shapes, type-parameter names plus the complexity
-//! flag, and call facts (callee name + identifier span, call span, argument
-//! literal kinds + spans) all come from adapter facts. The driver-side
+//! return annotations, body shapes, type-parameter names plus bound texts
+//! and the modifier flag, and call facts (callee name + identifier span,
+//! call span, argument literal kinds + spans) all come from adapter facts. The driver-side
 //! mappings are the literal-kind enum translations (mechanical and
 //! exhaustive) plus ONE disclosed hand-fed seam: explicit type arguments ride
 //! per-call (`Some(vec!["number"])` for `id<number>(1)`, `None` for `id(1)`)
@@ -26,12 +26,12 @@
 //!
 //! Differential rule: oracle header lines are `file:TSNNNN: message`,
 //! compared as sorted `(numeric-code, first-line-message)` multisets
-//! (`TS2322`/`TS2345`/`TS2304`/`TS2558` <-> `PITH*`) plus the unsupported
-//! count. Elaboration continuation lines (`'T' could be instantiated …`)
-//! fold away exactly like check-narrowing's union elaborations. Eight
-//! fixtures diverge by design (oracle clean or erroring where the subset
-//! declines or skips); each pins its divergence explicitly instead of
-//! forcing a false match.
+//! (`TS2322`/`TS2345`/`TS2304`/`TS2558`/`TS2344` <-> `PITH*`) plus the
+//! unsupported count. Elaboration continuation lines (`'T' could be
+//! instantiated …`) fold away exactly like check-narrowing's union
+//! elaborations. Nine fixtures diverge by design (oracle clean or erroring
+//! where the subset declines or skips); each pins its divergence explicitly
+//! instead of forcing a false match.
 
 use pith_frontend::{
     parse_module, CallArgKind as FrontendCallArgKind, FunctionBodyFact, ParsedFile,
@@ -181,7 +181,8 @@ fn map_joined(first: &FrontendReturn, second: &FrontendReturn) -> JoinedReturns 
 /// - `name`/`scope`/`symbol` via symbol linkage + binder resolution;
 /// - `params` as names + annotated-ness + annotation text + optional/rest
 ///   markers verbatim; `return_annotation` as the colon-stripped text;
-/// - `type_params` as declared names verbatim plus the complexity flag;
+/// - `type_params` as declared names verbatim, `constraint`/`default` as
+///   the sliced bound texts, plus the modifier complexity flag;
 /// - `body` mapped variant by variant, joins faithfully like the
 ///   check-functions driver (object returns become member facts,
 ///   always fresh: only direct syntactic literals carry them).
@@ -246,6 +247,17 @@ fn generics_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<GenericDecl>
                     .map(|param| param.name.clone())
                     .collect(),
                 type_params_complex: func.type_params_complex,
+                // First parameter's bounds only: multi-parameter lists
+                // decline on count before bounds ever read, so later bounds
+                // are unreachable on real paths.
+                constraint: func
+                    .type_params
+                    .first()
+                    .and_then(|param| param.constraint_text.clone()),
+                default: func
+                    .type_params
+                    .first()
+                    .and_then(|param| param.default_text.clone()),
             }
         })
         .collect()
@@ -423,6 +435,34 @@ fixture_test!(
     &[None],
     0
 );
+fixture_test!(
+    constrained_correct_binds_silently,
+    "constrained-correct.ts",
+    "constrained-correct.expected.txt",
+    &[None, Some(args1("string"))],
+    1
+);
+fixture_test!(
+    constrained_wrong_matches_oracle,
+    "constrained-wrong.ts",
+    "constrained-wrong.expected.txt",
+    &[None, Some(args1("number"))],
+    1
+);
+fixture_test!(
+    defaulted_correct_binds_silently,
+    "defaulted-correct.ts",
+    "defaulted-correct.expected.txt",
+    &[None, Some(args1("string"))],
+    1
+);
+fixture_test!(
+    defaulted_override_matches_ts2345,
+    "defaulted-inference-override.ts",
+    "defaulted-inference-override.expected.txt",
+    &[None, Some(args1("string"))],
+    1
+);
 
 #[test]
 fn inference_failure_pins_clean_oracle() {
@@ -479,9 +519,10 @@ fn multi_param_declined_against_clean_oracle() {
 }
 
 #[test]
-fn constrained_declined_against_clean_oracle() {
-    // A constrained `<T extends string>` is oracle-clean on a matching call
-    // while the subset declines (constraints need bound checking).
+fn constrained_admitted_against_clean_oracle() {
+    // A constrained `<T extends string>` now admits on a matching call:
+    // oracle clean while the solver checks silently (the pass-through body
+    // still declines with its own note).
     let source = include_str!("../../../corpus/check-generics/constrained-declined.ts");
     let expected = include_str!("../../../corpus/check-generics/constrained-declined.expected.txt");
     assert!(
@@ -496,16 +537,17 @@ fn constrained_declined_against_clean_oracle() {
     );
     assert_eq!(report.unsupported.len(), 1);
     assert!(
-        report.unsupported[0].reason.contains("constraint"),
+        report.unsupported[0].reason.contains("non-literal return"),
         "reason: {}",
         report.unsupported[0].reason
     );
 }
 
 #[test]
-fn defaulted_declined_against_clean_oracle() {
-    // A defaulted `<T = number>` is oracle-clean on a matching call while
-    // the subset declines (defaults need arity-independent binding).
+fn defaulted_admitted_against_clean_oracle() {
+    // A defaulted `<T = number>` now admits on a matching call: oracle
+    // clean while the solver checks silently (the pass-through body still
+    // declines with its own note).
     let source = include_str!("../../../corpus/check-generics/defaulted-declined.ts");
     let expected = include_str!("../../../corpus/check-generics/defaulted-declined.expected.txt");
     assert!(
@@ -520,7 +562,7 @@ fn defaulted_declined_against_clean_oracle() {
     );
     assert_eq!(report.unsupported.len(), 1);
     assert!(
-        report.unsupported[0].reason.contains("default"),
+        report.unsupported[0].reason.contains("non-literal return"),
         "reason: {}",
         report.unsupported[0].reason
     );
@@ -585,6 +627,94 @@ fn object_member_declined_pins_ts2322() {
 }
 
 #[test]
+fn keyof_param_declined_pins_ts2322() {
+    // `T` under `keyof` errors in tsc itself (the body fails against `T`)
+    // while the subset declines with a `keyof` reason.
+    let source = include_str!("../../../corpus/check-generics/keyof-param-declined.ts");
+    let expected = include_str!("../../../corpus/check-generics/keyof-param-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'keyof T' is not assignable to type 'T'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source, &[None]);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("keyof parameter"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn conditional_return_declined_pins_ts2322() {
+    // A conditional return errors in tsc itself (the literal fails against
+    // the conditional) while the subset declines with a reason.
+    let source = include_str!("../../../corpus/check-generics/conditional-return-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-generics/conditional-return-declined.expected.txt");
+    let want = concat!(
+        "Type 'number' is not assignable ",
+        "to type 'T extends string ? string : number'."
+    );
+    assert_eq!(
+        parse_baseline(expected),
+        [("TS2322".to_owned(), want.to_owned())],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source, &[None]);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("conditional return"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn mapped_return_declined_pins_ts2353() {
+    // A mapped return errors in tsc itself (`TS2353` on the returned
+    // literal) while the subset declines with a reason.
+    let source = include_str!("../../../corpus/check-generics/mapped-return-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-generics/mapped-return-declined.expected.txt");
+    let want = concat!(
+        "Object literal may only specify known properties, and 'v' ",
+        "does not exist in type '{ [K in keyof T]: T[K]; }'."
+    );
+    assert_eq!(
+        parse_baseline(expected),
+        [("TS2353".to_owned(), want.to_owned())],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source, &[None]);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("mapped return"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
 fn pipeline_is_deterministic_across_runs() {
     let source = include_str!("../../../corpus/check-generics/explicit-wrong.ts");
     let explicit = [Some(args1("number"))];
@@ -596,9 +726,9 @@ fn pipeline_is_deterministic_across_runs() {
 #[test]
 fn driver_maps_facts_without_hand_feeding() {
     // Guards the mapping itself: names from symbol linkage, type-parameter
-    // names plus the complexity flag verbatim, params/returns verbatim,
-    // call facts verbatim — only angle-bracket texts ride the disclosed
-    // hand-fed seam.
+    // names plus constraint/default texts plus the modifier flag verbatim,
+    // params/returns verbatim, call facts verbatim — only angle-bracket
+    // texts ride the disclosed hand-fed seam.
     let parsed = parse_module(
         FILE,
         "m.ts",
@@ -614,9 +744,13 @@ fn driver_maps_facts_without_hand_feeding() {
     assert_eq!(decls.len(), 2);
     assert_eq!(decls[0].type_params, ["T"]);
     assert!(!decls[0].type_params_complex);
+    assert_eq!(decls[0].constraint, None);
+    assert_eq!(decls[0].default, None);
     assert_eq!(decls[0].decl.return_annotation.as_deref(), Some("T"));
     assert_eq!(decls[1].type_params, ["T"]);
-    assert!(decls[1].type_params_complex);
+    assert!(!decls[1].type_params_complex);
+    assert_eq!(decls[1].constraint.as_deref(), Some("string"));
+    assert_eq!(decls[1].default, None);
     for decl in &decls {
         assert_eq!(decl.decl.span.file, FILE);
         assert!(decl.decl.span.lo < decl.decl.span.hi);
