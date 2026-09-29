@@ -59,6 +59,23 @@ Note: prescan-v2 guessed the jsonParseTransform reason as "bare return";
 executed reason is "complex body" (the if-branch) — decline confirmed,
 reason refined. Coverage stays 1/33.
 
+## P029 plimit end-to-end driver (EXECUTED 2026-09-29, E2B Linux)
+
+Driver: `real_plimit_blowup_verdict` in
+`crates/pith-solver/tests/e2e_check_real_defu.rs`. Fed
+`corpus/real/plimit-stress/index.d.ts` (single-file premise asserted:
+no imports/re-exports) to `check_program`. Remote output:
+`PLIMIT_TARGET_VERDICT: EXECUTED decline — CONFIRMS projection
+["overload signature for 'pLimit' has no body to check"]`.
+
+Per-construct executed verdicts: both fed functions decline
+(pLimit/limitFunction on overload-signature ambient form — the `.d.ts`
+declares overloads, so the decline path is overloads, not the guessed
+declare-form); file totals 0 diagnostics, 2 unsupported.
+`PLIMIT_WALL_MS parse_bind=1 check=0`. All three real cases now executed:
+defu CONFIRM-silent import, destr decline-confirmed, plimit
+decline-confirmed. Coverage stays 1/33.
+
 ## Heuristic regex census (machine-counted, NOT a classification)
 
 Counts are textual occurrences across each case's files; see
