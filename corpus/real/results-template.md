@@ -41,6 +41,24 @@ Per-file executed verdicts (`DEFU_FILE` lines): FileId(0) _utils —
 cross-file `DefuFunction` return). `DEFU_WALL_MS parse_bind=3 check=0`.
 The 1/33 prescan-v2 flip is now EXECUTED, not projected.
 
+## P028 destr end-to-end driver (EXECUTED 2026-09-29, E2B Linux)
+
+Driver: `real_destr_single_file_verdict` in
+`crates/pith-solver/tests/e2e_check_real_defu.rs`. Fed
+`corpus/real/destr/src/index.ts` (single-file graph, no-imports premise
+asserted) to `check_program`. Remote output:
+`DESTR_TARGET_VERDICT: EXECUTED decline — CONFIRMS projection
+["complex body on 'jsonParseTransform': control flow is outside the subset"]`.
+
+Per-construct executed verdicts: all 4 functions decline
+(jsonParseTransform/warnKeyDropped/destr on complex bodies; safeDestr on
+non-literal return); all 4 consts decline (unannotated inference);
+1 optional-arity call note (`destr` `options` range). File totals:
+0 diagnostics, 9 unsupported. `DESTR_WALL_MS parse_bind=1 check=0`.
+Note: prescan-v2 guessed the jsonParseTransform reason as "bare return";
+executed reason is "complex body" (the if-branch) — decline confirmed,
+reason refined. Coverage stays 1/33.
+
 ## Heuristic regex census (machine-counted, NOT a classification)
 
 Counts are textual occurrences across each case's files; see
