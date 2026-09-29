@@ -106,6 +106,40 @@
 //!   whole calls over one identifier argument would forfeit decidable arity
 //!   verdicts.
 //!
+//! Classes (P020, probed on tsc 7.0.2 `--strict --pretty false`; probes in
+//! `.agent/scratch/p020-probes/`):
+//!
+//! - Property initializers check exactly like consts: `x: number = "oops"`
+//!   diagnoses `TS2322: Type 'string' is not assignable to type 'number'.`
+//!   at the property. Properties carry no binder identity, so synthetic
+//!   declarations use dotted `Class.prop` names that can never resolve and
+//!   always fall back to the fact span (which is also the oracle anchor).
+//! - `new` checks exactly like calls through the same [`check_one_call`]
+//!   path: too-few `TS2554` at the callee (`Expected 2 arguments, but got
+//!   1.`), too-many at the first excess argument, wrong argument types
+//!   `TS2345` at the argument. Classes without a constructor take 0
+//!   arguments (`Expected 0 arguments, but got 1.`); constructor parameter
+//!   properties (`private x: number`) check normally; optional/rest
+//!   constructor params decline per site exactly like function calls
+//!   (`Expected 1-2 arguments …` is a range arity). Decline reasons say
+//!   "call" for `new` sites (documented wording fold — tsc itself spells
+//!   `arguments` for both).
+//! - Declines (each probed): method bodies (`TS2322` at the return in tsc),
+//!   accessors (same), heritage (`extends` clean in tsc; `implements`
+//!   mismatches spell the new family `TS2416`), statics (static-prop
+//!   mismatches spell `TS2322`), computed keys (`TS2322`), class
+//!   expressions (`TS2322`), abstract/declare classes (clean in tsc),
+//!   generic classes, missing initializers (`TS2564` under `--strict`),
+//!   and `this`-assignments (clean in tsc — they satisfy definite
+//!   assignment, which needs flow facts the subset refuses).
+//! - Rationale for class-level (not per-method) decline notes: one note per
+//!   out-of-subset family per class keeps reports proportional to
+//!   declarations — per-method notes would multiply on every realistic
+//!   class — while spans stay precise at the class level (the P016
+//!   generic-decl precedent: one declaration note covers all its uses).
+//!   Only genuinely per-property shapes (`declare`/abstract/decorated
+//!   properties) decline per-property, mirroring interface members.
+//!
 //! Interface-typed consts (P017, probed on tsc 7.0.2
 //! `--strict --pretty false`):
 //!
@@ -1042,6 +1076,407 @@ fn classify_param(param: &FunctionParam) -> Result<(TypeId, String), String> {
             ))
         },
         |expected| Ok((expected, text.to_owned())),
+    )
+}
+
+/// One class property: annotation plus initializer shapes for a synthetic
+/// const declaration.
+///
+/// Driver-mapped from the adapter's `ClassPropFact` (mechanical field copy).
+/// `complex_reason` carries the adapter's decline marker verbatim; checkable
+/// properties carry the raw annotation text plus the literal initializer for
+/// [`check_one`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassProp {
+    /// Property name as written (feeds the dotted synthetic-decl name only;
+    /// never resolved — see [`check_classes`]).
+    pub name: String,
+    /// Span of the property definition (diagnostic anchor and decl fallback).
+    pub span: Span,
+    /// Raw annotation text (`Some("number")`); `None` when unannotated.
+    pub annotation: Option<String>,
+    /// Initializer literal kind; `None` means no initializer.
+    pub init: Option<InitKind>,
+    /// Object-literal members when the value is a representable `{ ... }`;
+    /// `None` otherwise.
+    pub init_object: Option<ObjectInit>,
+    /// Adapter decline marker; `Some` means the property declines.
+    pub complex_reason: Option<String>,
+}
+
+/// One `class Name { ... }` declaration to check.
+///
+/// Driver-mapped from the adapter's `ClassFact` (mechanical field copies,
+/// plus the binder [`SymbolId`] resolved from the same [`Binder`] used for
+/// checking). Properties check through synthetic [`ConstDecl`]s; the
+/// constructor feeds synthetic [`FunctionDecl`]s for [`check_one_call`];
+/// every out-of-subset family declines with a class-level reason (see the
+/// module-level class rules).
+/// Whole-declaration form of one `class`: expression, abstract, and declare
+/// markers travel together (at most three flags, so the struct stays lean).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClassForm {
+    /// `true` for class expressions.
+    pub is_expression: bool,
+    /// `true` for `abstract class`.
+    pub is_abstract: bool,
+    /// `true` for `declare class` (ambient, never instantiated here).
+    pub is_declare: bool,
+}
+
+/// One out-of-subset family present on a class declaration, mirroring the
+/// adapter's [`ClassFamily`](pith_frontend::ClassFamily) facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassFamily {
+    /// Any non-constructor instance method.
+    Methods,
+    /// Any `accessor` property or getter/setter.
+    Accessors,
+    /// Any `extends` clause or `implements` list.
+    Heritage,
+    /// Any static member (properties, methods, blocks).
+    Statics,
+    /// Decorators on the class or any member.
+    Decorators,
+    /// Computed or non-identifier, non-`#private` keys.
+    Computed,
+    /// Any index signature.
+    IndexSignature,
+    /// Any `this`-member write in a method, constructor, or static block.
+    ThisAssignments,
+}
+
+impl ClassFamily {
+    /// The decline reason for one family on `class`, mirroring the
+    /// long-standing per-family notes.
+    fn reason(self, class: &str) -> String {
+        match self {
+            Self::Methods => format!(
+                "methods on class '{class}': method bodies are unchecked, outside the subset"
+            ),
+            Self::Accessors => {
+                format!("accessors on class '{class}' are outside the subset")
+            }
+            Self::Heritage => format!(
+                "heritage clause on class '{class}' (extends/implements) is outside the subset"
+            ),
+            Self::Statics => {
+                format!("static members on class '{class}' are outside the subset")
+            }
+            Self::Decorators => {
+                format!("decorators on class '{class}' are outside the subset")
+            }
+            Self::Computed => {
+                format!("computed or non-identifier keys on class '{class}' are outside the subset")
+            }
+            Self::IndexSignature => {
+                format!("index signatures on class '{class}' are outside the subset")
+            }
+            Self::ThisAssignments => format!(
+                "this-assignments in class '{class}' are outside the subset (no flow facts)"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassDecl {
+    /// Class name as written.
+    pub name: String,
+    /// Fallback span, used only when neither `symbol` nor scope-sensitive
+    /// resolution finds the declaration in the [`Binder`].
+    pub span: Span,
+    /// Per-file scope index of the declaration (from the adapter's facts).
+    pub scope: u32,
+    /// Exact binder identity when the driver resolved it (preferred over
+    /// scope-sensitive lookup); must come from the same `file`/`Binder`.
+    pub symbol: Option<SymbolId>,
+    /// Instance property facts in source order.
+    pub properties: Vec<ClassProp>,
+    /// Constructor identifier parameters in source order (empty for the
+    /// implicit constructor).
+    pub ctor_params: Vec<FunctionParam>,
+    /// `true` when the constructor holds an unrepresentable pattern: `new`
+    /// sites decline per site through [`check_one_call`].
+    pub ctor_complex: bool,
+    /// `true` when overloads leave no single parameter list: the class
+    /// declines constructor checking with one note while properties still
+    /// check (and `new` sites skip silently — the note covers them).
+    pub ctor_overloads: bool,
+    /// Out-of-subset families present on the declaration, in first-seen
+    /// order without duplicates (one note per family).
+    pub declined: Vec<ClassFamily>,
+    /// Whole-declaration form markers.
+    pub form: ClassForm,
+    /// Declared type parameters (generic classes check nothing: `T`
+    /// positions would otherwise mis-diagnose `TS2304`).
+    pub has_type_params: bool,
+}
+
+/// One `new C(...)` construction site to check.
+///
+/// Driver-mapped from the adapter's `NewFact` (mechanical field copy, only
+/// the literal-kind enum mapping is driver-side). Routes through
+/// [`check_one_call`] against the synthetic constructor declaration, so
+/// arity/argument verdicts match function calls by construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewSite {
+    /// Class name as written.
+    pub class_name: String,
+    /// Span of the class-name identifier (too-few-arity anchor, mirroring
+    /// tsc).
+    pub callee_span: Span,
+    /// Span of the whole `new` expression.
+    pub span: Span,
+    /// Argument facts in source order.
+    pub args: Vec<CallArg>,
+}
+
+/// Mutable checking state for one [`check_classes`] run, bundled so the
+/// per-class helpers stay lean (pedantic arity discipline, mirroring
+/// [`GenericCallCtx`]).
+struct ClassRun<'a, 'b> {
+    file: FileId,
+    binder: &'a Binder,
+    db: &'a mut QueryDb,
+    /// Running synthetic-declaration counter for disjoint occurrence nodes
+    /// (see [`class_occurrence_node`]).
+    occurrence: u32,
+    /// Synthetic constructor declarations for `new`-site checking (one per
+    /// checkable class, in class order).
+    synth: Vec<FunctionDecl>,
+    /// Names whose constructors declined at declaration level (overloads,
+    /// generics, abstract/declare/expression forms): `new` sites against
+    /// them skip silently — the declaration note covers them (the P016
+    /// precedent).
+    excluded: Vec<&'b str>,
+    report: &'a mut FileReport,
+}
+
+/// Checks every class declaration in `decls` plus every construction site in
+/// `news` for `file`, returning the sorted [`FileReport`].
+///
+/// Per-class outcomes, in order: whole-declaration declines (expressions,
+/// abstract/declare forms, generics — one note, properties and `new` sites
+/// both skip); property checks through synthetic [`ConstDecl`]s (one verdict
+/// or decline per property, exactly the const path); one class-level note
+/// per remaining out-of-subset family (methods, accessors, heritage,
+/// statics, decorators, computed keys, index signatures, `this`-assignments,
+/// constructor overloads); then the constructor joins the synthetic call set
+/// (implicit constructors take 0 arguments). `new` sites route through
+/// [`check_one_call`], so per-site arity/argument verdicts, overload
+/// declines, and unresolved-callee silence all mirror function calls —
+/// except sites against declaration-declined constructors, which skip
+/// silently under their declaration note.
+#[must_use]
+pub fn check_classes(
+    file: FileId,
+    decls: &[ClassDecl],
+    news: &[NewSite],
+    binder: &Binder,
+    db: &mut QueryDb,
+) -> FileReport {
+    let mut report = FileReport::default();
+    let mut run = ClassRun {
+        file,
+        binder,
+        db: &mut *db,
+        occurrence: 0,
+        synth: Vec::with_capacity(decls.len()),
+        excluded: Vec::new(),
+        report: &mut report,
+    };
+    for decl in decls {
+        check_one_class(decl, &mut run);
+    }
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, decl) in run.synth.iter().enumerate() {
+        by_name.entry(decl.name.as_str()).or_default().push(index);
+    }
+    for site in news {
+        if !by_name.contains_key(site.class_name.as_str())
+            && run.excluded.contains(&site.class_name.as_str())
+        {
+            continue;
+        }
+        let call = CallSite {
+            callee: site.class_name.clone(),
+            callee_span: site.callee_span,
+            span: site.span,
+            args: site.args.clone(),
+        };
+        check_one_call(
+            run.file, &run.synth, &by_name, &call, run.binder, run.report,
+        );
+    }
+    sort_report(run.report);
+    std::mem::take(run.report)
+}
+
+/// Checks one class declaration, pushing into the run report.
+///
+/// Whole-declaration gates first (expression/abstract/declare/generic —
+/// exactly one note, constructor excluded from the call set); then property
+/// checks; then one class-level note per remaining family; then the
+/// constructor joins the synthetic call set (or declines it via overloads).
+fn check_one_class<'a>(decl: &'a ClassDecl, run: &mut ClassRun<'a, 'a>) {
+    let span = binder_span_for(
+        run.binder,
+        run.file,
+        decl.name.as_str(),
+        decl.scope,
+        decl.symbol,
+        decl.span,
+    );
+    if let Some(reason) = whole_class_reason(decl) {
+        run.report.unsupported.push(UnsupportedDecl {
+            file: run.file,
+            span,
+            reason,
+        });
+        run.excluded.push(decl.name.as_str());
+        return;
+    }
+    check_class_properties(decl, run);
+    decline_class_families(decl, span, run);
+    if decl.ctor_overloads {
+        run.report.unsupported.push(UnsupportedDecl {
+            file: run.file,
+            span,
+            reason: format!(
+                "constructor overloads on class '{}': overload resolution is outside the subset",
+                decl.name
+            ),
+        });
+        run.excluded.push(decl.name.as_str());
+        return;
+    }
+    run.synth.push(FunctionDecl {
+        name: decl.name.clone(),
+        span: decl.span,
+        scope: decl.scope,
+        symbol: decl.symbol,
+        params: decl.ctor_params.clone(),
+        params_complex: decl.ctor_complex,
+        return_annotation: None,
+        body: FunctionBody::Empty,
+    });
+}
+
+/// Gates one class declaration for whole-declaration decline: `Some` carries
+/// the single unsupported reason (expression, abstract, declare, and generic
+/// forms check nothing — not even properties, whose `T` annotations would
+/// otherwise mis-diagnose `TS2304`).
+fn whole_class_reason(decl: &ClassDecl) -> Option<String> {
+    if decl.form.is_expression {
+        Some(format!(
+            "class expression '{}': expressions are outside the subset",
+            decl.name
+        ))
+    } else if decl.form.is_abstract {
+        Some(format!(
+            "abstract class '{}': abstract semantics are outside the subset",
+            decl.name
+        ))
+    } else if decl.form.is_declare {
+        Some(format!(
+            "declare class '{}': ambient declarations are outside the subset",
+            decl.name
+        ))
+    } else if decl.has_type_params {
+        Some(format!(
+            "generic class '{}': type parameters are outside the subset",
+            decl.name
+        ))
+    } else {
+        None
+    }
+}
+
+/// Checks one class's properties through synthetic [`ConstDecl`]s.
+///
+/// Each property becomes one const-style declaration checked by [`check_one`]
+/// with a disjoint occurrence node, so verdicts and messages match the const
+/// subset by construction. The synthetic name is dotted (`Class.prop`): no
+/// binder binding can ever carry a dot, so resolution always misses and the
+/// diagnostic anchors at the property fact span (the oracle anchor) instead
+/// of a same-named outer binding. Adapter-declined properties decline
+/// per-property, quoting the adapter reason (the interface-member
+/// precedent). Nodes reserve one counter step per property in order, so the
+/// freshness table (built first) and the checks (built second) share nodes
+/// without aliasing const/function space.
+fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
+    let base = run.occurrence;
+    let mut freshness = FreshnessTable::default();
+    for (offset, prop) in decl.properties.iter().enumerate() {
+        let node = class_occurrence_node(base, offset);
+        if let Some(init) = prop.init_object.as_ref() {
+            freshness.fresh.insert((run.file, node), init.fresh);
+        }
+    }
+    for (offset, prop) in decl.properties.iter().enumerate() {
+        let node = class_occurrence_node(base, offset);
+        if let Some(reason) = prop.complex_reason.as_deref() {
+            run.report.unsupported.push(UnsupportedDecl {
+                file: run.file,
+                span: prop.span,
+                reason: format!("class '{}': property '{}': {reason}", decl.name, prop.name),
+            });
+            continue;
+        }
+        let synth = ConstDecl {
+            name: format!("{}.{}", decl.name, prop.name),
+            span: prop.span,
+            scope: decl.scope,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: prop.annotation.clone(),
+            init: prop.init,
+            init_object: prop.init_object.clone(),
+        };
+        let mut ctx = CheckCtx {
+            file: run.file,
+            node,
+            db: &mut *run.db,
+            freshness: &freshness,
+            report: &mut *run.report,
+            extra: &[],
+        };
+        check_one(&synth, run.binder, &mut ctx);
+    }
+    run.occurrence = base.saturating_add(offset_count(decl.properties.len()));
+}
+
+/// Saturating `usize` property count into the occurrence-counter step.
+fn offset_count(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+/// Pushes one class-level [`UnsupportedDecl`] per out-of-subset family
+/// present on the declaration (see the module-level class rationale: one
+/// note per family per class, never per method).
+fn decline_class_families(decl: &ClassDecl, span: Span, run: &mut ClassRun<'_, '_>) {
+    for family in &decl.declined {
+        run.report.unsupported.push(UnsupportedDecl {
+            file: run.file,
+            span,
+            reason: family.reason(decl.name.as_str()),
+        });
+    }
+}
+
+/// Occurrence [`NodeId`] for the `offset`-th synthetic class-property
+/// declaration past `base`.
+///
+/// Property checks memoize through the same [`QueryDb`] as consts and
+/// functions, so class indices land in a third disjoint high range
+/// (saturating: skewed inputs pin the top, never wrap into other spaces).
+#[must_use]
+fn class_occurrence_node(base: u32, offset: usize) -> NodeId {
+    const BASE: u32 = 0xC000_0000;
+    NodeId(
+        base.saturating_add(offset_count(offset))
+            .saturating_add(BASE),
     )
 }
 
