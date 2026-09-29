@@ -457,6 +457,7 @@ fn imports_from_facts(parsed: &ParsedFile) -> (Vec<ImportUse>, ModuleInput) {
             span: fact.span,
             imported_span: fact.imported_span,
             specifier_span: fact.specifier_span,
+            is_type: fact.is_type,
         });
         inputs.push(ImportInput {
             local: fact.local.clone(),
@@ -796,6 +797,260 @@ fn barrel_star_resolves_transitively() {
                 0,
             ),
         ],
+    );
+}
+
+/// Checked values end-to-end (PITH-P022): a defu-shaped 3-file program
+/// (main plus two leaves, mirroring `defu.ts` -> {`_utils.ts`, `types.ts`})
+/// where imported const/function/interface/enum values check at use sites
+/// with correct types, plus one `TS2322` and one `TS2345` at the
+/// intentional errors. Every file carries an honest verdict (diagnostics or
+/// a checked-clean bill — never a silent skip): the test additionally
+/// asserts each file memoized at least its first const, proving every file
+/// was checked rather than skipped.
+#[test]
+fn checked_value_multifile_matches_baselines() {
+    let program = run_program(&[
+        FileSpec {
+            path: "checked-utils.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-utils.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "checked-types.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-types.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "checked-main.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-main.ts"),
+            objects: &[ObjectSpec {
+                name: "p",
+                members: &[
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::Number),
+                ],
+            }],
+        },
+    ]);
+    expect_case(
+        "checked-value",
+        &program,
+        &[
+            (
+                FileId(0),
+                include_str!("../../../corpus/check-multifile/checked-utils.expected.txt"),
+                0,
+            ),
+            (
+                FileId(1),
+                include_str!("../../../corpus/check-multifile/checked-types.expected.txt"),
+                0,
+            ),
+            (
+                FileId(2),
+                include_str!("../../../corpus/check-multifile/checked-main.expected.txt"),
+                0,
+            ),
+        ],
+    );
+    for file in [FileId(0), FileId(1), FileId(2)] {
+        assert!(
+            program
+                .db
+                .cached_deps(&QueryKey {
+                    file,
+                    node: NodeId(0),
+                    kind: QueryKind::TypeOf,
+                })
+                .is_some(),
+            "file {file:?} memoized nothing: silent skip"
+        );
+    }
+}
+
+/// Invalidation on the defu-shaped graph (PITH-P022): editing the shared
+/// types leaf drops exactly its own entry plus its one dependent in main,
+/// while a leaf edit inside main drops exactly its own entry.
+#[test]
+fn defu_graph_invalidation_leaf_vs_shared() {
+    let mut program = run_program(&[
+        FileSpec {
+            path: "checked-utils.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-utils.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "checked-types.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-types.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "checked-main.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-main.ts"),
+            objects: &[ObjectSpec {
+                name: "p",
+                members: &[
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::Number),
+                ],
+            }],
+        },
+    ]);
+    // The cross-file edge: main's `x` (const index 4) records the declaring
+    // occurrence of `ORIGIN_X` (the only const of checked-types.ts).
+    let use_key = QueryKey {
+        file: FileId(2),
+        node: NodeId(4),
+        kind: QueryKind::TypeOf,
+    };
+    let deps = program
+        .db
+        .cached_deps(&use_key)
+        .expect("cross-file use is memoized");
+    assert!(deps.contains(&Dep {
+        file: FileId(1),
+        node: NodeId(0)
+    }));
+    // Shared-leaf edit: drops the leaf entry plus its one dependent.
+    let dropped = program.db.invalidate(Dep {
+        file: FileId(1),
+        node: NodeId(0),
+    });
+    assert_eq!(dropped, 2, "shared edit drops exactly own + dependent");
+    // Unrelated entries survive: utils LIMIT and main `n`.
+    assert!(
+        program
+            .db
+            .cached_deps(&QueryKey {
+                file: FileId(0),
+                node: NodeId(0),
+                kind: QueryKind::TypeOf,
+            })
+            .is_some(),
+        "unrelated leaf survives"
+    );
+    assert!(
+        program
+            .db
+            .cached_deps(&QueryKey {
+                file: FileId(2),
+                node: NodeId(0),
+                kind: QueryKind::TypeOf,
+            })
+            .is_some(),
+        "unrelated same-file entry survives"
+    );
+}
+
+/// Leaf edit on a fresh defu-shaped program: exactly one entry drops.
+#[test]
+fn defu_graph_leaf_edit_invalidates_exactly_one_entry() {
+    let mut program = run_program(&[
+        FileSpec {
+            path: "checked-utils.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-utils.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "checked-types.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-types.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "checked-main.ts",
+            source: include_str!("../../../corpus/check-multifile/checked-main.ts"),
+            objects: &[ObjectSpec {
+                name: "p",
+                members: &[
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::Number),
+                ],
+            }],
+        },
+    ]);
+    // Main's `n` (const index 0) is imported by nobody: editing it drops
+    // exactly its own entry.
+    let dropped = program.db.invalidate(Dep {
+        file: FileId(2),
+        node: NodeId(0),
+    });
+    assert_eq!(dropped, 1, "leaf edit drops exactly its own entry");
+}
+
+/// Type-only imports decline instead of diagnosing (PITH-P022): type
+/// aliases emit no checker facts, so a failing `import type` may name a
+/// member the target does export as a type — `PITH2305`/`PITH2307`/`PITH2304`
+/// there would risk false verdicts where tsc stays clean (pinned
+/// divergence: tsc is silent for existing aliases and `TS2305`/`TS2307`
+/// for missing ones). Value imports keep the exact mirrors (pinned by the
+/// missing-module tests above).
+#[test]
+fn type_only_import_declines_instead_of_diagnosing() {
+    let program = run_program(&[
+        FileSpec {
+            path: "t.ts",
+            source: "export const LIMIT: number = 10;\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "m.ts",
+            source: "import type { NOPE } from \"./t\";\n\
+                      import type { X } from \"./does-not-exist\";\n\
+                      const a: NOPE = 1;\n",
+            objects: &[],
+        },
+    ]);
+    let main = program.report.file(FileId(1)).expect("main report");
+    assert!(
+        main.diagnostics.is_empty(),
+        "no false PITH2305/PITH2307/PITH2304: {:?}",
+        main.diagnostics
+    );
+    // Two import declines (missing member, unresolvable specifier) plus one
+    // annotation-use decline for `a`.
+    assert_eq!(main.unsupported.len(), 3, "reasons: {:?}", main.unsupported);
+    assert!(
+        main.unsupported
+            .iter()
+            .all(|note| note.reason.contains("type-only import")),
+        "reasons: {:?}",
+        main.unsupported
+    );
+}
+
+/// `import type` of an existing alias stays silent like tsc (PITH-P022):
+/// `export type Alias` records a local-export fact through the same
+/// `Declaration::id` module-record path as interfaces (pinned by the
+/// clean-`Point` case), so the import resolves; the alias annotation then
+/// declines via the existing not-an-enum path.
+#[test]
+fn type_only_import_of_existing_alias_stays_silent() {
+    let program = run_program(&[
+        FileSpec {
+            path: "t.ts",
+            source: "export type Alias = number;\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "m.ts",
+            source: "import type { Alias } from \"./t\";\nconst a: Alias = 1;\n",
+            objects: &[],
+        },
+    ]);
+    let main = program.report.file(FileId(1)).expect("main report");
+    assert!(
+        main.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        main.diagnostics
+    );
+    assert_eq!(main.unsupported.len(), 1, "reasons: {:?}", main.unsupported);
+    assert!(
+        main.unsupported[0]
+            .reason
+            .contains("not an enum or interface"),
+        "reason: {}",
+        main.unsupported[0].reason
     );
 }
 
