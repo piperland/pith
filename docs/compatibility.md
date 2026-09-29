@@ -41,3 +41,29 @@ Provenance: `corpus/real/SOURCES.md`. Runner:
   generics admission and multi-return/loop bodies. Narrowing fragments
   (`typeof x !== "string"` early-returns) already match subset shapes
   inside declined bodies.
+
+## M3 cap re-trial (PITH-P026 — 2026-09-29)
+
+Re-ran the pinned corpus through the grown pipeline; honest delta vs the
+0/33 P021 baseline above. Evidence: `corpus/real/coverage-prescan-v2.md`
+(full 33-construct re-score), `corpus/real/timings.json` (tsc medians of 3
+local runs; per-case `pith_ms` measured remotely (top-level stays null historically)), oracle re-run 3/3 MATCH still clean.
+
+- Strict subset coverage v2: **1/33 top-level constructs in-subset (3%)**,
+  0 unknown — delta **+1**: defu's `import { isPlainObject } from
+  "./_utils"` now resolves silent through the P022 checked value-import
+  graph (the P019 clean-main / P022 checked-utils precedent). It is the
+  only construct the pipeline would verdict today.
+- Everything else confirmed out: `import type` / type re-exports decline
+  by the P022 type-policy (not verdicts); all six function bodies miss the
+  three P023 joins (bare returns, loops, switch, try, 3+ returns);
+  `Array.isArray`/`Object.keys` verdict shapes (P024) and `any`/`as`
+  admissions (P025) fire only inside already-declined bodies; generics,
+  aliases, conditionals, default exports, ambient/lib types untouched.
+- No Pith checking verdicts are claimed: the checker was never driven on
+  these files (no driver; parse+bind evidence is the P021 remote run,
+  restated). The v2 1/33 is a projection for remote confirmation, and
+  `corpus_smoke` pins were left untouched — static analysis of the M3
+  frontend diffs (member/cast/join facts all land in uncounted vecs or
+  ride on existing facts; exactly one `functions.push` per named decl)
+  shows no count drift, pending the CTO's remote verification run.
