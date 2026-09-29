@@ -1,0 +1,2 @@
+two-returns.ts:TS2322: Type 'string' is not assignable to type 'number'.
+two-returns.ts:TS2322: Type 'string' is not assignable to type 'number'.

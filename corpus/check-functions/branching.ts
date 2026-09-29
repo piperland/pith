@@ -1,5 +1,5 @@
-// Solver verdict: UNSUPPORTED (branching; oracle TS2322 in the else branch,
-// invisible to the straight-line subset until the flow phase).
+// Solver verdict: DIAGNOSED (if/else branch returns; oracle TS2322 in the
+// else branch, now checked per-return through the join path).
 function pick(flag: boolean): number {
   if (flag) {
     return 1;

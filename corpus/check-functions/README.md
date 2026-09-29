@@ -11,16 +11,20 @@ machinery reused). Oracle baselines are tsc 7.0.2 via
 | return-mismatch.ts | 1x TS2322 | 1x PITH2322 (message shape mirrors tsc) |
 | unannotated-param.ts | 1x TS7006 | UNSUPPORTED (implicit-any inference out of subset) |
 | unannotated-return.ts | clean (inferred) | UNSUPPORTED (inference out of subset) |
-| multi-return.ts | clean | UNSUPPORTED (two returns, straight-line but not single) |
-| branching.ts | 1x TS2322 (else branch) | UNSUPPORTED (flow phase gap, pinned) |
+| multi-return.ts | clean | silent (two sequential returns, both clean) |
+| branching.ts | 1x TS2322 (else branch) | 1x PITH2322 (branch join, per-return) |
+| guard-return.ts | 1x TS2322 (tail return) | 1x PITH2322 (guard join, per-return) |
+| two-returns.ts | 2x TS2322 (both returns) | 2x PITH2322 (sequence join, per-return) |
 | object-return.ts | clean | silent (object machinery reused, member facts fact-fed) |
 | excluded-shapes.ts | clean | silent, zero function facts (arrows, expressions, methods) |
 
-Differential: 6/6 match on the straight-line subset (3 silent/clean +
-2 diagnostic pairs + 1 unsupported/clean); 2/2 divergences pinned
-explicitly (oracle errors, solver silent + 1 UNSUPPORTED each) — the
-implicit-any rule and the flow phase are acknowledged non-goals, never
-silent gaps.
+Differential: 9/9 match on the straight-line-plus-joins subset (4 silent/clean +
+4 diagnostic pairs incl. the double-diagnostic join + 1 unsupported/clean); 1/1
+divergence pinned explicitly (oracle errors, solver silent + 1 UNSUPPORTED) —
+the implicit-any rule is an acknowledged non-goal, never a silent gap.
+Unreachable returns still check (probed tsc 7.0.2: a wrong unreachable return
+still reports); loops, `switch`, `try`, `else-if` chains, `if/else` plus a tail
+return, `throw`/bare branches, and `continue` still decline (unit-pinned).
 
 Out of scope (no facts, solver never sees them): function expressions,
 arrow functions, object/class methods, accessors, constructors,
