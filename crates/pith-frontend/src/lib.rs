@@ -74,6 +74,23 @@
 //! fact (`f(g(1))` yields one for `g(1)` and one for `f(...)`, the inner
 //! argument classifying [`CallArgKind::NonLiteral`]).
 //!
+//! Member call facts (P024): [`ParsedFile::member_calls`] carries one
+//! [`MemberCallFact`] per `JSON.parse(...)`-shaped call expression — a
+//! non-optional static member call whose receiver is a plain `Identifier`
+//! naming a closed allowlist of known values (`JSON`, `Object`, `Array`,
+//! `console`, `Math`; see [`is_known_value_receiver`]) — in visitor
+//! (pre-order) order. Each fact records the receiver and member names plus
+//! the member identifier span ([`MemberCallFact::member_span`]), the whole
+//! call span, and one [`CallArgFact`] per argument (same classification as
+//! direct calls). Everything else keeps the existing non-emission, never a
+//! wrong fact: member calls on other receivers (`obj.pick()`,
+//! `nope.parse()`), computed members (`JSON["parse"]()`), optional chains
+//! (`JSON?.parse()`, `JSON.parse?.()`), chained receivers (`a.b.c()`), and
+//! calls with any spread element emit nothing. A locally declared binding
+//! shadowing a known value still emits (documented limit: the collector is
+//! syntactic and carries no occurrence scopes, so the fact cannot tell
+//! shadowing apart — the solver owns that fold).
+//!
 //! Probe basis (tsc 7.0.2 `--strict --pretty false`, recorded in the solver
 //! docs): `TS2554` (`Expected 2 arguments, but got 1.`, too-few anchored at
 //! the callee, too-many at the first excess argument) beats `TS2345`
@@ -674,6 +691,29 @@ pub struct CallFact {
     pub args: Vec<CallArgFact>,
 }
 
+/// One `JSON.parse(...)`-shaped member call's call-site facts.
+///
+/// `member_span` is the member identifier's own range (too-few-arity
+/// diagnostics anchor here, mirroring tsc's callee anchoring for direct
+/// calls); `span` is the whole call expression's range. `args` is source
+/// order with the same classification as [`CallArgFact`] — including
+/// non-literals (the solver skips those per-argument, never the whole call,
+/// so arity still checks). Only allowlisted receivers emit facts (see the
+/// module-level member-call note).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberCallFact {
+    /// Receiver name as written (`JSON` above).
+    pub receiver: String,
+    /// Member name as written (`parse` above).
+    pub member: String,
+    /// Span of the member identifier.
+    pub member_span: Span,
+    /// Span of the whole call expression.
+    pub span: Span,
+    /// Argument facts in source order.
+    pub args: Vec<CallArgFact>,
+}
+
 /// One straight-line `typeof` guard: `if (typeof x === "<lit>")` or
 /// `if (typeof x !== "<lit>")` at the top level of its statement list (never
 /// nested inside another `if`'s branches — those decline instead).
@@ -1142,6 +1182,9 @@ pub struct ParsedFile {
     /// One fact per direct `f(...)` call expression, in visitor (pre-order)
     /// order. Empty when the file makes no direct calls.
     pub calls: Vec<CallFact>,
+    /// One fact per allowlisted `JSON.parse(...)`-shaped member call, in
+    /// visitor (pre-order) order. Empty when the file makes no such calls.
+    pub member_calls: Vec<MemberCallFact>,
     /// One fact per top-level simple `typeof` guard, in visitor (pre-order)
     /// order. Empty when the file has no narrowable guards.
     pub guards: Vec<TypeofGuardFact>,
@@ -1197,6 +1240,7 @@ struct DeclCollector<'a> {
     decls: Vec<DeclFact>,
     functions: Vec<FunctionFact>,
     calls: Vec<CallFact>,
+    member_calls: Vec<MemberCallFact>,
     guards: Vec<TypeofGuardFact>,
     declines: Vec<DeclineRegionFact>,
     interfaces: Vec<InterfaceFact>,
@@ -1554,6 +1598,19 @@ fn return_kind(source: &str, expression: &Expression<'_>) -> ReturnKind {
         }
         _ => ReturnKind::NonLiteral,
     }
+}
+
+/// Whether a member-call receiver names a known value with opaque lib
+/// signatures solver-side (`JSON`, `Object`, `Array`, `console`, `Math`).
+///
+/// The closed allowlist mirrors the solver's table (see
+/// `pith_solver::check_member_calls`): only these receivers emit
+/// [`MemberCallFact`]s, so the solver never verdicts a member call it has no
+/// probe-grounded signature for. Probe basis: tsc 7.0.2 `--strict
+/// --pretty false`, recorded in the solver docs.
+#[must_use]
+pub fn is_known_value_receiver(name: &str) -> bool {
+    matches!(name, "JSON" | "Object" | "Array" | "console" | "Math")
 }
 
 /// Classifies one call argument into its literal kind.
@@ -2418,6 +2475,70 @@ impl DeclCollector<'_> {
         });
     }
 
+    /// Records one member call expression when it is an allowlisted
+    /// `JSON.parse(...)`-shaped call.
+    ///
+    /// Anything else emits no fact, never a wrong one: member calls on other
+    /// receivers (`obj.pick()`), computed members (`JSON["parse"]()`),
+    /// optional chains (`JSON?.parse()`, `JSON.parse?.()`), chained receivers
+    /// (`a.b.c()`), and every other non-identifier receiver or callee fail
+    /// the gates; any spread element (`JSON.parse(...xs)`) drops the whole
+    /// call (arity is unknowable from facts). Unclassifiable arguments still
+    /// occupy their position as [`CallArgKind::NonLiteral`] so arity checks
+    /// keep working.
+    fn record_member_call(&mut self, call: &CallExpression<'_>) {
+        if call.optional {
+            return;
+        }
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return;
+        };
+        if member.optional {
+            return;
+        }
+        let Expression::Identifier(object) = &member.object else {
+            return;
+        };
+        if !is_known_value_receiver(object.name.as_str()) {
+            return;
+        }
+        if call.arguments.iter().any(Argument::is_spread) {
+            return;
+        }
+        let mut args = Vec::with_capacity(call.arguments.len());
+        for argument in &call.arguments {
+            // Only `SpreadElement` converts to `None`, already excluded
+            // above: this skips rather than mis-records on skew.
+            let Some(expression) = argument.as_expression() else {
+                return;
+            };
+            let span = expression.span();
+            args.push(CallArgFact {
+                kind: call_arg_kind(self.source, expression),
+                span: Span {
+                    file: self.file,
+                    lo: span.start,
+                    hi: span.end,
+                },
+            });
+        }
+        self.member_calls.push(MemberCallFact {
+            receiver: object.name.to_string(),
+            member: member.property.name.to_string(),
+            member_span: Span {
+                file: self.file,
+                lo: member.property.span.start,
+                hi: member.property.span.end,
+            },
+            span: Span {
+                file: self.file,
+                lo: call.span.start,
+                hi: call.span.end,
+            },
+            args,
+        });
+    }
+
     /// Records one `new C(...)` expression when the callee is a plain
     /// identifier.
     ///
@@ -3044,6 +3165,7 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
         self.record_call(it);
+        self.record_member_call(it);
         // Keep walking: arguments nest further calls (`f(g(1))` yields a fact
         // per call) and declarations inside them.
         walk::walk_call_expression(self, it);
@@ -3164,6 +3286,7 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         decls: collected.decls,
         functions: collected.functions,
         calls: collected.calls,
+        member_calls: collected.member_calls,
         guards: collected.guards,
         decline_regions: collected.declines,
         interfaces: collected.interfaces,
@@ -3366,6 +3489,7 @@ struct CollectedFacts {
     decls: Vec<DeclFact>,
     functions: Vec<FunctionFact>,
     calls: Vec<CallFact>,
+    member_calls: Vec<MemberCallFact>,
     guards: Vec<TypeofGuardFact>,
     declines: Vec<DeclineRegionFact>,
     interfaces: Vec<InterfaceFact>,
@@ -3406,6 +3530,7 @@ fn collect_decls<'a>(
         decls: Vec::new(),
         functions: Vec::new(),
         calls: Vec::new(),
+        member_calls: Vec::new(),
         guards: Vec::new(),
         declines: Vec::new(),
         interfaces: Vec::new(),
@@ -3423,6 +3548,7 @@ fn collect_decls<'a>(
         decls,
         functions,
         calls,
+        member_calls,
         guards,
         declines,
         interfaces,
@@ -3437,6 +3563,7 @@ fn collect_decls<'a>(
         decls,
         functions,
         calls,
+        member_calls,
         guards,
         declines,
         interfaces,
@@ -4539,6 +4666,64 @@ export function f(a: string): string { return a + b; }
         let pf = parse_module(FileId(0), "s.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
         assert!(pf.calls.is_empty());
+    }
+
+    #[test]
+    fn member_call_facts_record_receiver_member_spans() {
+        // Offsets hand-counted: `parse` at 5..10, `"s"` at 11..14, `1` at
+        // 16..17, the whole call at 0..18.
+        let src = "JSON.parse(\"s\", 1);\n";
+        let pf = parse_module(FileId(0), "m.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(pf.calls.is_empty(), "member calls never emit direct facts");
+        assert_eq!(pf.member_calls.len(), 1);
+        let fact = &pf.member_calls[0];
+        assert_eq!(fact.receiver, "JSON");
+        assert_eq!(fact.member, "parse");
+        assert_eq!((fact.member_span.lo, fact.member_span.hi), (5, 10));
+        assert_eq!(slice_of(src, fact.member_span), "parse");
+        assert_eq!((fact.span.lo, fact.span.hi), (0, 18));
+        assert_eq!(fact.span.file, FileId(0));
+        assert_eq!(fact.member_span.file, FileId(0));
+        let kinds: Vec<CallArgKind> = fact.args.iter().map(|arg| arg.kind).collect();
+        assert_eq!(kinds, [CallArgKind::String, CallArgKind::Number]);
+        for arg in &fact.args {
+            assert_eq!(arg.span.file, FileId(0));
+            assert!(arg.span.lo < arg.span.hi);
+        }
+    }
+
+    #[test]
+    fn member_call_facts_gate_on_allowlist() {
+        // Only known-value receivers emit: `obj.pick` and `nope.parse` stay
+        // silent while `console.warn` and `Math.floor` record.
+        let src = "obj.pick(1);\nnope.parse(\"s\");\nconsole.warn(\"x\");\nMath.floor(1);\n";
+        let pf = parse_module(FileId(0), "m.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(pf.calls.is_empty());
+        assert_eq!(pf.member_calls.len(), 2);
+        let names: Vec<(&str, &str)> = pf
+            .member_calls
+            .iter()
+            .map(|fact| (fact.receiver.as_str(), fact.member.as_str()))
+            .collect();
+        assert_eq!(names, [("console", "warn"), ("Math", "floor")]);
+    }
+
+    #[test]
+    fn member_call_facts_skip_computed_optional_spread() {
+        // Computed members, optional chains, spreads, and chained receivers
+        // emit no member facts, never wrong ones.
+        let src = "JSON[\"parse\"](\"s\");\nJSON.parse?.(\"s\");\nJSON?.parse(\"s\");\n\
+                   JSON.parse(...xs);\na.b.c();\n";
+        let pf = parse_module(FileId(0), "m.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert!(pf.calls.is_empty());
+        assert!(
+            pf.member_calls.is_empty(),
+            "no member facts: {:?}",
+            pf.member_calls
+        );
     }
 
     #[test]
