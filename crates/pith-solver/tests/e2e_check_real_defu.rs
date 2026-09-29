@@ -24,9 +24,10 @@ use pith_ids::{FileId, NodeId, Span, SymbolId};
 use pith_queries::{QueryDb, QueryKey, QueryKind};
 use pith_solver::{
     multifile::{check_program, ImportUse, ProgramFile, ProgramReport},
-    CallArg, CallSite, ConstDecl, DeclKind, EnumMember, EnumMemberValue, EnumShape, FunctionBody,
-    FunctionDecl, FunctionParam, FunctionReturn, InitKind, InterfaceHeritage, InterfaceMember,
-    InterfaceShape, JoinedReturns, NamespaceShape, ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    CallArg, CallSite, ConstDecl, DeclKind, EnumMember, EnumMemberValue, EnumShape, FileReport,
+    FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, InitKind, InterfaceHeritage,
+    InterfaceMember, InterfaceShape, JoinedReturns, NamespaceShape, ObjectInit, ObjectMemberInit,
+    ObjectMemberKind,
 };
 use pith_symbols::{
     multifile::{
@@ -498,6 +499,7 @@ struct FileSpec<'a> {
 struct Program {
     report: ProgramReport,
     db: QueryDb,
+    binder: Binder,
     graph: ModuleGraph,
     parsed: Vec<ParsedFile>,
     parse_bind_ms: u128,
@@ -547,6 +549,7 @@ fn run_program(specs: &[FileSpec<'_>]) -> Program {
     Program {
         report,
         db,
+        binder,
         graph,
         parsed,
         parse_bind_ms,
@@ -673,5 +676,184 @@ fn real_defu_value_import_verdict() {
             })
             .is_some();
         println!("DEFU_MEMO {file:?}: node0 memoized={memoized}");
+    }
+}
+
+/// The pinned destr file set: one file, so the graph holds a single
+/// module and no imports (the premise the test below asserts).
+fn destr_specs() -> [FileSpec<'static>; 1] {
+    [FileSpec {
+        path: "destr/src/index.ts",
+        source: include_str!("../../../corpus/real/destr/src/index.ts"),
+        objects: &[],
+    }]
+}
+
+/// The executed verdict on the destr graph (PITH-P028).
+///
+/// The v2 prescan projects `jsonParseTransform` declines (a bare return
+/// plus a two-statement branch, not `GuardReturn`) and 0/9 overall. A
+/// decline at the target's span confirms the projection; a silent check
+/// or a diagnostic flips it. The test passes in every case and prints
+/// `DESTR_TARGET_VERDICT` so the remote run output is the evidence — a
+/// flip is data, not failure. Every `DESTR_*` line reports an EXECUTED
+/// value; the projection is quoted only for comparison, never as a
+/// verdict.
+///
+/// The nearest-miss target plus whatever the run attached at its span.
+struct TargetVerdict {
+    diags: Vec<String>,
+    notes: Vec<String>,
+}
+
+/// Locates `jsonParseTransform` in the adapter facts and collects whatever
+/// the executed run attached at its span (or silence).
+fn destr_target_verdict(
+    destr_parsed: &ParsedFile,
+    binder: &Binder,
+    main: &FileReport,
+) -> TargetVerdict {
+    let target = destr_parsed
+        .functions
+        .iter()
+        .find(|func| {
+            let index = usize::try_from(func.symbol).expect("dense symbol index");
+            destr_parsed.symbols[index].name == "jsonParseTransform"
+        })
+        .expect("destr defines jsonParseTransform");
+    let (target_name, target_span, _) =
+        fallback_span(destr_parsed, binder, target.symbol, target.scope);
+    assert_eq!(target_name, "jsonParseTransform");
+    let diags = main
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.span == target_span)
+        .map(|diag| {
+            let code = diag.code.as_str();
+            let message = diag.message.as_str();
+            format!("{code}: {message}")
+        })
+        .collect();
+    let notes = main
+        .unsupported
+        .iter()
+        .filter(|note| note.span == target_span)
+        .map(|note| note.reason.clone())
+        .collect();
+    TargetVerdict { diags, notes }
+}
+
+/// Prints one EXECUTED line per fed function and const: whatever the run
+/// attached at its span (diagnosed, declined with reasons, or silence).
+fn print_construct_verdicts(destr_parsed: &ParsedFile, binder: &Binder, main: &FileReport) {
+    for func in &destr_parsed.functions {
+        let (name, span, _) = fallback_span(destr_parsed, binder, func.symbol, func.scope);
+        let diags = main
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.span == span)
+            .count();
+        let notes: Vec<&str> = main
+            .unsupported
+            .iter()
+            .filter(|note| note.span == span)
+            .map(|note| note.reason.as_str())
+            .collect();
+        if diags > 0 {
+            println!("DESTR_FUNC {name}: EXECUTED diagnosed x{diags}");
+        } else if notes.is_empty() {
+            println!("DESTR_FUNC {name}: EXECUTED silent");
+        } else {
+            println!("DESTR_FUNC {name}: EXECUTED declined {notes:?}");
+        }
+    }
+    for decl in &destr_parsed.decls {
+        let (name, span, _) = fallback_span(destr_parsed, binder, decl.symbol, decl.scope);
+        let diags = main
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.span == span)
+            .count();
+        let notes: Vec<&str> = main
+            .unsupported
+            .iter()
+            .filter(|note| note.span == span)
+            .map(|note| note.reason.as_str())
+            .collect();
+        if diags > 0 {
+            println!("DESTR_CONST {name}: EXECUTED diagnosed x{diags}");
+        } else if notes.is_empty() {
+            println!("DESTR_CONST {name}: EXECUTED silent");
+        } else {
+            println!("DESTR_CONST {name}: EXECUTED declined {notes:?}");
+        }
+    }
+}
+
+/// Dumps per-file verdict counts plus every diagnostic and note, and
+/// asserts span hygiene — mirroring the DEFU protocol.
+fn dump_file_verdicts(program: &Program) {
+    for (file, report) in &program.report.files {
+        let diags = report.diagnostics.len();
+        let notes = report.unsupported.len();
+        println!("DESTR_FILE {file:?}: {diags} diagnostics, {notes} unsupported");
+        for diag in &report.diagnostics {
+            let code = diag.code.as_str();
+            let message = diag.message.as_str();
+            println!("DESTR_DIAG {file:?}: {code}: {message}");
+        }
+        for note in &report.unsupported {
+            let reason = note.reason.as_str();
+            println!("DESTR_NOTE {file:?}: {reason}");
+        }
+        let mut spans: Vec<Span> = report.diagnostics.iter().map(|diag| diag.span).collect();
+        spans.extend(report.unsupported.iter().map(|note| note.span));
+        for item in spans {
+            assert!(item.lo < item.hi, "degenerate span in {file:?}");
+        }
+    }
+}
+
+#[test]
+fn real_destr_single_file_verdict() {
+    let specs = destr_specs();
+    let program = run_program(&specs);
+    assert_eq!(program.report.files.len(), 1, "destr graph file count");
+    // Single-file premise (not a verdict): nothing to import or resolve.
+    let destr_parsed = &program.parsed[0];
+    assert!(
+        destr_parsed.named_imports.is_empty(),
+        "destr premise: no imports expected",
+    );
+    assert!(
+        destr_parsed.reexports.is_empty(),
+        "destr premise: no re-exports expected",
+    );
+    // The nearest-miss target, straight from the adapter facts.
+    let main = program.report.file(FileId(0)).expect("destr report");
+    let target = destr_target_verdict(destr_parsed, &program.binder, main);
+    let attached_diags = target.diags;
+    let attached_notes = target.notes;
+    // Per-construct EXECUTED verdicts: every fed function and const maps
+    // its span to whatever the run attached there (or silence).
+    print_construct_verdicts(destr_parsed, &program.binder, main);
+    // Full-file dump plus span hygiene, mirroring the DEFU protocol.
+    dump_file_verdicts(&program);
+    let parse_bind_ms = program.parse_bind_ms;
+    let check_ms = program.check_ms;
+    println!("DESTR_WALL_MS parse_bind={parse_bind_ms} check={check_ms}");
+    println!("DESTR_PROJECTION: jsonParseTransform declines (bare return, v2 #4)");
+    if attached_diags.is_empty() && attached_notes.is_empty() {
+        println!("DESTR_TARGET_VERDICT: EXECUTED silent — FLIP vs projection");
+    } else if attached_diags.is_empty() {
+        println!(
+            "DESTR_TARGET_VERDICT: EXECUTED decline — \
+             CONFIRMS projection {attached_notes:?}",
+        );
+    } else {
+        println!(
+            "DESTR_TARGET_VERDICT: EXECUTED diagnosed — FLIP vs projection \
+             {attached_diags:?} {attached_notes:?}",
+        );
     }
 }
