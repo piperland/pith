@@ -857,3 +857,210 @@ fn real_destr_single_file_verdict() {
         );
     }
 }
+
+/// The pinned plimit file set: one ambient `.d.ts`, so the graph holds a
+/// single module and no imports (the premise the test below asserts).
+fn plimit_specs() -> [FileSpec<'static>; 1] {
+    [FileSpec {
+        path: "plimit-stress/index.d.ts",
+        source: include_str!("../../../corpus/real/plimit-stress/index.d.ts"),
+        objects: &[],
+    }]
+}
+
+/// The ambient target plus whatever the run attached at its span.
+struct PlimitTarget {
+    diags: Vec<String>,
+    notes: Vec<String>,
+}
+
+/// Locates `pLimit` in the adapter facts and collects whatever the
+/// executed run attached at its span (or silence).
+fn plimit_target_verdict(parsed: &ParsedFile, binder: &Binder, main: &FileReport) -> PlimitTarget {
+    let target = parsed
+        .functions
+        .iter()
+        .find(|func| {
+            let index = usize::try_from(func.symbol).expect("dense symbol index");
+            parsed.symbols[index].name == "pLimit"
+        })
+        .expect("plimit defines pLimit");
+    let (name, span, _) = fallback_span(parsed, binder, target.symbol, target.scope);
+    assert_eq!(name, "pLimit");
+    let diags = main
+        .diagnostics
+        .iter()
+        .filter(|diag| diag.span == span)
+        .map(|diag| {
+            let code = diag.code.as_str();
+            let message = diag.message.as_str();
+            format!("{code}: {message}")
+        })
+        .collect();
+    let notes = main
+        .unsupported
+        .iter()
+        .filter(|note| note.span == span)
+        .map(|note| note.reason.clone())
+        .collect();
+    PlimitTarget { diags, notes }
+}
+
+/// Prints one EXECUTED line per fed function at its span.
+fn print_plimit_functions(parsed: &ParsedFile, binder: &Binder, main: &FileReport) {
+    for func in &parsed.functions {
+        let (name, span, _) = fallback_span(parsed, binder, func.symbol, func.scope);
+        let diags = main
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.span == span)
+            .count();
+        let notes: Vec<&str> = main
+            .unsupported
+            .iter()
+            .filter(|note| note.span == span)
+            .map(|note| note.reason.as_str())
+            .collect();
+        if diags > 0 {
+            println!("PLIMIT_FUNC {name}: EXECUTED diagnosed x{diags}");
+        } else if notes.is_empty() {
+            println!("PLIMIT_FUNC {name}: EXECUTED silent");
+        } else {
+            println!("PLIMIT_FUNC {name}: EXECUTED declined {notes:?}");
+        }
+    }
+}
+
+/// Prints one EXECUTED line per fed const at its span.
+fn print_plimit_consts(parsed: &ParsedFile, binder: &Binder, main: &FileReport) {
+    for decl in &parsed.decls {
+        let (name, span, _) = fallback_span(parsed, binder, decl.symbol, decl.scope);
+        let diags = main
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.span == span)
+            .count();
+        let notes: Vec<&str> = main
+            .unsupported
+            .iter()
+            .filter(|note| note.span == span)
+            .map(|note| note.reason.as_str())
+            .collect();
+        if diags > 0 {
+            println!("PLIMIT_CONST {name}: EXECUTED diagnosed x{diags}");
+        } else if notes.is_empty() {
+            println!("PLIMIT_CONST {name}: EXECUTED silent");
+        } else {
+            println!("PLIMIT_CONST {name}: EXECUTED declined {notes:?}");
+        }
+    }
+}
+
+/// Prints one EXECUTED line per fed interface at its span.
+fn print_plimit_interfaces(parsed: &ParsedFile, main: &FileReport) {
+    for fact in &parsed.interfaces {
+        let diags = main
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.span == fact.span)
+            .count();
+        let notes: Vec<&str> = main
+            .unsupported
+            .iter()
+            .filter(|note| note.span == fact.span)
+            .map(|note| note.reason.as_str())
+            .collect();
+        let name = fact.name.as_str();
+        if diags > 0 {
+            println!("PLIMIT_INTERFACE {name}: EXECUTED diagnosed x{diags}");
+        } else if notes.is_empty() {
+            println!("PLIMIT_INTERFACE {name}: EXECUTED silent");
+        } else {
+            println!("PLIMIT_INTERFACE {name}: EXECUTED declined {notes:?}");
+        }
+    }
+}
+
+/// Prints every fed per-construct EXECUTED verdict for the plimit graph.
+///
+/// Type aliases (`LimitFunction`, `Options`) emit no facts per the P022
+/// precedent, so they carry no fed span to verdict; the three families
+/// above are the exhaustive fed per-construct surface.
+fn print_plimit_verdicts(parsed: &ParsedFile, binder: &Binder, main: &FileReport) {
+    print_plimit_functions(parsed, binder, main);
+    print_plimit_consts(parsed, binder, main);
+    print_plimit_interfaces(parsed, main);
+}
+
+/// Dumps per-file verdict counts plus every diagnostic and note, and
+/// asserts span hygiene — mirroring the DESTR protocol.
+fn dump_plimit_file(program: &Program) {
+    for (file, report) in &program.report.files {
+        let diags = report.diagnostics.len();
+        let notes = report.unsupported.len();
+        println!("PLIMIT_FILE {file:?}: {diags} diagnostics, {notes} unsupported");
+        for diag in &report.diagnostics {
+            let code = diag.code.as_str();
+            let message = diag.message.as_str();
+            println!("PLIMIT_DIAG {file:?}: {code}: {message}");
+        }
+        for note in &report.unsupported {
+            let reason = note.reason.as_str();
+            println!("PLIMIT_NOTE {file:?}: {reason}");
+        }
+        let mut spans: Vec<Span> = report.diagnostics.iter().map(|diag| diag.span).collect();
+        spans.extend(report.unsupported.iter().map(|note| note.span));
+        for item in spans {
+            assert!(item.lo < item.hi, "degenerate span in {file:?}");
+        }
+    }
+}
+
+/// The executed verdict on the plimit graph (PITH-P029).
+///
+/// The v2 prescan projects wholesale decline on ambient/declare forms
+/// (0/4). A decline at the `pLimit` span confirms the projection; a
+/// silent check or a diagnostic flips it. The test passes in every case
+/// and prints `PLIMIT_TARGET_VERDICT` so the remote run output is the
+/// evidence — any outcome is a successful measurement. Every `PLIMIT_*`
+/// line reports an EXECUTED value; the projection is quoted only for
+/// comparison, never as a verdict.
+#[test]
+fn real_plimit_blowup_verdict() {
+    let specs = plimit_specs();
+    let program = run_program(&specs);
+    assert_eq!(program.report.files.len(), 1, "plimit graph file count");
+    // Single-file premise (not a verdict): the `.d.ts` carries no imports
+    // or re-exports — asserted after reading the file, not assumed.
+    let parsed = &program.parsed[0];
+    assert!(
+        parsed.named_imports.is_empty(),
+        "plimit premise: no imports"
+    );
+    assert!(parsed.reexports.is_empty(), "plimit premise: no re-exports");
+    // The ambient target, straight from the adapter facts.
+    let main = program.report.file(FileId(0)).expect("plimit report");
+    let target = plimit_target_verdict(parsed, &program.binder, main);
+    let attached_diags = target.diags;
+    let attached_notes = target.notes;
+    // Per-construct EXECUTED verdicts plus the full-file dump and hygiene.
+    print_plimit_verdicts(parsed, &program.binder, main);
+    dump_plimit_file(&program);
+    let parse_bind_ms = program.parse_bind_ms;
+    let check_ms = program.check_ms;
+    println!("PLIMIT_WALL_MS parse_bind={parse_bind_ms} check={check_ms}");
+    println!("PLIMIT_PROJECTION: wholesale decline on ambient forms (v2 0/4)");
+    if attached_diags.is_empty() && attached_notes.is_empty() {
+        println!("PLIMIT_TARGET_VERDICT: EXECUTED silent — FLIP vs projection");
+    } else if attached_diags.is_empty() {
+        println!(
+            "PLIMIT_TARGET_VERDICT: EXECUTED decline — \
+             CONFIRMS projection {attached_notes:?}",
+        );
+    } else {
+        println!(
+            "PLIMIT_TARGET_VERDICT: EXECUTED diagnosed — FLIP vs projection \
+             {attached_diags:?} {attached_notes:?}",
+        );
+    }
+}
