@@ -2368,11 +2368,16 @@ fn class_occurrence_node(base: u32, offset: usize) -> NodeId {
 ///
 /// [`check_generics`] checks identity-style `function id<T>(x: T): T`
 /// declarations with explicit type arguments AND single-candidate inference
-/// from argument literals. The (inferred or explicit) type argument binds in
-/// the scoped [`InferenceTable`], substitutes for `T` in the parameter
-/// annotation text, and checks through the same primitive comparisons (and
-/// message shapes) as [`check_calls`]. Bodies check against `T` directly at
-/// declaration level, exactly like tsc (call-independent).
+/// from argument literals, extended (P032) to single type parameters with
+/// primitive `extends` constraints and primitive `=` defaults. The
+/// (inferred or explicit) type argument binds in the scoped
+/// [`InferenceTable`], substitutes for `T` in the parameter annotation
+/// text, and checks through the same primitive comparisons (and message
+/// shapes) as [`check_calls`]. A declared constraint bounds the admitted
+/// kinds (violations diagnose `TS2345` on inference, `TS2344` on explicit
+/// type arguments); a declared default fills missing inference from
+/// non-literal arguments. Bodies check against `T` directly at declaration
+/// level, exactly like tsc (call-independent).
 ///
 /// Probe record (each `function id<T>(x: T): T { return x; }` unless noted):
 ///
@@ -2409,13 +2414,40 @@ fn class_occurrence_node(base: u32, offset: usize) -> NodeId {
 ///   in tsc but inexpressible without expression facts, so non-literal
 ///   returns decline (P013's reason) while calls still check (P014
 ///   precedent: body checkability is irrelevant to call sites).
+/// - Constrained and defaulted single parameters (P032, probed on tsc
+///   7.0.2 `--strict --pretty false`; probes in
+///   `.agent/scratch/p032-probes/`): `function idc<T extends string>(x:
+///   T): T { return x; }` admits inferred `idc("s")` and explicit
+///   `idc<string>("s")` silently; inferred `idc(1)` diagnoses `TS2345` at
+///   the argument against the constraint (`Argument of type 'number' is not
+///   assignable to parameter of type 'string'.`), while explicit
+///   `idc<number>("s")` diagnoses `TS2344` (`Type 'number' does not satisfy
+///   the constraint 'string'.`, anchored at the callee: no type-argument
+///   spans exist in facts — the `TS2304`/`TS2558` fold). Satisfaction beats
+///   argument checks (`idc<string>(1)` reports `TS2345`); name resolution
+///   beats satisfaction (`idc<Nope>(1)` reports `TS2304`); `any`/`never`
+///   satisfy every constraint while `unknown` diagnoses `TS2344`.
+///   `function idd<T = number>(x: T): T { return x; }` admits inferred
+///   `idd(1)` and explicit `idd<string>("s")` silently; the default fills
+///   missing inference (`idd(u)` over an identifier is clean in tsc and
+///   silent here), explicit overrides still check (`idd<string>(1)`
+///   reports `TS2345`), and defaults never fill missing VALUE arguments
+///   (`idd()` reports `TS2554`). Literal bodies check against `T` directly
+///   with or without bounds (only the folded elaboration names the
+///   constraint — the mirrored first line is unchanged), so the body path
+///   is shared.
 /// - Declines, all probed: multi-parameter `pair<T, U>` (clean call),
-///   constrained `idc("s")` (clean), defaulted `idd(1)` (clean) — solver
-///   declines each (pinned oracle-clean divergences). Union parameter
-///   `x: T | string` and object return `: { v: T }` error in tsc ITSELF
-///   (the `return x` fails: `Type 'string | T' is not assignable to type
-///   'T'.`, `Type 'T' is not assignable to type '{ v: T; }'.`) — solver
-///   declines with reasons (pinned oracle-error divergences).
+///   non-primitive bounds (`extends keyof T`, `extends string | number`,
+///   object defaults), `in`/`out`/`const` modifiers, and `keyof`/`infer`/
+///   conditional/mapped `T` positions — each with a distinct reason. Union
+///   parameter `x: T | string` and object return `: { v: T }` error in tsc
+///   ITSELF (the `return x` fails: `Type 'string | T' is not assignable to
+///   type 'T'.`, `Type 'T' is not assignable to type '{ v: T; }'.`) — solver
+///   declines with reasons (pinned oracle-error divergences), as do the
+///   P032 `keyof` (`Type 'keyof T' is not assignable to type 'T'.`),
+///   conditional (`Type 'number' is not assignable to type 'T extends
+///   string ? string : number'.`), and mapped (`TS2353` on the returned
+///   literal) positions.
 /// - Multi-parameter inference `f(1, "s")` over `(x: T, y: T)` binds the
 ///   literal type `1`, then `TS2345` on `"s"`: literal-type inference is
 ///   outside the subset (multi-parameter lists decline before any call
@@ -2434,19 +2466,28 @@ fn class_occurrence_node(base: u32, offset: usize) -> NodeId {
 ///
 /// Code for explicit type-argument count mismatches (oracle `TS2558`).
 pub const CODE_TYPE_ARITY: &str = "PITH2558";
+/// Code for explicit type arguments violating a primitive constraint
+/// (oracle `TS2344`).
+pub const CODE_CONSTRAINT: &str = "PITH2344";
 
 /// One generic `function id<T>(x: T): T` declaration: the plain
-/// [`FunctionDecl`] plus its declared type-parameter names verbatim from
-/// adapter facts.
+/// [`FunctionDecl`] plus its declared type-parameter facts verbatim from the
+/// adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenericDecl {
     /// The underlying declaration (name/span/scope/symbol/params/return/body).
     pub decl: FunctionDecl,
     /// Declared type-parameter names in source order (`["T"]` for `id<T>`).
     pub type_params: Vec<String>,
-    /// `true` when any parameter carries a constraint, a default, or an
-    /// `in`/`out`/`const` modifier (from the adapter's complexity flag).
+    /// `true` when any parameter carries an `in`/`out`/`const` modifier
+    /// (from the adapter's complexity flag).
     pub type_params_complex: bool,
+    /// Verbatim constraint text (`Some("string")` for `<T extends string>`);
+    /// `None` when unconstrained. Only primitives admit.
+    pub constraint: Option<String>,
+    /// Verbatim default text (`Some("number")` for `<T = number>`);
+    /// `None` when absent. Only primitives admit; fills missing inference.
+    pub default: Option<String>,
 }
 
 /// One call site that may instantiate a generic declaration.
@@ -2485,13 +2526,31 @@ impl InferenceTable {
     }
 }
 
+/// One admitted primitive bound: canonical id plus display text.
+///
+/// Bounds admit through [`annotation_type`] plus [`boundary_annotation_type`]
+/// (primitives and `any`/`unknown`/`never`); the structure is shared and
+/// canonical, so per-occurrence bindings still live only in the
+/// [`InferenceTable`] (H-002).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GenericBound {
+    /// Canonical builtin [`TypeId`] of the bound.
+    id: TypeId,
+    /// Canonical display text (`"string"`, `"number"`, ...).
+    text: String,
+}
+
 /// What a checkable generic declaration carries into call checking: the
-/// single bound type-parameter name (body verdicts emit at declaration
-/// level, so calls only need the name for decline-free gating).
+/// single bound type-parameter name plus its admitted bounds (body verdicts
+/// emit at declaration level, so calls only need these for gating).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GenericShape {
     /// The single bound type-parameter name (`T`).
     t_name: String,
+    /// Admitted `extends` bound, if declared.
+    constraint: Option<GenericBound>,
+    /// Admitted `=` default, if declared (fills missing inference).
+    default: Option<GenericBound>,
 }
 
 /// Checks every generic declaration in `decls` plus every instantiation in
@@ -2508,12 +2567,13 @@ struct GenericShape {
 /// [`check_calls`] (unresolved callees skip, overloads decline); calls to
 /// declined declarations skip silently (the declaration note covers them).
 /// Then arity (`PITH2554`, exact single argument), `T` resolution (explicit
-/// count `PITH2558` / unknown `PITH2304` / complex-type-argument decline, or
-/// single-literal inference with a no-candidate decline), and finally the
-/// substituted argument check (`PITH2345`, vacuous for inferred calls by
-/// construction). Non-literal arguments under explicit type arguments skip
-/// per-argument (P014 precedent); under inference they decline (no
-/// candidate).
+/// count `PITH2558` / unknown `PITH2304` / complex-type-argument decline /
+/// constraint `PITH2344`, or single-literal inference verified against a
+/// declared constraint, or default-filled inference), and finally the
+/// substituted argument check (`PITH2345`, vacuous for unconstrained
+/// inferred calls by construction). Non-literal arguments under explicit
+/// type arguments skip per-argument (P014 precedent); under inference they
+/// bind the default when one is declared and decline otherwise.
 ///
 /// Spans mirror the oracle: body diagnostics at the declaration span,
 /// too-few arity and `PITH2558`/`PITH2304` at the callee identifier,
@@ -2671,15 +2731,13 @@ fn check_generic_decl(
 /// Gates one generic declaration's type parameters, value parameters, and
 /// return annotation into a [`GenericShape`]; `Err` carries the reason.
 ///
-/// Gate order is structural-first: type-parameter complexity and count,
-/// then value-parameter patterns/annotatedness/optionality/count, then
-/// bare-`T` annotation shapes, then the return annotation. The body checks
-/// separately in [`check_generic_body`].
+/// Gate order is structural-first: type-parameter modifiers, count, and
+/// bound shapes, then value-parameter patterns/annotatedness/optionality/
+/// count, then bare-`T` annotation shapes, then the return annotation. The
+/// body checks separately in [`check_generic_body`].
 fn generic_decl_shape(generic: &GenericDecl) -> Result<GenericShape, String> {
     if generic.type_params_complex {
-        return Err(
-            "type parameter constraint, default, or modifier is outside the subset".to_owned(),
-        );
+        return Err("type parameter modifier is outside the subset".to_owned());
     }
     if generic.type_params.len() != 1 {
         if generic.type_params.is_empty() {
@@ -2693,6 +2751,14 @@ fn generic_decl_shape(generic: &GenericDecl) -> Result<GenericShape, String> {
             generic.type_params.join(", ")
         ));
     }
+    let constraint = match generic.constraint.as_deref() {
+        None => None,
+        Some(text) => Some(classify_bound(text, "constraint")?),
+    };
+    let default = match generic.default.as_deref() {
+        None => None,
+        Some(text) => Some(classify_bound(text, "default")?),
+    };
     let t_name = generic.type_params[0].clone();
     let decl = &generic.decl;
     if decl.params_complex {
@@ -2737,24 +2803,113 @@ fn generic_decl_shape(generic: &GenericDecl) -> Result<GenericShape, String> {
         ));
     }
     bare_t_return(annotation, &t_name)?;
-    Ok(GenericShape { t_name })
+    Ok(GenericShape {
+        t_name,
+        constraint,
+        default,
+    })
+}
+
+/// Canonical display text for one classified bound id.
+///
+/// Callers only pass ids that [`annotation_type`] or
+/// [`boundary_annotation_type`] produced, so every arm is reachable on real
+/// paths and the fallback never fires.
+fn bound_display(id: TypeId) -> &'static str {
+    if id == TypeStore::NUMBER {
+        "number"
+    } else if id == TypeStore::STRING {
+        "string"
+    } else if id == TypeStore::BOOLEAN {
+        "boolean"
+    } else if id == TypeStore::NULL {
+        "null"
+    } else if id == TypeStore::UNDEFINED {
+        "undefined"
+    } else if id == TypeStore::VOID {
+        "void"
+    } else if id == TypeStore::ANY {
+        "any"
+    } else if id == TypeStore::UNKNOWN {
+        "unknown"
+    } else if id == TypeStore::NEVER {
+        "never"
+    } else {
+        "unknown"
+    }
+}
+
+/// Decline reason for one non-primitive generic-position text, if complex.
+///
+/// Union, mapped, object, `keyof`, `infer`, and conditional shapes each name
+/// themselves (in that order — a conditional holding `infer` reports
+/// `infer`, a mapped type reports `mapped` rather than `object`); `None`
+/// means the text is none of those (indexed `T[]`, concrete names, ...),
+/// and the caller falls through to its own wording. `what` names the
+/// position (`"parameter type"`, `"return type"`, `"constraint"`,
+/// `"default"`).
+fn complex_shape_reason(text: &str, what: &str) -> Option<String> {
+    if text.contains('|') {
+        Some(format!("union {what} '{text}' is outside the subset"))
+    } else if text.starts_with('{') && text.contains('[') && text.contains(" in ") {
+        Some(format!("mapped {what} '{text}' is outside the subset"))
+    } else if text.starts_with('{') {
+        Some(format!("object {what} '{text}' is outside the subset"))
+    } else if text.contains("keyof") {
+        Some(format!("keyof {what} '{text}' is outside the subset"))
+    } else if text.contains("infer") {
+        Some(format!("infer {what} '{text}' is outside the subset"))
+    } else if text.contains('?') {
+        Some(format!("conditional {what} '{text}' is outside the subset"))
+    } else {
+        None
+    }
+}
+
+/// Classifies one constraint/default text into a primitive bound.
+///
+/// Primitives (plus `any`/`unknown`/`never`) admit through the shared maps;
+/// every other shape declines via [`complex_shape_reason`], or the plain
+/// outside-the-subset wording when it is none of those. `kind` names the
+/// bound (`"constraint"` or `"default"`).
+fn classify_bound(text: &str, kind: &str) -> Result<GenericBound, String> {
+    let trimmed = text.trim();
+    let id = annotation_type(trimmed).or_else(|| boundary_annotation_type(trimmed));
+    if let Some(id) = id {
+        return Ok(GenericBound {
+            id,
+            text: bound_display(id).to_owned(),
+        });
+    }
+    if let Some(reason) = complex_shape_reason(trimmed, kind) {
+        return Err(reason);
+    }
+    Err(format!("{kind} '{trimmed}' is outside the subset"))
+}
+
+/// Whether one explicit type argument satisfies a primitive constraint.
+///
+/// Same-primitive admits; `any`/`never` satisfy every constraint, and every
+/// argument satisfies an `any`/`unknown` constraint (probed tsc 7.0.2:
+/// `idc<any>` is clean, `idc<never>` reaches the argument check,
+/// `idc<unknown>` diagnoses `TS2344`).
+fn bound_satisfied(argument: TypeId, constraint: TypeId) -> bool {
+    argument == constraint
+        || argument == TypeStore::ANY
+        || argument == TypeStore::NEVER
+        || constraint == TypeStore::ANY
+        || constraint == TypeStore::UNKNOWN
 }
 
 /// Requires a value-parameter annotation to be exactly the bare type
-/// parameter (`T`); union/object/other shapes decline with distinct reasons.
+/// parameter (`T`); union/mapped/object/`keyof`/`infer`/conditional shapes
+/// decline with distinct reasons via [`complex_shape_reason`].
 fn bare_t_param(text: &str, t_name: &str, param: &str) -> Result<(), String> {
     if text == t_name {
         return Ok(());
     }
-    if text.contains('|') {
-        return Err(format!(
-            "union parameter type '{text}' is outside the subset"
-        ));
-    }
-    if text.starts_with('{') {
-        return Err(format!(
-            "object parameter type '{text}' is outside the subset"
-        ));
+    if let Some(reason) = complex_shape_reason(text, "parameter type") {
+        return Err(reason);
     }
     Err(format!(
         "parameter type '{text}' for '{param}' is not the bare type parameter '{t_name}': outside the subset"
@@ -2762,16 +2917,14 @@ fn bare_t_param(text: &str, t_name: &str, param: &str) -> Result<(), String> {
 }
 
 /// Requires the return annotation to be exactly the bare type parameter
-/// (`T`); union/object/other shapes decline with distinct reasons.
+/// (`T`); union/mapped/object/`keyof`/`infer`/conditional shapes decline
+/// with distinct reasons via [`complex_shape_reason`].
 fn bare_t_return(text: &str, t_name: &str) -> Result<(), String> {
     if text == t_name {
         return Ok(());
     }
-    if text.contains('|') {
-        return Err(format!("union return type '{text}' is outside the subset"));
-    }
-    if text.starts_with('{') {
-        return Err(format!("object return type '{text}' is outside the subset"));
+    if let Some(reason) = complex_shape_reason(text, "return type") {
+        return Err(reason);
     }
     Err(format!(
         "return type '{text}' is not the bare type parameter '{t_name}': outside the subset"
@@ -2937,8 +3090,9 @@ fn check_one_generic_call(node: NodeId, call_site: &GenericCall, ctx: &mut Gener
     };
     let argument = &call.args[0];
     if argument.kind == InitKind::NonLiteral {
-        // Reachable only under explicit type arguments (inference declines
-        // non-literals during resolution): skip per-argument, P014 precedent.
+        // Reachable under explicit type arguments (checked against the
+        // resolved type) and default-filled inference (bound to the
+        // default): skip per-argument, P014 precedent.
         return;
     }
     if argument.kind.type_id() != bound {
@@ -2957,12 +3111,16 @@ fn check_one_generic_call(node: NodeId, call_site: &GenericCall, ctx: &mut Gener
 /// Resolves `T` for one call to its builtin [`TypeId`] plus display text,
 /// recording the binding in the [`InferenceTable`].
 ///
-/// Explicit arguments gate count (`PITH2558`), then name
-/// (`PITH2304` for unknown names, decline for union/object shapes tsc
-/// accepts but the subset cannot spell checks against). Inference binds
-/// the single literal argument's kind and declines non-literals (no
-/// candidate without expression facts). Returns `None` when one note was
-/// pushed and the call declines.
+/// Explicit arguments gate count (`PITH2558`), then name (`PITH2304` for
+/// unknown names, decline for union/object shapes tsc accepts but the
+/// subset cannot spell checks against), then constraint satisfaction
+/// (`PITH2344`, which beats argument checks — probed tsc 7.0.2). Inference
+/// binds the single literal argument's kind and verifies it against a
+/// declared constraint (so violations diagnose `TS2345` with the constraint
+/// spelling); a declared default fills missing inference from non-literal
+/// arguments (the per-argument skip then stays silent), and non-literals
+/// without a default decline with no candidate. Returns `None` when one
+/// note was pushed and the call declines.
 #[must_use]
 fn resolve_t(
     node: NodeId,
@@ -3003,6 +3161,20 @@ fn resolve_t(
             });
             return None;
         };
+        if let Some(constraint) = shape.constraint.as_ref() {
+            if !bound_satisfied(bound, constraint.id) {
+                ctx.report.diagnostics.push(PithDiagnostic {
+                    code: CODE_CONSTRAINT.to_owned(),
+                    file,
+                    span: call.callee_span,
+                    message: format!(
+                        "Type '{text}' does not satisfy the constraint '{}'.",
+                        constraint.text
+                    ),
+                });
+                return None;
+            }
+        }
         ctx.inference.bindings.insert((file, node), bound);
         // Verdicts below substitute the RECORDED binding, never the
         // transient local: occurrence-varying state flows through the
@@ -3012,6 +3184,13 @@ fn resolve_t(
     }
     let argument = &call.args[0];
     if argument.kind == InitKind::NonLiteral {
+        if let Some(default) = shape.default.as_ref() {
+            ctx.inference.bindings.insert((file, node), default.id);
+            // Same read-back as the explicit path: substitute the recorded
+            // binding (H-002), never the transient local.
+            let bound = ctx.inference.binding(file, node).unwrap_or(default.id);
+            return Some((bound, default.text.clone()));
+        }
         ctx.report.unsupported.push(UnsupportedDecl {
             file,
             span: argument.span,
@@ -3023,11 +3202,18 @@ fn resolve_t(
         return None;
     }
     let bound = argument.kind.type_id();
-    let display = primitive_name(bound).unwrap_or("unknown").to_owned();
     ctx.inference.bindings.insert((file, node), bound);
     // Same read-back as the explicit path: substitute the recorded
     // binding (H-002), never the transient local.
     let bound = ctx.inference.binding(file, node).unwrap_or(bound);
+    if let Some(constraint) = shape.constraint.as_ref() {
+        // The inferred kind records above, but the argument verifies against
+        // the constraint: violations diagnose `TS2345` with the constraint
+        // spelling (probed tsc 7.0.2: `idc(1)` reports the argument against
+        // `'string'`, never `TS2344`).
+        return Some((constraint.id, constraint.text.clone()));
+    }
+    let display = primitive_name(bound).unwrap_or("unknown").to_owned();
     Some((bound, display))
 }
 
@@ -9041,6 +9227,8 @@ mod tests {
             },
             type_params: t_params.iter().map(|param| (*param).to_owned()).collect(),
             type_params_complex: false,
+            constraint: None,
+            default: None,
         }
     }
 
@@ -9360,7 +9548,8 @@ mod tests {
 
     #[test]
     fn generic_complex_type_params_decline() {
-        // Constraints/defaults/modifiers arrive as one flag: one reason.
+        // `in`/`out`/`const` modifiers arrive as one flag: one reason.
+        // (Constraints and defaults are facts now — see the bound tests.)
         let binder = binder_with(&[("id", span(0, 20))]);
         let mut decl = identity_decl(0, 20);
         decl.type_params_complex = true;
@@ -9368,9 +9557,287 @@ mod tests {
         assert!(report.diagnostics.is_empty());
         assert_eq!(report.unsupported.len(), 1);
         assert!(
-            report.unsupported[0].reason.contains("constraint"),
+            report.unsupported[0].reason.contains("modifier"),
             "reason: {}",
             report.unsupported[0].reason
+        );
+    }
+
+    /// The canonical bounded declaration: `function name<T extends C = D>(x:
+    /// T): T` with a pass-through body (non-literal, so the declaration
+    /// declines while calls still check — P014 precedent).
+    fn bounded_decl(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        constraint: Option<&str>,
+        default: Option<&str>,
+    ) -> GenericDecl {
+        let mut decl = generic_decl_named(
+            name,
+            lo,
+            hi,
+            &["T"],
+            Some("T"),
+            Some("T"),
+            FunctionBody::SingleReturn(FunctionReturn {
+                kind: Some(InitKind::NonLiteral),
+                init_object: None,
+                cast: None,
+            }),
+        );
+        decl.constraint = constraint.map(str::to_owned);
+        decl.default = default.map(str::to_owned);
+        decl
+    }
+
+    #[test]
+    fn generic_constrained_inferred_correct_binds_silently() {
+        // `idc("s")` over `<T extends string>`: the inferred `string`
+        // satisfies the constraint, so only the body note remains.
+        let binder = binder_with(&[("idc", span(0, 20))]);
+        let decl = bounded_decl("idc", 0, 20, Some("string"), None);
+        let args = vec![(InitKind::String, 40, 44)];
+        let calls = [generic_call_args("idc", 30, 33, args, None)];
+        let report = generics_report(&[decl], &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_constrained_inferred_wrong_is_ts2345() {
+        // `idc(1)` over `<T extends string>`: the oracle's TS2345 at the
+        // argument against the constraint spelling (never TS2344).
+        let binder = binder_with(&[("idc", span(0, 20))]);
+        let decl = bounded_decl("idc", 0, 20, Some("string"), None);
+        let args = vec![(InitKind::Number, 40, 41)];
+        let calls = [generic_call_args("idc", 30, 33, args, None)];
+        let report = generics_report(&[decl], &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'number' is not assignable to parameter of type 'string'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(40, 41));
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_constrained_explicit_violation_is_ts2344() {
+        // `idc<number>("s")`: the oracle's TS2344 (callee-anchored: no
+        // type-argument spans exist in facts — the TS2304/TS2558 fold).
+        let binder = binder_with(&[("idc", span(0, 20))]);
+        let decl = bounded_decl("idc", 0, 20, Some("string"), None);
+        let args = vec![(InitKind::String, 40, 44)];
+        let calls = [generic_call_args("idc", 30, 33, args, Some(vec!["number"]))];
+        let report = generics_report(&[decl], &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_CONSTRAINT);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' does not satisfy the constraint 'string'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(30, 33));
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_constrained_explicit_satisfies_then_arg_checks() {
+        // `idc<string>("s")` is silent while `idc<string>(1)` reports
+        // TS2345: satisfaction beats argument checks, never replaces them.
+        let binder = binder_with(&[("idc", span(0, 20))]);
+        let decl = bounded_decl("idc", 0, 20, Some("string"), None);
+        let calls = [
+            generic_call_args(
+                "idc",
+                30,
+                33,
+                vec![(InitKind::String, 40, 44)],
+                Some(vec!["string"]),
+            ),
+            generic_call_args(
+                "idc",
+                50,
+                53,
+                vec![(InitKind::Number, 60, 61)],
+                Some(vec!["string"]),
+            ),
+        ];
+        let report = generics_report(&[decl], &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'number' is not assignable to parameter of type 'string'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(60, 61));
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_constrained_explicit_unknown_is_ts2304() {
+        // `idc<Nope>(1)`: name resolution beats satisfaction — TS2304, even
+        // against a declared constraint.
+        let binder = binder_with(&[("idc", span(0, 20))]);
+        let decl = bounded_decl("idc", 0, 20, Some("string"), None);
+        let args = vec![(InitKind::Number, 40, 41)];
+        let calls = [generic_call_args("idc", 30, 33, args, Some(vec!["Nope"]))];
+        let report = generics_report(&[decl], &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_UNKNOWN_ANNOTATION);
+        assert_eq!(report.diagnostics[0].message, "Cannot find name 'Nope'.");
+    }
+
+    #[test]
+    fn generic_defaulted_fills_missing_inference() {
+        // `idd(u)` over `<T = number>`: no literal candidate, so the
+        // default binds and the per-argument skip stays silent (the oracle
+        // binds from the identifier's type — clean either way).
+        let binder = binder_with(&[("idd", span(0, 20))]);
+        let decl = bounded_decl("idd", 0, 20, None, Some("number"));
+        let args = vec![(InitKind::NonLiteral, 40, 41)];
+        let calls = [generic_call_args("idd", 30, 33, args, None)];
+        let report = generics_report(&[decl], &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_defaulted_inferred_and_override_check() {
+        // `idd(1)` prefers inference silently; `idd<string>(1)` overrides
+        // the default and reports TS2345.
+        let binder = binder_with(&[("idd", span(0, 20))]);
+        let decl = bounded_decl("idd", 0, 20, None, Some("number"));
+        let calls = [
+            generic_call_args("idd", 30, 33, vec![(InitKind::Number, 40, 41)], None),
+            generic_call_args(
+                "idd",
+                50,
+                53,
+                vec![(InitKind::Number, 60, 61)],
+                Some(vec!["string"]),
+            ),
+        ];
+        let report = generics_report(&[decl], &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'number' is not assignable to parameter of type 'string'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(60, 61));
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_non_primitive_bounds_decline() {
+        // Union/keyof constraints and object defaults decline with distinct
+        // reasons; their calls skip (the declaration note covers them).
+        let binder = binder_with(&[("f", span(0, 20)), ("g", span(21, 41)), ("h", span(42, 62))]);
+        let decls = [
+            bounded_decl("f", 0, 20, Some("string | number"), None),
+            bounded_decl("g", 21, 41, Some("keyof T"), None),
+            bounded_decl("h", 42, 62, None, Some("{ v: number }")),
+        ];
+        let calls = [generic_call_args(
+            "f",
+            70,
+            71,
+            vec![(InitKind::Number, 72, 73)],
+            None,
+        )];
+        let report = generics_report(&decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 3);
+        assert!(
+            report.unsupported[0].reason.contains("union constraint"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("keyof constraint"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+        assert!(
+            report.unsupported[2].reason.contains("object default"),
+            "reason: {}",
+            report.unsupported[2].reason
+        );
+    }
+
+    #[test]
+    fn generic_advanced_t_positions_decline() {
+        // `keyof` parameters, conditional and mapped returns, and `infer`
+        // bounds each decline with a distinct reason.
+        let binder = binder_with(&[
+            ("f", span(0, 20)),
+            ("g", span(21, 41)),
+            ("h", span(42, 62)),
+            ("k", span(63, 83)),
+        ]);
+        let body = || {
+            FunctionBody::SingleReturn(FunctionReturn {
+                kind: Some(InitKind::NonLiteral),
+                init_object: None,
+                cast: None,
+            })
+        };
+        let mut infer_named = generic_decl_named("k", 63, 83, &["T"], Some("T"), Some("T"), body());
+        infer_named.constraint = Some("infer U".to_owned());
+        let decls = [
+            generic_decl_named("f", 0, 20, &["T"], Some("keyof T"), Some("T"), body()),
+            generic_decl_named(
+                "g",
+                21,
+                41,
+                &["T"],
+                Some("T"),
+                Some("T extends string ? string : number"),
+                body(),
+            ),
+            generic_decl_named(
+                "h",
+                42,
+                62,
+                &["T"],
+                Some("T"),
+                Some("{ [K in keyof T]: T[K] }"),
+                body(),
+            ),
+            infer_named,
+        ];
+        let report = generics_report(&decls, &[], &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 4);
+        assert!(
+            report.unsupported[0].reason.contains("keyof parameter"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("conditional return"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+        assert!(
+            report.unsupported[2].reason.contains("mapped return"),
+            "reason: {}",
+            report.unsupported[2].reason
+        );
+        assert!(
+            report.unsupported[3].reason.contains("infer constraint"),
+            "reason: {}",
+            report.unsupported[3].reason
         );
     }
 
