@@ -359,6 +359,7 @@ fn interfaces_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<InterfaceS
                     .map(|member| InterfaceMember {
                         name: member.name.clone(),
                         annotation_text: member.annotation_text.clone(),
+                        optional: member.optional,
                         span: member.span,
                         complex_reason: member.complex_reason.clone(),
                     })

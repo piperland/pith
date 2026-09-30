@@ -17,15 +17,18 @@
 //!
 //! Differential rule: same as check-functions — oracle lines are
 //! `file:TSNNNN: message`, compared as sorted `(numeric-code, message)`
-//! multisets (`TS2554` <-> `PITH2554`, `TS2345` <-> `PITH2345`) plus the
-//! unsupported count. Three fixtures diverge by design (the oracle errors or
-//! stays clean where the subset declines): `unresolved-callee` (oracle
-//! `TS2304`, solver silent — the name is already tracked as an unresolved
-//! reference, never double-diagnosed), `overloads-declined` (oracle
-//! `TS2554`, solver one unsupported — overload resolution is future work),
-//! and `rest-param-declined` (oracle clean, solver one unsupported —
-//! variadic arity is outside the exact-count subset). Those pin the
-//! divergence explicitly instead of forcing a false match.
+//! multisets (`TS2554`/`TS2555` <-> `PITH2554`/`PITH2555`, `TS2345` <->
+//! `PITH2345`) plus the unsupported count. Three fixtures diverge by design
+//! (the oracle errors where the subset declines or skips):
+//! `unresolved-callee` (oracle `TS2304`, solver silent — the name is already
+//! tracked as an unresolved reference, never double-diagnosed),
+//! `overloads-declined` (oracle `TS2554`, solver one unsupported — overload
+//! resolution is future work), and `required-after-optional-declined`
+//! (oracle `TS1016` on the declaration, solver one unsupported — the solver
+//! spells no declaration diagnostics). Those pin the divergence explicitly
+//! instead of forcing a false match. Ranges, rest minima, and rest-element
+//! checks all match (P037 converted the old `rest-param-declined`
+//! divergence into a silent match).
 
 use pith_frontend::{
     parse_module, CallArgKind as FrontendCallArgKind, FunctionBodyFact, ParsedFile,
@@ -263,6 +266,31 @@ fn calls_from_facts(parsed: &ParsedFile) -> Vec<CallSite> {
         .collect()
 }
 
+/// Variant pipeline for fixtures where the frontend itself diagnoses (Oxc
+/// mirrors tsc diagnostics like TS1016): asserts the expected diagnostic
+/// is present instead of asserting silence, then checks facts still flow
+/// (Oxc recovers and emits them).
+fn run_pipeline_with_frontend_diagnostic(
+    source: &str,
+    code: &str,
+    message: &str,
+) -> (ParsedFile, FileReport) {
+    let parsed = parse_module(FILE, "fixture.ts", source);
+    assert!(
+        parsed
+            .errors
+            .iter()
+            .any(|error| error.contains(code) && error.contains(message)),
+        "expected frontend {code}: {message}, got: {:?}",
+        parsed.errors
+    );
+    let binder = build_binder(&parsed);
+    let decls = functions_from_facts(&parsed, &binder);
+    let calls = calls_from_facts(&parsed);
+    let report = check_calls(FILE, &decls, &calls, &binder);
+    (parsed, report)
+}
+
 /// Runs the full real pipeline on one source text with a fresh binder.
 fn run_pipeline(source: &str) -> (ParsedFile, FileReport) {
     let parsed = parse_module(FILE, "fixture.ts", source);
@@ -373,6 +401,42 @@ fixture_test!(
     "wrong-arg-type.expected.txt",
     0
 );
+fixture_test!(
+    range_correct_is_silent,
+    "range-correct.ts",
+    "range-correct.expected.txt",
+    0
+);
+fixture_test!(
+    range_too_few_matches_ts2554,
+    "range-too-few.ts",
+    "range-too-few.expected.txt",
+    0
+);
+fixture_test!(
+    range_too_many_matches_ts2554,
+    "range-too-many.ts",
+    "range-too-many.expected.txt",
+    0
+);
+fixture_test!(
+    range_wrong_type_matches_ts2345,
+    "range-wrong-type.ts",
+    "range-wrong-type.expected.txt",
+    0
+);
+fixture_test!(
+    rest_param_admitted_is_silent,
+    "rest-param-declined.ts",
+    "rest-param-declined.expected.txt",
+    0
+);
+fixture_test!(
+    rest_prefix_matches_ts2345_and_ts2555,
+    "rest-prefix.ts",
+    "rest-prefix.expected.txt",
+    0
+);
 
 #[test]
 fn unresolved_callee_pins_ts2304_and_skips_silently() {
@@ -467,16 +531,26 @@ fn overloads_declined_pins_ts2554() {
 }
 
 #[test]
-fn rest_param_declined_against_clean_oracle() {
-    // Variadic arity is outside the exact-count subset: oracle clean while
-    // the solver declines with one unsupported note.
-    let source = include_str!("../../../corpus/check-calls/rest-param-declined.ts");
-    let expected = include_str!("../../../corpus/check-calls/rest-param-declined.expected.txt");
-    assert!(
-        parse_baseline(expected).is_empty(),
-        "oracle is clean on rest calls"
+fn required_after_optional_declines_and_pins_ts1016() {
+    // Required-after-optional is outside the subset: tsc errors the
+    // declaration (`TS1016`) while the solver declines the call site with
+    // one unsupported note.
+    let source = include_str!("../../../corpus/check-calls/required-after-optional-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/required-after-optional-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS1016".to_owned(),
+            "A required parameter cannot follow an optional parameter.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
     );
-    let (_, report) = run_pipeline(source);
+    let (_, report) = run_pipeline_with_frontend_diagnostic(
+        source,
+        "1016",
+        "A required parameter cannot follow an optional parameter.",
+    );
     assert!(
         report.diagnostics.is_empty(),
         "diagnostics: {:?}",
@@ -484,7 +558,9 @@ fn rest_param_declined_against_clean_oracle() {
     );
     assert_eq!(report.unsupported.len(), 1);
     assert!(
-        report.unsupported[0].reason.contains("rest parameter"),
+        report.unsupported[0]
+            .reason
+            .contains("follows an optional parameter"),
         "reason: {}",
         report.unsupported[0].reason
     );

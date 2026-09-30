@@ -147,6 +147,7 @@ fn shapes_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<InterfaceShape
                     .map(|member| InterfaceMember {
                         name: member.name.clone(),
                         annotation_text: member.annotation_text.clone(),
+                        optional: member.optional,
                         span: member.span,
                         complex_reason: member.complex_reason.clone(),
                     })
@@ -411,9 +412,13 @@ fn iface_methods_declines_with_reasons() {
 }
 
 #[test]
-fn iface_optional_declines_per_use() {
+fn iface_optional_members_absent_silent_present_checked() {
+    // PITH-P037 converted the old per-use decline: absent optional members
+    // stay silent while present ones run the shared comparison, so both
+    // uses match the clean oracle with zero notes. (The `iface-optional-`
+    // fixture name records the history; the verdict is now silent.)
     expect_differential(
-        "iface_optional_declines_per_use",
+        "iface_optional_members_absent_silent_present_checked",
         include_str!("../../../corpus/check-interfaces/iface-optional-declined.ts"),
         &[
             HandFed {
@@ -432,7 +437,7 @@ fn iface_optional_declines_per_use() {
             },
         ],
         include_str!("../../../corpus/check-interfaces/iface-optional-declined.expected.txt"),
-        2,
+        0,
     );
 }
 

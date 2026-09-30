@@ -403,7 +403,10 @@ fn object_out_of_subset_is_unsupported() {
 }
 
 #[test]
-fn object_nested_annotation_is_unsupported() {
+fn object_nested_shape_still_declines_while_optional_is_silent() {
+    // Nested object member types stay declined (one note); the
+    // `{ a?: number } = {}` declarator went silent under PITH-P037 — an
+    // absent optional member checks clean in tsc, so silence matches.
     expect_differential(
         "object_nested_annotation_is_unsupported",
         include_str!("../../../corpus/check-object/object-nested-annotation.ts"),
@@ -424,7 +427,57 @@ fn object_nested_annotation_is_unsupported() {
             },
         ],
         include_str!("../../../corpus/check-object/object-nested-annotation.expected.txt"),
-        2,
+        1,
+    );
+}
+
+#[test]
+fn object_optional_absent_is_silent() {
+    expect_differential(
+        "object_optional_absent_is_silent",
+        include_str!("../../../corpus/check-object/object-optional-absent.ts"),
+        &[HandFed {
+            name: "o",
+            kind: DeclKind::Const,
+            annotation: Some("{ x: number; y?: number }"),
+            init: None,
+            members: Some(&[("x", Number)]),
+        }],
+        include_str!("../../../corpus/check-object/object-optional-absent.expected.txt"),
+        0,
+    );
+}
+
+#[test]
+fn object_optional_present_matches_oracle() {
+    expect_differential(
+        "object_optional_present_matches_oracle",
+        include_str!("../../../corpus/check-object/object-optional-present.ts"),
+        &[
+            HandFed {
+                name: "ok",
+                kind: DeclKind::Const,
+                annotation: Some("{ x: number; y?: number }"),
+                init: None,
+                members: Some(&[("x", Number), ("y", Number)]),
+            },
+            HandFed {
+                name: "bad",
+                kind: DeclKind::Const,
+                annotation: Some("{ x: number; y?: number }"),
+                init: None,
+                members: Some(&[("x", Number), ("y", ObjectMemberKind::String)]),
+            },
+            HandFed {
+                name: "miss",
+                kind: DeclKind::Const,
+                annotation: Some("{ x: number; y?: number }"),
+                init: None,
+                members: Some(&[]),
+            },
+        ],
+        include_str!("../../../corpus/check-object/object-optional-present.expected.txt"),
+        0,
     );
 }
 

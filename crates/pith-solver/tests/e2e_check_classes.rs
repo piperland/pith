@@ -644,21 +644,17 @@ fn too_many_new_matches_ts2554() {
 }
 
 #[test]
-fn optional_ctor_param_declines_range_arity() {
-    // Range arities (`Expected 1-2 arguments …`) are outside the exact-count
-    // subset: oracle errors while the solver declines per site.
+fn optional_ctor_param_matches_range_arity() {
+    // Range arities flow through the shared call path: oracle `TS2554`
+    // matches by construction (PITH-P037 converted the old per-site
+    // decline into a verdict).
     let source = "class C {\nconstructor(a: number, b?: number) {}\n}\nconst c = new C(1, 2, 3);\n";
-    let (_, report) = run_pipeline(source);
-    assert!(
-        report.diagnostics.is_empty(),
-        "diagnostics: {:?}",
-        report.diagnostics
-    );
-    assert_eq!(report.unsupported.len(), 1);
-    assert!(
-        report.unsupported[0].reason.contains("optional"),
-        "reason: {}",
-        report.unsupported[0].reason
+    let expected = "range.ts:TS2554: Expected 1-2 arguments, but got 3.\n";
+    expect_differential(
+        "optional_ctor_param_matches_range_arity",
+        source,
+        expected,
+        0,
     );
 }
 
