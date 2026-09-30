@@ -25,6 +25,20 @@
 //! verdict: resolution succeeding where tsc errors only ever *adds* checking
 //! the oracle skips).
 //!
+//! Type-only re-exports (P035 probe basis, tsc 7.0.2 `--strict --pretty
+//! false`, `.agent/scratch/p035-probes/`): `export type { T } from`,
+//! `export { type T } from`, and `export type * from` behave exactly like
+//! their value forms in tsc (re-exported interfaces and aliases check with
+//! the same `TS2322`/`TS2741` families and anchors; alias elaborations spell
+//! the underlying shape), so the graph records and resolves them through
+//! the same walk below — no type/value fork exists here. `export { T }
+//! from` where `T` names an interface or alias in the target, renames
+//! (`export { P as Renamed } from`), and star barrels over type members all
+//! resolve; ambiguous stars decline [`ImportError::Ambiguous`] (tsc's
+//! `TS2308` at the barrel statement is the pinned gap) and cycles decline
+//! [`ImportError::Cycle`] (tsc's `TS2303` at the re-export statements is the
+//! pinned gap).
+//!
 //! [`Binder`]: super::Binder
 
 use std::collections::{HashMap, HashSet};
@@ -773,6 +787,116 @@ mod tests {
             Ok(ResolvedExport {
                 file: FileId(2),
                 local: "X".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn type_only_chains_resolve_through_named_reexports() {
+        // `export type { P } from` / `export { A } from` where `P` names an
+        // interface and `A` an alias in the target: both record as named
+        // re-exports, so the same walk resolves them (P035 probes: tsc
+        // checks both with the value families intact).
+        let graph = ModuleGraph::new(vec![
+            module(
+                0,
+                "main.ts",
+                vec![
+                    named("P", "P", "./mid"),
+                    named("A", "A", "./mid"),
+                    named("R", "Renamed", "./mid"),
+                ],
+                vec![],
+                vec![],
+            ),
+            module(
+                1,
+                "mid.ts",
+                vec![],
+                vec![],
+                vec![
+                    from("P", "P", "./types"),
+                    from("A", "A", "./types"),
+                    from("Renamed", "P", "./types"),
+                ],
+            ),
+            module(2, "types.ts", vec![], vec![("P", "P"), ("A", "A")], vec![]),
+        ]);
+        for (local, target) in [("P", "P"), ("A", "A"), ("R", "P")] {
+            assert_eq!(
+                graph.resolve_import(FileId(0), local),
+                Ok(ResolvedExport {
+                    file: FileId(2),
+                    local: target.to_owned()
+                }),
+                "type member {local}"
+            );
+        }
+    }
+
+    #[test]
+    fn star_barrels_resolve_types_and_decline_ambiguity() {
+        // `export * from` / `export type * from` re-export type members like
+        // value ones (P035 probes: clean when unambiguous); conflicting stars
+        // decline exactly like values (tsc's `TS2308` at the barrel is the
+        // pinned gap).
+        let graph = ModuleGraph::new(vec![
+            module(
+                0,
+                "main.ts",
+                vec![named("P", "P", "./index")],
+                vec![],
+                vec![],
+            ),
+            module(1, "index.ts", vec![], vec![], vec![star("./types")]),
+            module(2, "types.ts", vec![], vec![("P", "P")], vec![]),
+        ]);
+        assert_eq!(
+            graph.resolve_import(FileId(0), "P"),
+            Ok(ResolvedExport {
+                file: FileId(2),
+                local: "P".to_owned()
+            })
+        );
+        let ambiguous = ModuleGraph::new(vec![
+            module(
+                0,
+                "main.ts",
+                vec![named("P", "P", "./index")],
+                vec![],
+                vec![],
+            ),
+            module(
+                1,
+                "index.ts",
+                vec![],
+                vec![],
+                vec![star("./a"), star("./b")],
+            ),
+            module(2, "a.ts", vec![], vec![("P", "P")], vec![]),
+            module(3, "b.ts", vec![], vec![("P", "P")], vec![]),
+        ]);
+        assert_eq!(
+            ambiguous.resolve_import(FileId(0), "P"),
+            Err(ImportError::Ambiguous {
+                name: "P".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn cyclic_type_reexports_decline() {
+        // `export { C } from` cycles over a type member decline (tsc's
+        // `TS2303` at the re-export statements is the pinned gap).
+        let graph = ModuleGraph::new(vec![
+            module(0, "main.ts", vec![named("C", "C", "./a")], vec![], vec![]),
+            module(1, "a.ts", vec![], vec![], vec![from("C", "C", "./b")]),
+            module(2, "b.ts", vec![], vec![], vec![from("C", "C", "./a")]),
+        ]);
+        assert_eq!(
+            graph.resolve_import(FileId(0), "C"),
+            Err(ImportError::Cycle {
+                name: "C".to_owned()
             })
         );
     }
