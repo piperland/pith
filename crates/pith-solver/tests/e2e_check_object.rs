@@ -115,6 +115,8 @@ fn decls_from_handfed(
                         .collect(),
                     fresh: true,
                 }),
+                // No array-member facts yet (see the check-functions driver).
+                init_array: None,
                 cast: None,
             }
         })

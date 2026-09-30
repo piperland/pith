@@ -126,6 +126,8 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<ConstDecl> {
                 annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
                 init: decl.init.as_ref().map(|init| map_init(init.kind)),
                 init_object: None,
+                // No array-member facts yet (see the check-functions driver).
+                init_array: None,
                 cast: None,
             }
         })

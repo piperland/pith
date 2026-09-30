@@ -144,6 +144,10 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     FunctionReturn {
         kind,
         init_object,
+        // No array-member facts yet (adapter classifies `[ ... ]` as
+        // non-literal): array returns decline in `shape_return` until the
+        // adapter emits them.
+        init_array: None,
         cast: ret.cast.as_ref().map(map_cast),
     }
 }
@@ -251,6 +255,8 @@ fn map_inner_decl(parsed: &ParsedFile, binder: &Binder, inner: &FrontendInnerDec
         annotation: inner.annotation.as_ref().map(|ann| ann.text.clone()),
         init,
         init_object,
+        // No array-member facts yet (see `map_function_return`).
+        init_array: None,
         cast: inner
             .init
             .as_ref()
@@ -348,6 +354,9 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                     })
                     .collect(),
                 params_complex: func.params_complex,
+                // No async fact yet (the adapter emits none): every fixture
+                // here is non-async, so `false` changes nothing.
+                is_async: false,
                 return_annotation: func.return_annotation.as_ref().map(|ann| ann.text.clone()),
                 body,
             }

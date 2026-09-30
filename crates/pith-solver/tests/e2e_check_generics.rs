@@ -163,6 +163,8 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     FunctionReturn {
         kind,
         init_object,
+        // No array-member facts yet (see the check-functions driver).
+        init_array: None,
         cast: None,
     }
 }
@@ -238,6 +240,8 @@ fn generics_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<GenericDecl>
                         })
                         .collect(),
                     params_complex: func.params_complex,
+                    // No async fact yet (see the check-functions driver).
+                    is_async: false,
                     return_annotation: func.return_annotation.as_ref().map(|ann| ann.text.clone()),
                     body,
                 },
