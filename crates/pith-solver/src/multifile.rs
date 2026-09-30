@@ -30,12 +30,35 @@
 //!   (`TS2322` wrong member, `TS2741` missing — the P017 families intact).
 //! - A type used as a value diagnoses `TS2693` in tsc; the solver declines
 //!   those uses with reasons (pinned oracle-error divergence).
-//! - `import type` of an existing alias is silent in tsc; the solver
-//!   declines failed type-only imports (and their annotation uses) with
-//!   reasons instead of `PITH2305`/`PITH2307`/`PITH2304` — a pinned
-//!   divergence, since type aliases emit no facts and diagnosing would risk
-//!   false verdicts. Failed VALUE imports keep the exact mirrors (their
-//!   export space is fully facted).
+//! - Failed `import type` resolutions decline with reasons instead of
+//!   `PITH2305`/`PITH2307`/`PITH2304` — a pinned divergence: a failing
+//!   type-only resolution may name a member the target exports only as a
+//!   type through shapes the subset cannot spell (chained or complex
+//!   aliases), so diagnosing would risk false verdicts where tsc stays
+//!   clean. Failed VALUE imports keep the exact mirrors (their export space
+//!   is fully facted). Resolved type-only imports (including aliases the
+//!   graph sees) stay silent like tsc and check through the shape paths.
+//! - Re-exported interfaces and single-level aliases check with the same
+//!   families and anchors through named chains, renames, and `export *`
+//!   barrels (P035 probes, tsc 7.0.2, `.agent/scratch/p035-probes/`): wrong
+//!   members diagnose `TS2322` at the member, missing members `TS2741`
+//!   spelling the UNDERLYING interface (aliases expand transparently), and
+//!   primitive aliases behave exactly like their target spelling.
+//!   `export type` / `export { type X }` / `export type *` forms are
+//!   identical to value forms. Ambiguous stars diagnose `TS2308` at the
+//!   barrel statement and cycles `TS2303` at the re-export statements — both
+//!   pinned gaps: the solver declines with reasons instead of guessing.
+//!   Chained aliases (`type B = A`, aliases over imports) resolve in tsc but
+//!   the solver expands one level only and declines the rest (pinned
+//!   divergence, e2e-pinned).
+//!
+//! - Missing/excess elaborations through an ALIAS spell the alias as written
+//!   (`required in type 'Alias'`) where tsc spells the underlying interface
+//!   (`'Point'`): the use-site spelling feeds the shared object path as the
+//!   display text, and re-plumbing that display through [`check_enums`]
+//!   would touch the shared single-file interface path. Pinned message
+//!   divergence — the family, anchor, and structure all match, so no corpus
+//!   fixture covers alias-missing (direct re-exported missing does).
 //!
 //! Driver seams (all disclosed, mirroring the narrowing/check-enums
 //! precedents): identifier-initializer names ride [`ProgramFile::ident_inits`]
@@ -63,10 +86,18 @@
 //! - Annotations resolving to the declaring file's interfaces/enums relink
 //!   onto the LOCAL import binding's symbol and check through [`check_enums`]
 //!   unchanged; value targets there decline via the existing not-an-enum
-//!   path (tsc's `TS2749` is the pinned gap). Annotations naming a
-//!   type-only import the graph cannot resolve skip checking with a
-//!   recorded reason (type aliases emit no facts — `PITH2304` there would
-//!   be a false verdict).
+//!   path (tsc's `TS2749` is the pinned gap). Annotations naming an imported
+//!   alias expand ONE level against the declaring file: alias-to-primitive
+//!   rewrites the annotation to the target spelling (checked exactly as if
+//!   written); alias-to-interface and alias-to-enum relink the declaring
+//!   shape onto the local import binding like a direct shape import.
+//!   Chained (alias-to-alias, alias-to-import), generic, and non-identifier
+//!   targets decline with reasons and skip checking (a raw check would add a
+//!   second, misleading not-an-enum note). Annotations naming a type-only
+//!   import the graph cannot resolve skip checking with a recorded reason
+//!   (a failed type-only resolution may name a member exported only through
+//!   shapes the subset cannot spell — `PITH2304` there would risk a false
+//!   verdict).
 //! - Calls merge imported function declarations (parameters from the
 //!   declaring file) with local ones and check through [`check_calls`]
 //!   unchanged — calls are unmemoized, so they record no query deps
@@ -124,6 +155,19 @@ pub struct ImportUse {
     pub is_type: bool,
 }
 
+/// One imported type alias, driver-mapped from the frontend's
+/// `TypeAliasFact` (mechanical name + target-text copy).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AliasShape {
+    /// Alias name as written in the declaring file.
+    pub name: String,
+    /// Verbatim aliased-type text (`"Point"`, `"number"`).
+    pub target: String,
+    /// `true` when the alias declares type parameters: expansion declines
+    /// instead of instantiating it.
+    pub has_type_params: bool,
+}
+
 /// One file's checking inputs for [`check_program`].
 ///
 /// Declaration fields map 1:1 from adapter facts (see the module-level seam
@@ -153,6 +197,9 @@ pub struct ProgramFile {
     pub enums: Vec<EnumShape>,
     /// Local namespace shapes in source order.
     pub namespaces: Vec<NamespaceShape>,
+    /// Local type aliases in source order (feeds single-level expansion of
+    /// imported annotations; see [`AliasShape`]).
+    pub aliases: Vec<AliasShape>,
     /// Local import bindings in source order.
     pub imports: Vec<ImportUse>,
 }
@@ -467,6 +514,50 @@ enum ShapeHit {
     Enum(EnumShape),
 }
 
+/// Finds one declaring file's shape by name, relinked onto the use file's
+/// import binding symbol: interfaces before enums (merged pairs are illegal
+/// in tsc). `None` means no shape claims the name (values, type aliases,
+/// classes); `Some(Err)` carries only the multiple-declaration gaps.
+fn declaring_shape(
+    declaring: &ProgramFile,
+    name: &str,
+    symbol: Option<pith_ids::SymbolId>,
+) -> Option<Result<ShapeHit, String>> {
+    if declaring
+        .interfaces
+        .iter()
+        .filter(|shape| shape.name == name)
+        .count()
+        > 1
+    {
+        return Some(Err(format!(
+            "multiple interface declarations for '{name}': merging is outside the subset"
+        )));
+    }
+    if let Some(shape) = declaring.interfaces.iter().find(|shape| shape.name == name) {
+        let mut relinked = shape.clone();
+        relinked.symbol = symbol;
+        return Some(Ok(ShapeHit::Interface(relinked)));
+    }
+    if declaring
+        .enums
+        .iter()
+        .filter(|shape| shape.name == name)
+        .count()
+        > 1
+    {
+        return Some(Err(format!(
+            "multiple enum declarations for '{name}': merging is outside the subset"
+        )));
+    }
+    if let Some(shape) = declaring.enums.iter().find(|shape| shape.name == name) {
+        let mut relinked = shape.clone();
+        relinked.symbol = symbol;
+        return Some(Ok(ShapeHit::Enum(relinked)));
+    }
+    None
+}
+
 /// Resolves one annotation name through the import graph to a declaring
 /// file's shape: interfaces before enums (merged pairs are illegal in tsc).
 /// `None` means local handling applies (unimported names and import
@@ -484,50 +575,89 @@ fn resolve_type_shape(ctx: &FileCtx<'_>, target: &str) -> Option<Result<ShapeHit
             "declaring file for import '{target}' has no inputs: driver skew"
         )));
     };
-    let symbol = relinked_symbol(ctx, target);
-    if declaring
-        .interfaces
+    declaring_shape(declaring, &resolved.local, relinked_symbol(ctx, target))
+}
+
+/// One single-level alias expansion step for an imported annotation.
+enum AliasStep {
+    /// Alias-to-primitive: the annotation rewrites to the target spelling
+    /// and checks exactly as if written.
+    Primitive(String),
+    /// Alias-to-interface/enum: the declaring shape, relinked locally.
+    Shape(ShapeHit),
+    /// Unexpandable: chained, generic, circular, or complex targets decline.
+    Decline(String),
+}
+
+/// Expands one imported annotation naming a declaring-file alias, ONE level.
+///
+/// `None` means no expansion applies: unimported names, import failures
+/// (whose records already exist), and names no declaring alias claims (the
+/// existing unknown-name path applies). Primitives rewrite to their
+/// spelling; interfaces and enums relink like direct shape imports; chains
+/// (alias-to-alias, alias-to-import), generic aliases, circular references,
+/// and non-identifier targets decline — tsc resolves chains transitively, so
+/// those declines are a pinned divergence.
+fn expand_imported_alias(ctx: &FileCtx<'_>, target: &str) -> Option<AliasStep> {
+    if !ctx.input.imports.iter().any(|entry| entry.local == target) {
+        return None;
+    }
+    let Ok(resolved) = ctx.graph.resolve_import(ctx.input.file, target) else {
+        return None;
+    };
+    let declaring = declaring_input(ctx.files, ctx.by_file, &resolved)?;
+    let alias = declaring
+        .aliases
         .iter()
-        .filter(|shape| shape.name == resolved.local)
-        .count()
-        > 1
-    {
-        return Some(Err(format!(
-            "multiple interface declarations for '{}': merging is outside the subset",
+        .find(|shape| shape.name == resolved.local)?;
+    if alias.has_type_params {
+        return Some(AliasStep::Decline(format!(
+            "type alias '{}' is generic: generic aliases are outside the subset",
             resolved.local
         )));
     }
-    if let Some(shape) = declaring
-        .interfaces
-        .iter()
-        .find(|shape| shape.name == resolved.local)
-    {
-        let mut relinked = shape.clone();
-        relinked.symbol = symbol;
-        return Some(Ok(ShapeHit::Interface(relinked)));
-    }
-    if declaring
-        .enums
-        .iter()
-        .filter(|shape| shape.name == resolved.local)
-        .count()
-        > 1
-    {
-        return Some(Err(format!(
-            "multiple enum declarations for '{}': merging is outside the subset",
+    let expanded = alias.target.trim();
+    if expanded.is_empty() || expanded == resolved.local {
+        return Some(AliasStep::Decline(format!(
+            "type alias '{}' is circular: circular aliases are outside the subset",
             resolved.local
         )));
     }
-    if let Some(shape) = declaring
-        .enums
-        .iter()
-        .find(|shape| shape.name == resolved.local)
+    if super::annotation_type(expanded).is_some()
+        || super::boundary_annotation_type(expanded).is_some()
     {
-        let mut relinked = shape.clone();
-        relinked.symbol = symbol;
-        return Some(Ok(ShapeHit::Enum(relinked)));
+        return Some(AliasStep::Primitive(expanded.to_owned()));
     }
-    None
+    if !is_bare_identifier(expanded) {
+        return Some(AliasStep::Decline(format!(
+            "type alias '{}' targets '{expanded}': \
+             non-identifier alias targets are outside the subset",
+            resolved.local
+        )));
+    }
+    if let Some(hit) = declaring_shape(declaring, expanded, relinked_symbol(ctx, target)) {
+        return Some(match hit {
+            Ok(shape) => AliasStep::Shape(shape),
+            Err(reason) => AliasStep::Decline(reason),
+        });
+    }
+    if declaring.aliases.iter().any(|shape| shape.name == expanded)
+        || declaring
+            .imports
+            .iter()
+            .any(|entry| entry.local == expanded)
+    {
+        return Some(AliasStep::Decline(format!(
+            "type alias '{}' targets '{expanded}': \
+             chained aliases are outside the subset (single-level expansion only)",
+            resolved.local
+        )));
+    }
+    Some(AliasStep::Decline(format!(
+        "type alias '{}' targets '{expanded}': \
+         no interface, enum, or primitive claims it",
+        resolved.local
+    )))
 }
 
 /// The decline reason when `target` is a type-only import whose resolution
@@ -563,96 +693,230 @@ fn use_decl_span(ctx: &FileCtx<'_>, decl: &ConstDecl) -> Span {
     )
 }
 
+/// Queued checking state for one file's const declarators, bundled so the
+/// annotation arms stay lean (pedantic arity discipline).
+struct DeclSink {
+    /// Declarations queued for [`check_enums`], parallel to `skip`.
+    decls: Vec<EnumDecl>,
+    /// Positions in `decls` whose declaration already declined: they skip
+    /// `check_enums` instead of checking unannotated, which would add a
+    /// second, misleading note for a declaration that does bear one.
+    skip: Vec<bool>,
+    /// Recorded decline reasons, drained into the report after checking.
+    notes: Vec<(Span, String)>,
+}
+
+impl DeclSink {
+    /// Queues one declaration, checked (`skipped: false`) or past checking.
+    fn push(&mut self, decl: EnumDecl, skipped: bool) {
+        self.decls.push(decl);
+        self.skip.push(skipped);
+    }
+
+    /// Records one annotation decline and queues its already-resolved
+    /// declaration past `check_enums` (checking the raw name would add a
+    /// second, misleading note for a position that already declined).
+    fn decline(
+        &mut self,
+        span: Span,
+        reason: String,
+        resolved: ConstDecl,
+        init_text: Option<String>,
+        deps: Vec<Dep>,
+    ) {
+        self.notes.push((span, reason));
+        self.push(
+            EnumDecl {
+                decl: resolved,
+                init_text,
+                cross_file_deps: deps,
+            },
+            true,
+        );
+    }
+}
+
 /// Checks every const declarator: value inits resolve through imports (with
 /// cross-file [`Dep`] edges), annotations relink imported shapes, then one
 /// [`check_enums`] run verdicts the file.
+/// Mutable checking state for one alias-expansion step, bundled so the
+/// arity stays flat.
+struct AliasStepCtx<'a> {
+    index: usize,
+    interfaces: &'a mut Vec<InterfaceShape>,
+    enums: &'a mut Vec<EnumShape>,
+    sink: &'a mut DeclSink,
+}
+
+/// Single-level alias expansion for one imported annotation (see
+/// `expand_imported_alias`): primitives rewrite the annotation spelling,
+/// interfaces/enums relink through the existing shape paths, and
+/// unexpandable targets decline and skip checking like failed type-only
+/// imports. Returns the (possibly rewritten) declaration plus deps, or
+/// `None` when a decline was recorded and the caller should `continue`.
+fn expand_alias_annotation(
+    ctx: &FileCtx<'_>,
+    annotation: &str,
+    resolved: ConstDecl,
+    deps: Vec<Dep>,
+    step: AliasStepCtx<'_>,
+) -> Option<(ConstDecl, Vec<Dep>)> {
+    let AliasStepCtx {
+        index,
+        interfaces,
+        enums,
+        sink,
+    } = step;
+    match expand_imported_alias(ctx, annotation) {
+        None => Some((resolved, deps)),
+        Some(AliasStep::Primitive(spelling)) => {
+            let mut resolved = resolved;
+            resolved.annotation = Some(spelling);
+            Some((resolved, deps))
+        }
+        Some(AliasStep::Shape(ShapeHit::Interface(shape))) => {
+            interfaces.push(shape);
+            Some((resolved, deps))
+        }
+        Some(AliasStep::Shape(ShapeHit::Enum(shape))) => {
+            enums.push(shape);
+            Some((resolved, deps))
+        }
+        Some(AliasStep::Decline(reason)) => {
+            let span = use_decl_span(ctx, &resolved);
+            let init_text = ctx.input.enum_texts.get(index).cloned().flatten();
+            sink.decline(span, reason, resolved, init_text, deps);
+            None
+        }
+    }
+}
+
+/// Resolves one declaration's identifier initializer through the
+/// cross-file value graph for [`check_const_decls`]: resolved inits
+/// (kinds, objects, arrays) substitute with a [`Dep`] edge; failures
+/// record a note; local consts and missing entries pass through silently.
+/// Mutates `resolved`/`deps` in place, notes into the sink.
+fn resolve_const_value_init(
+    ctx: &FileCtx<'_>,
+    index: usize,
+    resolved: &mut ConstDecl,
+    deps: &mut Vec<Dep>,
+    sink: &mut DeclSink,
+) {
+    let Some(target) = ctx
+        .input
+        .ident_inits
+        .get(index)
+        .and_then(|slot| slot.as_ref())
+    else {
+        return;
+    };
+    if has_local_const(ctx.input, target.as_str()) {
+        return;
+    }
+    match resolve_value_init(ctx, target.as_str()) {
+        None => {}
+        Some(Ok(hit)) => {
+            resolved.init = hit.init;
+            resolved.init_object = hit.init_object;
+            resolved.init_array = hit.init_array;
+            deps.push(hit.dep);
+        }
+        Some(Err(reason)) => {
+            sink.notes.push((use_decl_span(ctx, resolved), reason));
+        }
+    }
+}
+
 fn check_const_decls(ctx: &mut FileCtx<'_>) {
     let file = ctx.input.file;
-    let mut decls: Vec<EnumDecl> = Vec::with_capacity(ctx.input.consts.len());
+    let mut sink = DeclSink {
+        decls: Vec::with_capacity(ctx.input.consts.len()),
+        skip: Vec::with_capacity(ctx.input.consts.len()),
+        notes: Vec::new(),
+    };
     let mut interfaces: Vec<InterfaceShape> = ctx.input.interfaces.clone();
     let mut enums: Vec<EnumShape> = ctx.input.enums.clone();
-    let mut notes: Vec<(Span, String)> = Vec::new();
-    // Positions in `decls` whose declaration already declined (a failed
-    // type-only import records its gap here): they skip `check_enums`
-    // instead of checking unannotated, which would add a second, misleading
-    // "no annotation" note for a declaration that does have one.
-    let mut skip: Vec<bool> = Vec::with_capacity(ctx.input.consts.len());
     for (index, decl) in ctx.input.consts.iter().enumerate() {
         let mut resolved = decl.clone();
         let mut deps: Vec<Dep> = Vec::new();
-        if let Some(target) = ctx
-            .input
-            .ident_inits
-            .get(index)
-            .and_then(|slot| slot.as_ref())
-        {
-            if !has_local_const(ctx.input, target.as_str()) {
-                match resolve_value_init(ctx, target.as_str()) {
-                    None => {}
-                    Some(Ok(hit)) => {
-                        resolved.init = hit.init;
-                        resolved.init_object = hit.init_object;
-                        resolved.init_array = hit.init_array;
-                        deps.push(hit.dep);
-                    }
-                    Some(Err(reason)) => {
-                        notes.push((use_decl_span(ctx, &resolved), reason));
-                    }
-                }
-            }
-        }
-        if let Some(annotation) = resolved.annotation.as_deref().map(str::trim) {
-            if is_bare_identifier(annotation)
-                && super::annotation_type(annotation).is_none()
-                && !has_local_const(ctx.input, annotation)
-                && !has_local_shape(ctx, resolved.scope, annotation)
+        resolve_const_value_init(ctx, index, &mut resolved, &mut deps, &mut sink);
+        if let Some(raw) = resolved.annotation.as_deref().map(str::trim) {
+            // Owned so the declaration below can move into the sink or the
+            // alias step while the text is still in use.
+            let annotation = raw.to_owned();
+            if is_bare_identifier(&annotation)
+                && super::annotation_type(&annotation).is_none()
+                && !has_local_const(ctx.input, &annotation)
+                && !has_local_shape(ctx, resolved.scope, &annotation)
             {
-                match resolve_type_shape(ctx, annotation) {
+                match resolve_type_shape(ctx, &annotation) {
                     None => {
-                        if let Some(reason) = failed_type_import(ctx, annotation) {
-                            // A type-only import the value graph cannot see
-                            // (type aliases emit no facts): checking the
-                            // annotation would invent `PITH2304` where tsc
-                            // resolves the alias cleanly, so the declaration
-                            // skips checking and the gap is recorded here.
+                        if let Some(reason) = failed_type_import(ctx, &annotation) {
+                            // A type-only import the graph cannot resolve:
+                            // checking the annotation would invent `PITH2304`
+                            // where tsc may resolve the member cleanly, so
+                            // the declaration skips checking and the gap is
+                            // recorded here.
                             let span = use_decl_span(ctx, &resolved);
-                            let name = annotation.to_owned();
-                            notes.push((
+                            let name = annotation.clone();
+                            let init_text = ctx.input.enum_texts.get(index).cloned().flatten();
+                            sink.decline(
                                 span,
                                 format!(
                                     "type-only import '{name}': {reason}: \
                                      type aliases are outside the subset"
                                 ),
-                            ));
-                            skip.push(true);
-                            let init_text = ctx.input.enum_texts.get(index).cloned().flatten();
-                            decls.push(EnumDecl {
-                                decl: resolved,
+                                resolved,
                                 init_text,
-                                cross_file_deps: deps,
-                            });
+                                deps,
+                            );
                             continue;
                         }
+                        // Single-level alias expansion: an imported
+                        // annotation naming a declaring-file alias rewrites
+                        // (primitives) or relinks (interfaces/enums) through
+                        // the existing paths; unexpandable targets decline
+                        // and skip checking like failed type-only imports.
+                        let Some((rewritten, returned)) = expand_alias_annotation(
+                            ctx,
+                            &annotation,
+                            resolved,
+                            deps,
+                            AliasStepCtx {
+                                index,
+                                interfaces: &mut interfaces,
+                                enums: &mut enums,
+                                sink: &mut sink,
+                            },
+                        ) else {
+                            continue;
+                        };
+                        resolved = rewritten;
+                        deps = returned;
                     }
                     Some(Ok(ShapeHit::Interface(shape))) => interfaces.push(shape),
                     Some(Ok(ShapeHit::Enum(shape))) => enums.push(shape),
                     Some(Err(reason)) => {
-                        notes.push((use_decl_span(ctx, &resolved), reason));
+                        sink.notes.push((use_decl_span(ctx, &resolved), reason));
                     }
                 }
             }
         }
         let init_text = ctx.input.enum_texts.get(index).cloned().flatten();
-        decls.push(EnumDecl {
-            decl: resolved,
-            init_text,
-            cross_file_deps: deps,
-        });
-        skip.push(false);
+        sink.push(
+            EnumDecl {
+                decl: resolved,
+                init_text,
+                cross_file_deps: deps,
+            },
+            false,
+        );
     }
-    let decls: Vec<EnumDecl> = decls
+    let decls: Vec<EnumDecl> = sink
+        .decls
         .into_iter()
-        .zip(skip)
+        .zip(sink.skip)
         .filter_map(|(decl, skipped)| (!skipped).then_some(decl))
         .collect();
     let input = EnumInput {
@@ -661,7 +925,7 @@ fn check_const_decls(ctx: &mut FileCtx<'_>) {
         namespaces: &ctx.input.namespaces,
     };
     let mut report = check_enums(file, &decls, &input, ctx.binder, &mut *ctx.db);
-    for (span, reason) in notes {
+    for (span, reason) in sink.notes {
         report
             .unsupported
             .push(super::UnsupportedDecl { file, span, reason });
