@@ -14,7 +14,7 @@ declaration-merging depth (interface+value pairs). Oracle baselines are tsc
 | iface-merged-pair.ts | clean | 2x UNSUPPORTED (unannotated `Foo`, non-literal value use) + silent interface-annotated use |
 | iface-heritage-declined.ts | clean | 1x UNSUPPORTED (heritage clause) |
 | iface-methods-declined.ts | clean | 2x UNSUPPORTED (method member, index member) |
-| iface-optional-declined.ts | clean | 2x UNSUPPORTED (optional member, one note per use) |
+| iface-optional-declined.ts | clean | silent (PITH-P037: absent optional silent, present checks; converts the old per-use decline — the name records the history) |
 
 Differential: 8/8 match on (code-family, message) multisets; declined
 fixtures recorded as UNSUPPORTED with reasons, never silent, never forced.

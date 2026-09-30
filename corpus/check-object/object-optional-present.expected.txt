@@ -1,0 +1,2 @@
+object-optional-present.ts:TS2322: Type 'string' is not assignable to type 'number'.
+object-optional-present.ts:TS2741: Property 'x' is missing in type '{}' but required in type '{ x: number; y?: number | undefined; }'.

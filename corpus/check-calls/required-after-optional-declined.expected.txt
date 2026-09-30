@@ -1,0 +1,1 @@
+required-after-optional-declined.ts:TS1016: A required parameter cannot follow an optional parameter.

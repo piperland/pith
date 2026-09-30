@@ -1,5 +1,7 @@
-// Solver verdict: UNSUPPORTED (rest parameter is variadic; exact arity
-// does not apply). The oracle is clean here — pinned divergence.
+// Solver verdict: silent (rest calls admit 1-or-more; the supplied call is
+// in range). Formerly UNSUPPORTED (variadic arity outside the exact-count
+// subset). Converted by PITH-P037: the range/member flip. The oracle is
+// clean.
 function rs(a: number, ...rest: number[]): number {
   return 1;
 }

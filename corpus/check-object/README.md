@@ -13,9 +13,11 @@ declarators. Oracle baselines are tsc 7.0.2 via
 | object-excess-member.ts | 1x TS2353 | 1x PITH2353 (fresh literal, per-occurrence table) |
 | object-error-priority.ts | 1x TS2322 + 1x TS2353 | same (wrong beats excess; excess beats missing) |
 | object-out-of-subset.ts | clean | 4x UNSUPPORTED (union member, 2x no annotation, non-literal init) |
-| object-nested-annotation.ts | clean | 2x UNSUPPORTED (nested member type, optional member) |
+| object-nested-annotation.ts | clean | 1x UNSUPPORTED (nested member type; the absent-optional declarator is silent) |
+| object-optional-absent.ts | clean | silent (absent optional member) |
+| object-optional-present.ts | 1x TS2322 + 1x TS2741 | same (present optional checks; missing names only required, spelling `y?: number \| undefined`) |
 
-Differential: 8/8 match on (code-family, message) multisets; out-of-subset
+Differential: 10/10 match on (code-family, message) multisets; out-of-subset
 recorded as UNSUPPORTED with reasons, never silent, never forced.
 
 Probed tsc rules pinned here: literal-order actual-type spellings with

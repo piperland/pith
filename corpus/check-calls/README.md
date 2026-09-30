@@ -15,7 +15,13 @@ tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs` (normalized
 | unresolved-callee.ts | 1x TS2304 | silent (already tracked as unresolved; never double-diagnosed) |
 | method-call-excluded.ts | clean | silent, zero call facts (methods out of scope) |
 | overloads-declined.ts | 1x TS2554 | UNSUPPORTED (multiple declarations; resolution is future work) |
-| rest-param-declined.ts | clean | UNSUPPORTED (variadic arity outside the exact-count subset) |
+| rest-param-declined.ts | clean | silent (PITH-P037: rest admits 1-or-more; converts the old variadic decline) |
+| range-correct.ts | clean | silent (optional + defaulted ranges admit every call, incl. explicit `undefined`) |
+| range-too-few.ts | 1x TS2554 (`Expected 1-2 arguments, but got 0.`) | 1x PITH2554 at the callee |
+| range-too-many.ts | 1x TS2554 (`Expected 1-2 arguments, but got 3.`) | 1x PITH2554 at the first excess arg |
+| range-wrong-type.ts | 2x TS2345 (`Argument of type 'string' …`) | 2x PITH2345, one per site at the mismatched arg |
+| rest-prefix.ts | 1x TS2345 + 1x TS2555 | same (rest extras check the element type; below-minimum spells `Expected at least 1 arguments …`) |
+| required-after-optional-declined.ts | 1x TS1016 (on the declaration) | UNSUPPORTED (required-after-optional; the solver spells no declaration diagnostics) |
 | member-correct.ts | clean | silent (4 member calls: opaque arity + arg types match) |
 | member-wrong-type.ts | 1x TS2345 (`Argument of type 'string' …`) | 1x PITH2345 at the mismatched arg |
 | member-arity.ts | 2x TS2554 (too-few + too-many) | 2x PITH2554, one per site |
@@ -23,11 +29,12 @@ tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs` (normalized
 | member-unknown-receiver.ts | 1x TS2304 | silent, zero member facts (tracked unresolved; never double-diagnosed) |
 | member-lib-declined.ts | clean | 4x UNSUPPORTED (range/overload/variadic lib shapes) |
 
-Differential: 5/5 match on the checkable subset (2 silent/clean +
-3 diagnostic pairs); 3/3 divergences pinned explicitly (oracle errors or
-stays clean while the solver declines or skips) — overload resolution,
-range/variadic arities, and unresolved-callee silence are acknowledged
-non-goals, never silent gaps.
+Differential: 11/11 match on the checkable direct-call subset (4
+silent/clean + 7 diagnostic groups); 3/3 divergences pinned explicitly
+(oracle errors while the solver declines or skips) — unresolved-callee
+silence (tracked once, never double-diagnosed), overload resolution, and
+required-after-optional shapes are acknowledged non-goals, never silent
+gaps. PITH-P037 converted the old range/variadic declines into matches.
 
 Member differential: 3/3 match on the checkable opaque subset (1 silent +
 2 diagnostic groups); 3/3 divergences pinned explicitly —
@@ -46,8 +53,8 @@ Out of scope (no facts, solver never sees them): method/member calls on
 non-allowlisted receivers, computed members (`JSON["parse"]()`), optional
 chains (`f?.()`, `JSON?.parse()`, `JSON.parse?.()`), chained receivers
 (`a.b.c()`), spreads (`f(...xs)`), `super(...)`, `import(...)`, `new f()`,
-tagged templates. Optional/defaulted params and non-primitive parameter
-types decline per call with reasons (unit-pinned; no corpus fixture).
+tagged templates. Non-primitive parameter types decline per call with
+reasons (unit-pinned; no corpus fixture).
 Known-but-uncheckable lib members (`JSON.parse`, `JSON.stringify`,
 `console.warn/log/error`, `Math.max/min`) and unknown members on known
 receivers decline per site with lib reasons (corpus-pinned above).

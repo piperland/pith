@@ -1,0 +1,1 @@
+range-too-few.ts:TS2554: Expected 1-2 arguments, but got 0.
