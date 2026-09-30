@@ -38,6 +38,10 @@
 //!   missing: any wrong member suppresses excess/missing; excess suppresses
 //!   missing; two missing members collapse into one `TS2739`; only the first
 //!   excess member is reported.
+//! - Optional members (`y?: number`, P037) are known when present (wrong
+//!   types diagnose exactly like required members) and invisible when
+//!   absent: they never appear in missing lists, and expected-type
+//!   elaborations spell them `y?: number | undefined`.
 //! - `let` checks exactly like `const` (mutability/reassignment unchecked).
 //!
 //! Out-of-subset declarations (union annotations outside [`check_narrowing`],
@@ -135,12 +139,24 @@
 //! - Span anchoring mirrors tsc: too-few arity anchors at the callee
 //!   identifier, too-many at the first excess argument, arg-type at the
 //!   mismatched argument — all from call facts, never string-searching.
-//! - Range/variadic arities are declined: optional/defaulted params spell
-//!   `Expected 1-2 arguments, but got 3.` and rest params spell `TS2555`
-//!   (`Expected at least 1 arguments, but got 0.`); the subset checks exact
-//!   counts only. Overload failures spell `TS2769` with continuation lines;
-//!   multiple same-name declarations (overloads, or shadowing the fact set
-//!   cannot disambiguate — a documented precision limit) decline with reason.
+//! - Range/variadic arities check (P037): optional/defaulted params admit a
+//!   `min-max` range (`Expected 1-2 arguments, but got 3.`, still `TS2554`)
+//!   while rest params admit `min`-or-more with `TS2555` below the minimum
+//!   (`Expected at least 1 arguments, but got 0.`); fixed positions check
+//!   exactly like exact-arity params and rest extras check against the `T`
+//!   of the `...rest: T[]` element type (one `TS2345` at the first mismatch,
+//!   same shape). Explicit `undefined` at an optional position is silent
+//!   (its type carries `| undefined`); at fixed and rest positions it
+//!   diagnoses like any other mismatch. Overload failures spell `TS2769`
+//!   with continuation lines; multiple same-name declarations (overloads, or
+//!   shadowing the fact set cannot disambiguate — a documented precision
+//!   limit) decline with reason.
+//! - Still declined per site, each with its reason: required-after-optional
+//!   shapes (`(a?: T, b: U)` — tsc itself errors the declaration with
+//!   `TS1016` and checks calls at the exact total, both unmirrorable without
+//!   declaration diagnostics), non-array rest types (`...rest: number` —
+//!   tsc's `TS2370` at the declaration, likewise unmirrorable), and
+//!   non-trailing rest markers (unprobed entirely).
 //! - Unresolved callees are skipped, not diagnosed: the name is already
 //!   tracked as an unresolved reference (see [`Binder::unresolved`]), so a
 //!   diagnostic would double-report one signal (and per-site unsupported
@@ -190,6 +206,43 @@
 //!   string-searching. A locally declared binding shadowing a known value
 //!   still routes opaque (documented limit: member facts carry no occurrence
 //!   scope, so shadowing is indistinguishable facts-side).
+//!
+//! Range arities and optional members (P037, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p037-probes/`):
+//!
+//! - `function f(a: number, b?: number)` and `function g(a: number, b: number
+//!   = 2)` both admit 1-2 arguments silently and diagnose both sides with
+//!   the range spelling (`Expected 1-2 arguments, but got 0.` / `... but got
+//!   3.`, still `TS2554`): anchoring follows the exact-arity law (too-few at
+//!   the callee, too-many at the first excess argument). All-optional lists
+//!   spell `Expected 0-1 arguments, but got 2.` the same way.
+//! - `function h(a: number, ...rest: number[])` admits 1-or-more silently;
+//!   zero arguments diagnose `TS2555` (`Expected at least 1 arguments, but
+//!   got 0.`, callee-anchored) while extras check against the element type
+//!   (`h(1, "oops")` reports `TS2345` at the argument, exactly the fixed
+//!   shape). A zero-fixed rest list admits zero arguments. Non-array rest
+//!   types error the declaration in tsc (`TS2370: A rest parameter must be of
+//!   an array type.`) with tuple-typed call fallout the subset cannot spell,
+//!   so calls against them decline.
+//! - In-range wrong types diagnose positionally (`o1(1, "oops")` and
+//!   `o1("oops", 2)` each report `TS2345` at their own argument), except
+//!   explicit `undefined` at an optional position, which is silent (the
+//!   parameter's type carries `| undefined`); the same `undefined` at a
+//!   fixed or rest position diagnoses normally.
+//! - Required-after-optional (`(a?: T, b: U)`, and defaulted-then-required
+//!   `(a: T = …, b: U)`) errors the declaration in tsc (`TS1016: A required
+//!   parameter cannot follow an optional parameter.`) and checks calls at
+//!   the exact total (`Expected 2 arguments …`); the subset has no
+//!   declaration-diagnostic family, so these decline per site with a reason.
+//! - Optional object members (`{ x: number; y?: number }`,
+//!   `interface P { x: number; y?: number }`): absent uses stay silent,
+//!   present uses check exactly like required members (wrong types diagnose
+//!   `TS2322` with the plain member type), and missing calculations skip
+//!   them — `{}` against `{ x: number; y?: number }` reports only `x`, and
+//!   `[1]` against either spelling reports only `x` (`TS2741` in both).
+//!   Expected-type elaborations spell the marker verbatim (`{ x: number; y?:
+//!   number | undefined; }` for inline annotations; the bare interface name
+//!   otherwise), so excess members name the same text tsc does.
 //!
 //! `any`/`unknown` boundary plus `as` casts (P025, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p025-probes/`):
@@ -252,8 +305,9 @@
 //!   `TS2345` at the argument. Classes without a constructor take 0
 //!   arguments (`Expected 0 arguments, but got 1.`); constructor parameter
 //!   properties (`private x: number`) check normally; optional/rest
-//!   constructor params decline per site exactly like function calls
-//!   (`Expected 1-2 arguments …` is a range arity). Decline reasons say
+//!   constructor params check per site exactly like function calls (ranges,
+//!   `TS2555` minima, and rest-element checks all flow through the shared
+//!   [`check_one_call`] path). Decline reasons say
 //!   "call" for `new` sites (documented wording fold — tsc itself spells
 //!   `arguments` for both).
 //! - Declines (each probed): method bodies (`TS2322` at the return in tsc),
@@ -286,8 +340,11 @@
 //! - `readonly` needs no special case: assignability ignores it (clean when
 //!   members match, plain `TS2322` when wrong).
 //! - Heritage clauses, generic parameter lists, methods, index/call/
-//!   construct signatures, and optional members decline with per-member
-//!   reasons (pinned oracle-clean divergences: tsc checks all of these).
+//!   construct signatures, computed or non-identifier keys, and missing
+//!   annotations decline with per-member reasons (pinned oracle-clean
+//!   divergences: tsc checks all of these). Optional members check instead:
+//!   absent uses stay silent while present ones run the shared comparison
+//!   (P037).
 //! - Merged pairs (`interface Foo {}` + `const Foo = …`) share one
 //!   [`SymbolId`]: oxc pre-merges same-scope redeclarations (so the
 //!   frontend emits one fact), and the P005 binder law covers any residual
@@ -442,6 +499,8 @@ pub const CODE_MISSING_MANY: &str = "PITH2739";
 pub const CODE_EXCESS_MEMBER: &str = "PITH2353";
 /// Code for call-site arity mismatches (oracle `TS2554`).
 pub const CODE_ARITY: &str = "PITH2554";
+/// Code for rest-minimum arity mismatches (oracle `TS2555`).
+pub const CODE_ARITY_MIN: &str = "PITH2555";
 /// Code for call-site argument-type mismatches (oracle `TS2345`).
 pub const CODE_ARG_TYPE: &str = "PITH2345";
 /// Code for declined `as`/angle assertions (oracle `TS2352`).
@@ -773,8 +832,9 @@ pub struct ConstDecl {
 ///
 /// Fact-fed from the adapter's identifier parameter list. The return checker
 /// gates on `annotated` only; the call-site checker additionally needs
-/// `annotation` (arg-type checks), `optional`, and `is_rest` (exact-arity
-/// checks decline range/variadic lists).
+/// `annotation` (arg-type checks) plus `optional` and `is_rest` (range
+/// arity: `min` counts the required prefix, `max` the fixed total, rest is
+/// `min`-or-more with the `T[]` element type checking the extras).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionParam {
     /// Parameter name as written.
@@ -1975,10 +2035,11 @@ pub struct CallSite {
 ///   fact set cannot disambiguate): one [`UnsupportedDecl`] — overload
 ///   resolution is future work, never speculative.
 /// - Exactly one declaration: parameter gates (structural first —
-///   `params_complex`, unannotated, optional/rest, uncheckable parameter
-///   types — each its own [`UnsupportedDecl`] at the callee span), then at
-///   most one diagnostic: arity (`PITH2554`) beats arg types (`PITH2345`),
-///   and only the first mismatched argument reports (both probed on tsc
+///   `params_complex`, non-trailing rest, unannotated, required-after-optional,
+///   uncheckable parameter types — each its own [`UnsupportedDecl`] at the
+///   callee span), then at most one diagnostic: arity (`PITH2554`, or
+///   `PITH2555` below a rest minimum) beats arg types (`PITH2345`),
+///   and only the first mismatched argument reports (all probed on tsc
 ///   7.0.2). Non-literal arguments are skipped per-argument for type checks
 ///   while arity still enforces. Return annotations and body shapes are
 ///   irrelevant here: calls to complex-bodied functions still check.
@@ -2049,18 +2110,36 @@ fn check_one_call(
         return;
     }
     let decl = &decls[candidates[0]];
-    let Some(params) = call_params(call, decl, file, report) else {
+    let Some(resolved) = call_params(call, decl, file, report) else {
         return;
     };
     let site = VerdictSite {
         anchor: call.callee_span,
         args: &call.args,
     };
-    let params: Vec<CallParam> = params
+    let fixed: Vec<CallParam> = resolved
+        .fixed
         .into_iter()
-        .map(|(expected, display)| CallParam { expected, display })
+        .map(|(expected, display, optional)| CallParam {
+            expected,
+            display,
+            optional,
+        })
         .collect();
-    emit_call_verdict(file, &site, &params, report);
+    let rest = resolved.rest.map(|(expected, display)| CallParam {
+        expected,
+        display,
+        optional: false,
+    });
+    let target = CallTarget {
+        fixed: &fixed,
+        arity: CallArity {
+            min: resolved.min,
+            max: resolved.max,
+        },
+        rest: rest.as_ref(),
+    };
+    emit_call_verdict(file, &site, &target, report);
 }
 
 /// One resolved call parameter: the expected type when checkable plus the
@@ -2069,7 +2148,10 @@ fn check_one_call(
 /// `expected` is `None` for accept-all (`any`, `unknown`) and uncheckable
 /// (`object`, function, union) parameters: those skip per-argument (the non-literal
 /// precedent), never decline whole calls, so decidable arity verdicts survive
-/// uncheckable shapes.
+/// uncheckable shapes. `optional` marks optional/defaulted positions, where
+/// an explicit `undefined` argument is silent (the parameter's type carries
+/// `| undefined` — probed tsc 7.0.2 P037); rest-element params always read
+/// `false`, so `undefined` extras diagnose like any other mismatch.
 #[derive(Clone, Debug)]
 struct CallParam {
     /// Expected builtin [`TypeId`], or `None` when this position never
@@ -2078,6 +2160,8 @@ struct CallParam {
     /// Parameter type text for `TS2345` messages (`"number"`, `"any"`,
     /// `"object"`, ...).
     display: String,
+    /// Whether this position admits an explicit `undefined` argument.
+    optional: bool,
 }
 
 /// One anchored call site for the shared verdict tail: direct calls anchor at
@@ -2090,37 +2174,127 @@ struct VerdictSite<'a> {
     args: &'a [CallArg],
 }
 
-/// Emits at most one diagnostic for one anchored call site: exact arity
-/// (`PITH2554`) beats argument types (`PITH2345`), and only the first
-/// mismatched argument reports (both probed on tsc 7.0.2).
+/// Admitted arity of one call target: `min` required arguments plus the
+/// fixed `max` (`None` for rest-variadic lists, which admit any count past
+/// `min`). Exact lists read `min == max`.
+#[derive(Clone, Copy, Debug)]
+struct CallArity {
+    /// Fewest admitted arguments (the required prefix).
+    min: usize,
+    /// Most admitted fixed arguments (`None` when a rest element trails).
+    max: Option<usize>,
+}
+
+/// One resolved call target for the shared verdict tail: fixed positions in
+/// source order plus the arity they admit and, for rest lists, the element
+/// type trailing extras check against.
+struct CallTarget<'a> {
+    /// Fixed positions in source order.
+    fixed: &'a [CallParam],
+    /// Admitted argument-count range.
+    arity: CallArity,
+    /// Rest-element expectation (`None` for exact/range lists).
+    rest: Option<&'a CallParam>,
+}
+
+/// Emits at most one diagnostic for one anchored call site: arity
+/// (`PITH2554`, or `PITH2555` below a rest minimum) beats argument types
+/// (`PITH2345`), and only the first mismatched argument reports (all probed
+/// on tsc 7.0.2 P014/P037).
 ///
 /// Spans mirror the oracle: too-few arity at the anchor, too-many at the
-/// first excess argument, arg-type at the mismatched argument.
+/// first excess argument, arg-type at the mismatched argument. Exact lists
+/// keep the historical `Expected 2 arguments …` spelling, ranges spell
+/// `Expected 1-2 arguments …`, and rest minima spell
+/// `Expected at least 1 arguments …`.
 fn emit_call_verdict(
     file: FileId,
     site: &VerdictSite<'_>,
-    params: &[CallParam],
+    target: &CallTarget<'_>,
     report: &mut FileReport,
 ) {
-    if site.args.len() != params.len() {
-        let span = if site.args.len() < params.len() {
-            site.anchor
+    let count = site.args.len();
+    if count < target.arity.min {
+        let (code, message) = if target.arity.max.is_none() {
+            (
+                CODE_ARITY_MIN,
+                format!(
+                    "Expected at least {} arguments, but got {count}.",
+                    target.arity.min
+                ),
+            )
         } else {
-            site.args[params.len()].span
+            (
+                CODE_ARITY,
+                format!(
+                    "Expected {} arguments, but got {count}.",
+                    range_text(target.arity)
+                ),
+            )
         };
         report.diagnostics.push(PithDiagnostic {
-            code: CODE_ARITY.to_owned(),
+            code: code.to_owned(),
             file,
-            span,
-            message: format!(
-                "Expected {} arguments, but got {}.",
-                params.len(),
-                site.args.len()
-            ),
+            span: site.anchor,
+            message,
         });
         return;
     }
-    for (argument, param) in site.args.iter().zip(params.iter()) {
+    if let Some(max) = target.arity.max {
+        if count > max {
+            report.diagnostics.push(PithDiagnostic {
+                code: CODE_ARITY.to_owned(),
+                file,
+                span: site.args[max].span,
+                message: format!(
+                    "Expected {} arguments, but got {count}.",
+                    range_text(target.arity)
+                ),
+            });
+            return;
+        }
+    }
+    check_call_arguments(file, site, target, report);
+}
+
+/// Spells one admitted range-arity the way tsc does: `2` for exact lists,
+/// `1-2` for ranges (rest minima never reach here — they spell `at least`).
+fn range_text(arity: CallArity) -> String {
+    match arity.max {
+        Some(max) if max == arity.min => arity.min.to_string(),
+        Some(max) => format!("{}-{max}", arity.min),
+        None => format!("at least {}", arity.min),
+    }
+}
+
+/// Checks supplied arguments positionally: fixed positions against their
+/// params, trailing extras against the rest element (when one trails).
+///
+/// Assertion arguments evaluate first: complex casts skip per-argument (the
+/// `NonLiteral` precedent — arity still enforces), declined casts diagnose
+/// at the operand span, and admitted results check like their kind.
+/// Declined casts never suppress the type check (probed tsc 7.0.2:
+/// `sn(("hello" as number))` reports both `TS2345` and `TS2352`); the
+/// first-mismatch rule still governs `TS2345`. Explicit `undefined` at an
+/// optional position is silent (its type carries `| undefined` — probed
+/// P037); everywhere else it diagnoses like any other mismatch.
+fn check_call_arguments(
+    file: FileId,
+    site: &VerdictSite<'_>,
+    target: &CallTarget<'_>,
+    report: &mut FileReport,
+) {
+    for (index, argument) in site.args.iter().enumerate() {
+        let param: &CallParam = if let Some(fixed) = target.fixed.get(index) {
+            fixed
+        } else if let Some(element) = target.rest {
+            element
+        } else {
+            // No fixed position and no rest element: the arity gate above
+            // already returned on every checked path, so this skips rather
+            // than forcing a verdict.
+            continue;
+        };
         // Assertion arguments evaluate first: complex casts skip per-argument
         // (the `NonLiteral` precedent — arity still enforces), declined casts
         // diagnose at the operand span, and admitted results check like their
@@ -2149,6 +2323,9 @@ fn emit_call_verdict(
         if kind == InitKind::NonLiteral {
             continue;
         }
+        if kind == InitKind::Undefined && param.optional {
+            continue;
+        }
         let Some(expected) = param.expected else {
             continue;
         };
@@ -2168,21 +2345,36 @@ fn emit_call_verdict(
     }
 }
 
+/// One admitted parameter list for [`check_one_call`]: fixed positions in
+/// source order (each an `(expected, display, optional)` triple — `None`
+/// expectations are accept-all `any`/`unknown`), the admitted
+/// argument-count range, and the rest-element type when variadic.
+struct ResolvedCallParams {
+    /// Fixed positions in source order: expected type, display text, and
+    /// whether explicit `undefined` is silent at the position.
+    fixed: Vec<(Option<TypeId>, String, bool)>,
+    /// Fewest admitted arguments (the required prefix).
+    min: usize,
+    /// Most admitted fixed arguments (`None` when a rest element trails).
+    max: Option<usize>,
+    /// Rest-element expectation (`None` for exact/range lists).
+    rest: Option<(Option<TypeId>, String)>,
+}
+
 /// Gates one call's parameter list for [`check_one_call`].
 ///
-/// `Some` carries per-parameter `(expected [``TypeId``], display text)` in
-/// source order (`None` positions are accept-all `any`/`unknown`: they skip
-/// per-argument, never decline whole calls); `None` means one [`UnsupportedDecl`] was pushed at the
-/// callee span and the call declines. Structural gates run
-/// parameter-by-parameter in order (unannotated, optional/rest, then
-/// uncheckable type text): the first failure wins, so reasons stay
-/// single and deterministic.
+/// `Some` carries the admitted range plus per-position expectations (see
+/// [`ResolvedCallParams`]); `None` means one [`UnsupportedDecl`] was pushed
+/// at the callee span and the call declines. Structural gates run first
+/// (`params_complex`, non-trailing rest), then parameter-by-parameter in
+/// order (unannotated, required-after-optional, then the type text): the
+/// first failure wins, so reasons stay single and deterministic.
 fn call_params(
     call: &CallSite,
     decl: &FunctionDecl,
     file: FileId,
     report: &mut FileReport,
-) -> Option<Vec<(Option<TypeId>, String)>> {
+) -> Option<ResolvedCallParams> {
     if decl.params_complex {
         decline(
             call,
@@ -2192,7 +2384,26 @@ fn call_params(
         );
         return None;
     }
-    let mut params = Vec::with_capacity(decl.params.len());
+    if let Some(trailing) = decl
+        .params
+        .iter()
+        .position(|param| param.is_rest)
+        .filter(|index| index.saturating_add(1) != decl.params.len())
+    {
+        decline(
+            call,
+            file,
+            report,
+            &format!(
+                "rest parameter '{}' must be last: trailing positions are outside the subset",
+                decl.params[trailing].name
+            ),
+        );
+        return None;
+    }
+    let mut fixed = Vec::with_capacity(decl.params.len());
+    let mut rest: Option<(Option<TypeId>, String)> = None;
+    let mut seen_optional = false;
     for param in &decl.params {
         if !param.annotated {
             decline(
@@ -2206,39 +2417,51 @@ fn call_params(
             );
             return None;
         }
-        if param.optional {
-            decline(
-                call,
-                file,
-                report,
-                &format!(
-                    "optional parameter '{}' takes a range of arities, outside the subset",
-                    param.name
-                ),
-            );
-            return None;
-        }
         if param.is_rest {
+            match classify_rest_element(param) {
+                Ok(element) => rest = Some(element),
+                Err(reason) => {
+                    decline(call, file, report, &reason);
+                    return None;
+                }
+            }
+            continue;
+        }
+        if param.optional {
+            seen_optional = true;
+        } else if seen_optional {
             decline(
                 call,
                 file,
                 report,
                 &format!(
-                    "rest parameter '{}' is variadic, outside the subset",
+                    "required parameter '{}' follows an optional parameter: \
+                    required-after-optional shapes are outside the subset",
                     param.name
                 ),
             );
             return None;
         }
         match classify_param(param) {
-            Ok((expected, display)) => params.push((expected, display)),
+            Ok((expected, display)) => fixed.push((expected, display, param.optional)),
             Err(reason) => {
                 decline(call, file, report, &reason);
                 return None;
             }
         }
     }
-    Some(params)
+    let min = fixed.iter().filter(|member| !member.2).count();
+    let max = if rest.is_some() {
+        None
+    } else {
+        Some(fixed.len())
+    };
+    Some(ResolvedCallParams {
+        fixed,
+        min,
+        max,
+        rest,
+    })
 }
 
 /// Pushes one call-site [`UnsupportedDecl`] at the callee span.
@@ -2250,7 +2473,38 @@ fn decline(call: &CallSite, file: FileId, report: &mut FileReport, reason: &str)
     });
 }
 
-/// Classifies one annotated, non-optional, non-rest parameter into its
+/// Classifies one annotated rest parameter into its element `(expected,
+/// display)`: only array spellings with a primitive-or-boundary element
+/// admit (`any`/`unknown` elements accept every extra silently, mirroring
+/// the array-element rule; `never` keeps its diagnosing expectation, the
+/// same precedent).
+///
+/// `Err` carries the decline reason: non-array types mirror tsc's `TS2370`
+/// (`A rest parameter must be of an array type.`) as a decline — the solver
+/// spells no declaration diagnostics — and uncheckable element shapes reuse
+/// the array classifier's reasons, prefixed with the parameter name.
+fn classify_rest_element(param: &FunctionParam) -> Result<(Option<TypeId>, String), String> {
+    let text = param.annotation.as_deref().map_or("", str::trim);
+    let Some(array) = classify_array_annotation(text) else {
+        return Err(format!(
+            "rest parameter '{}' must be of an array type: outside the subset",
+            param.name
+        ));
+    };
+    match array {
+        ArrayAnnotation::Decline(reason) => {
+            Err(format!("rest parameter '{}': {reason}", param.name))
+        }
+        ArrayAnnotation::Admit(element) => {
+            if element.id == TypeStore::ANY || element.id == TypeStore::UNKNOWN {
+                Ok((None, element.spelling.to_owned()))
+            } else {
+                Ok((Some(element.id), element.spelling.to_owned()))
+            }
+        }
+    }
+}
+/// Classifies one annotated fixed parameter into its
 /// expected ([`TypeId`], display text): `Err` carries the decline reason
 /// (union, object, unknown, or missing type text the subset cannot spell
 /// argument checks against).
@@ -2325,6 +2579,7 @@ fn exact_sig(arity: usize, params: &[(Option<TypeId>, &str)]) -> OpaqueSig {
         out.push(CallParam {
             expected: *expected,
             display: (*display).to_owned(),
+            optional: false,
         });
     }
     OpaqueSig { arity, params: out }
@@ -2461,7 +2716,15 @@ fn check_one_member_call(run: &mut MemberRun<'_>, call: &MemberCallSite) {
             anchor: call.member_span,
             args: &call.args,
         };
-        emit_call_verdict(run.file, &site, &sig.params, &mut *run.report);
+        let target = CallTarget {
+            fixed: &sig.params,
+            arity: CallArity {
+                min: sig.arity,
+                max: Some(sig.arity),
+            },
+            rest: None,
+        };
+        emit_call_verdict(run.file, &site, &target, &mut *run.report);
         return;
     }
     if let Some(reason) = member_shape_decline(call.receiver.as_str(), call.member.as_str()) {
@@ -5316,15 +5579,29 @@ fn binder_span_for(
         .map_or(fallback, |found| found.span)
 }
 
-/// Parses an object annotation (`{ a: number; b: string }`) into member
-/// name/type-text pairs in annotation order.
+/// One parsed object-annotation member: name, type text, and whether the
+/// name carried `?` (absent uses stay silent while present ones check —
+/// probed tsc 7.0.2 P037).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedMember {
+    /// Member name with any `?` marker stripped.
+    name: String,
+    /// Verbatim type text (`"number"`).
+    ty: String,
+    /// `true` for `y?: number` members.
+    optional: bool,
+}
+
+/// Parses an object annotation (`{ a: number; b?: string }`) into members in
+/// annotation order.
 ///
 /// Separators follow tsc type literals (`;`, `,`, newlines); only plain
-/// identifier names parse. Returns `None` for anything outside the subset
-/// (missing braces, unparseable or non-identifier members) — never a
-/// verdict. An empty `{}` parses to an empty vec; callers decline it
-/// separately because tsc skips excess checks against `{}`.
-fn parse_object_annotation(text: &str) -> Option<Vec<(String, String)>> {
+/// identifier names parse (a single trailing `?` marks the member
+/// optional). Returns `None` for anything outside the subset (missing
+/// braces, unparseable or non-identifier members) — never a verdict. An
+/// empty `{}` parses to an empty vec; callers decline it separately because
+/// tsc skips excess checks against `{}`.
+fn parse_object_annotation(text: &str) -> Option<Vec<ParsedMember>> {
     let inner = text.strip_prefix('{')?.strip_suffix('}')?;
     let mut members = Vec::new();
     for piece in inner.split([';', ',', '\n']) {
@@ -5333,7 +5610,10 @@ fn parse_object_annotation(text: &str) -> Option<Vec<(String, String)>> {
             continue;
         }
         let (name, ty) = piece.split_once(':')?;
-        let name = name.trim();
+        let (name, optional) = match name.trim().strip_suffix('?') {
+            Some(stripped) => (stripped.trim(), true),
+            None => (name.trim(), false),
+        };
         let ty = ty.trim();
         if name.is_empty()
             || ty.is_empty()
@@ -5343,7 +5623,11 @@ fn parse_object_annotation(text: &str) -> Option<Vec<(String, String)>> {
         {
             return None;
         }
-        members.push((name.to_owned(), ty.to_owned()));
+        members.push(ParsedMember {
+            name: name.to_owned(),
+            ty: ty.to_owned(),
+            optional,
+        });
     }
     Some(members)
 }
@@ -5853,13 +6137,14 @@ fn finish_object_check(
     }
 }
 
-/// Parses an object annotation into `(name, type-text)` pairs, declining
-/// unparseable shapes and empty `{}` (tsc skips excess checks against `{}`).
+/// Parses an object annotation into [`ParsedMember`]s (name, type text,
+/// optionality), declining unparseable shapes and empty `{}` (tsc skips
+/// excess checks against `{}`).
 fn parse_object_members(
     annotation: &str,
     span: Span,
     ctx: &mut CheckCtx<'_>,
-) -> Option<Vec<(String, String)>> {
+) -> Option<Vec<ParsedMember>> {
     let Some(parsed) = parse_object_annotation(annotation) else {
         ctx.report.unsupported.push(UnsupportedDecl {
             file: ctx.file,
@@ -5881,24 +6166,44 @@ fn parse_object_members(
     Some(parsed)
 }
 
-/// One classified annotation member: name, primitive type, original text.
-type ExpectedMember = (String, TypeId, String);
+/// One classified annotation member: name, primitive type, display text for
+/// messages, and whether absent uses stay silent (P037 optional members).
+#[derive(Clone, Debug)]
+struct ExpectedMember {
+    /// Member name as written in the annotation.
+    name: String,
+    /// Builtin [`TypeId`] present members compare against.
+    id: TypeId,
+    /// Plain type text for `TS2322` messages (`"number"` — never the
+    /// `| undefined` elaboration, which only missing/excess texts spell).
+    display: String,
+    /// `true` for `y?: number` members (absent silent, present checked).
+    optional: bool,
+}
 
 /// Resolves every member type to a primitive: unknown names diagnose
 /// (`TS2304`, one per name), union/complex shapes decline the declaration.
+/// Optionality rides along untouched: it gates missing-member silence and
+/// the expected-type spelling, never the type comparison itself.
 fn classify_expected(
-    parsed: &[(String, String)],
+    parsed: &[ParsedMember],
     span: Span,
     ctx: &mut CheckCtx<'_>,
 ) -> Option<Vec<ExpectedMember>> {
     let mut expected: Vec<ExpectedMember> = Vec::with_capacity(parsed.len());
     let mut unknown: Vec<&str> = Vec::new();
-    for (name, ty) in parsed {
+    for member in parsed {
+        let (name, ty) = (member.name.as_str(), member.ty.as_str());
         match classify_member_type(ty) {
-            Ok(id) => expected.push((name.clone(), id, ty.clone())),
+            Ok(id) => expected.push(ExpectedMember {
+                name: name.to_owned(),
+                id,
+                display: ty.to_owned(),
+                optional: member.optional,
+            }),
             Err(is_unknown) => {
                 if is_unknown {
-                    unknown.push(ty.as_str());
+                    unknown.push(ty);
                 } else {
                     let reason = if ty.contains('|') {
                         format!("union member type '{ty}' is outside the subset")
@@ -5936,7 +6241,7 @@ fn memoize_object_shape(expected: &[ExpectedMember], ctx: &mut CheckCtx<'_>) {
     let shape = TypeData::Object {
         members: expected
             .iter()
-            .map(|(name, id, _)| (name.clone(), *id))
+            .map(|member| (member.name.clone(), member.id))
             .collect(),
     };
     let ann_ty = ctx.db.types_mut().intern(shape);
@@ -6013,12 +6318,12 @@ fn diagnose_wrong_members(
     for (name, kind) in actual {
         let Some(entry) = expected
             .iter()
-            .find(|entry| entry.0.as_str() == name.as_str())
+            .find(|entry| entry.name.as_str() == name.as_str())
         else {
             continue;
         };
-        if kind.type_id() != entry.1 {
-            wrong.push((kind.widened_name(), entry.2.as_str()));
+        if kind.type_id() != entry.id {
+            wrong.push((kind.widened_name(), entry.display.as_str()));
         }
     }
     if wrong.is_empty() {
@@ -6049,7 +6354,7 @@ fn diagnose_excess_member(
     let Some(first) = actual
         .iter()
         .map(|(name, _)| name.as_str())
-        .find(|name| expected.iter().all(|entry| entry.0 != *name))
+        .find(|name| expected.iter().all(|entry| entry.name != *name))
     else {
         return false;
     };
@@ -6072,8 +6377,9 @@ fn diagnose_excess_member(
     true
 }
 
-/// Missing members (annotation order): one is `TS2741`, several collapse
-/// into one `TS2739`.
+/// Missing members (annotation order, required only): one is `TS2741`,
+/// several collapse into one `TS2739`. Optional members are invisible here:
+/// absent uses stay silent (probed tsc 7.0.2 P037).
 fn diagnose_missing_members(
     span: Span,
     expected: &[ExpectedMember],
@@ -6093,7 +6399,8 @@ fn diagnose_missing_members(
     );
     let missing: Vec<&str> = expected
         .iter()
-        .map(|(name, _, _)| name.as_str())
+        .filter(|member| !member.optional)
+        .map(|member| member.name.as_str())
         .filter(|name| actual.iter().all(|slot| slot.0 != *name))
         .collect();
     emit_missing(
@@ -6359,25 +6666,38 @@ fn emit_missing(file: FileId, emission: &MissingEmission<'_>, report: &mut FileR
 }
 
 /// Spells the expected object type in annotation order (the shared
-/// elaboration for inline annotations).
+/// elaboration for inline annotations): `{ a: number; }`, with optional
+/// members spelled exactly like tsc (`y?: number | undefined` — probed
+/// 7.0.2 P037).
 fn expected_object_text(expected: &[ExpectedMember]) -> String {
-    object_type_text(
-        &expected
-            .iter()
-            .map(|(name, _, _)| name.as_str())
-            .collect::<Vec<&str>>(),
-        &expected
-            .iter()
-            .map(|(_, _, ty)| ty.as_str())
-            .collect::<Vec<&str>>(),
-    )
+    if expected.is_empty() {
+        // tsc spells the empty object type `{}` (probed 7.0.2), never `{ }`.
+        return "{}".to_owned();
+    }
+    let mut text = String::from("{");
+    for member in expected {
+        text.push(' ');
+        text.push_str(member.name.as_str());
+        if member.optional {
+            text.push('?');
+        }
+        text.push_str(": ");
+        text.push_str(member.display.as_str());
+        if member.optional {
+            text.push_str(" | undefined");
+        }
+        text.push(';');
+    }
+    text.push_str(" }");
+    text
 }
 
 /// Array initializer against an object annotation: tsc reports the missing
 /// family with the array spelling as the actual type (`Property 'x' is
 /// missing in type 'number[]' but required in type '{ x: number; }'.`,
-/// probed 7.0.2). Arrays carry no named members, so every expected member
-/// is missing; unspellable arrays decline.
+/// probed 7.0.2). Arrays carry no named members, so every REQUIRED expected
+/// member is missing (optional members stay silent — probed P037);
+/// unspellable arrays decline.
 fn check_object_annotation_array_init(
     span: Span,
     annotation: &str,
@@ -6401,7 +6721,11 @@ fn check_object_annotation_array_init(
         });
         return;
     };
-    let missing: Vec<&str> = expected.iter().map(|(name, _, _)| name.as_str()).collect();
+    let missing: Vec<&str> = expected
+        .iter()
+        .filter(|member| !member.optional)
+        .map(|member| member.name.as_str())
+        .collect();
     emit_missing(
         ctx.file,
         &MissingEmission {
@@ -6432,13 +6756,16 @@ pub struct InterfaceHeritage {
 /// Driver-mapped from the adapter's `InterfaceMemberFact` (mechanical field
 /// copy). `complex_reason` carries the adapter's decline marker verbatim;
 /// checkable members carry the raw annotation text for
-/// [`classify_expected`].
+/// [`classify_expected`], and `optional` marks `y?: T` members (absent uses
+/// silent, present checked — probed tsc 7.0.2 P037).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceMember {
     /// Member name as written.
     pub name: String,
     /// Raw annotation text (`Some("number")`); `None` when absent.
     pub annotation_text: Option<String>,
+    /// `true` for `y?: T` members.
+    pub optional: bool,
     /// Span of the member signature.
     pub span: Span,
     /// Adapter decline marker; `Some` means the interface declines.
@@ -6823,9 +7150,10 @@ fn decline_interface_shape(
 }
 
 /// Checks an array initializer against an interface shape for
-/// [`check_interface_shape`]: every member is missing (arrays carry no
-/// named members), spelled the oracle way with the interface name
-/// (probed 7.0.2). Unspellable arrays decline instead of mis-spelling.
+/// [`check_interface_shape`]: every REQUIRED member is missing (arrays carry
+/// no named members; optional members stay silent — probed P037), spelled
+/// the oracle way with the interface name (probed 7.0.2). Unspellable arrays
+/// decline instead of mis-spelling.
 /// Returns true when the declaration is done.
 fn check_interface_array_init(
     decl: &ConstDecl,
@@ -6850,6 +7178,7 @@ fn check_interface_array_init(
     let missing: Vec<&str> = shape
         .members
         .iter()
+        .filter(|member| !member.optional)
         .map(|member| member.name.as_str())
         .collect();
     emit_missing(
@@ -6904,7 +7233,11 @@ fn check_interface_shape(
             });
             return;
         };
-        parsed.push((member.name.clone(), text.to_owned()));
+        parsed.push(ParsedMember {
+            name: member.name.clone(),
+            ty: text.to_owned(),
+            optional: member.optional,
+        });
     }
     let Some(expected) = classify_expected(&parsed, span, ctx) else {
         return;
@@ -7805,6 +8138,7 @@ mod tests {
                 .map(|(member, ty)| InterfaceMember {
                     name: member.to_owned(),
                     annotation_text: Some(ty.to_owned()),
+                    optional: false,
                     span: span(0, 1),
                     complex_reason: None,
                 })
@@ -8020,6 +8354,7 @@ mod tests {
         heritage.members.push(InterfaceMember {
             name: "run".to_owned(),
             annotation_text: None,
+            optional: false,
             span: span(0, 1),
             complex_reason: Some("method signature 'run' is outside the subset".to_owned()),
         });
@@ -8029,6 +8364,7 @@ mod tests {
         method.members.push(InterfaceMember {
             name: "run".to_owned(),
             annotation_text: None,
+            optional: false,
             span: span(0, 1),
             complex_reason: Some("method signature 'run' is outside the subset".to_owned()),
         });
@@ -8112,6 +8448,7 @@ mod tests {
             members: vec![InterfaceMember {
                 name: "a".to_owned(),
                 annotation_text: Some("string".to_owned()),
+                optional: false,
                 span: first,
                 complex_reason: None,
             }],
@@ -9090,6 +9427,93 @@ mod tests {
     }
 
     #[test]
+    fn object_optional_members_absent_silent_present_checked() {
+        // Probed tsc 7.0.2 P037: absent optional members stay silent,
+        // present ones check exactly like required members, and missing
+        // calculations skip them (only `x` is ever reported).
+        let binder = binder_with(&[
+            ("a", span(0, 10)),
+            ("b", span(11, 21)),
+            ("c", span(22, 32)),
+            ("d", span(33, 43)),
+        ]);
+        let ann = "{ x: number; y?: number }";
+        let decls = [
+            object_decl("a", 0, 10, ann, vec![("x", ObjectMemberKind::Number)]),
+            object_decl(
+                "b",
+                11,
+                21,
+                ann,
+                vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::Number),
+                ],
+            ),
+            object_decl(
+                "c",
+                22,
+                32,
+                ann,
+                vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::String),
+                ],
+            ),
+            object_decl("d", 33, 43, ann, Vec::new()),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(report.diagnostics[0].span, span(22, 32));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[1].code, CODE_MISSING_MEMBER);
+        assert_eq!(report.diagnostics[1].span, span(33, 43));
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Property 'x' is missing in type '{}' but required in type \
+            '{ x: number; y?: number | undefined; }'."
+        );
+    }
+
+    #[test]
+    fn interface_optional_member_absent_silent_present_wrong() {
+        // Same rule through the interface path (the expected spelling stays
+        // the interface name): absent silent, present-wrong `TS2322`.
+        let binder = binder_with(&[("P", span(0, 5)), ("a", span(6, 16)), ("b", span(17, 27))]);
+        let mut shape = interface_shape(&binder, "P", 0, vec![("x", "number"), ("y", "number")]);
+        shape.members[1].optional = true;
+        let decls = [
+            object_decl("a", 6, 16, "P", vec![("x", ObjectMemberKind::Number)]),
+            object_decl(
+                "b",
+                17,
+                27,
+                "P",
+                vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::String),
+                ],
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_interfaces(FILE, &decls, &[shape], &binder, &mut db);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(report.diagnostics[0].span, span(17, 27));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
     fn object_missing_many_is_pith2739() {
         // The actual type keeps literal order (`secure` first) and fresh
         // booleans spell literally (`false`); the missing list keeps
@@ -9231,7 +9655,6 @@ mod tests {
             ("n", span(9, 17)),
             ("e", span(18, 26)),
             ("q", span(27, 35)),
-            ("v", span(36, 44)),
         ]);
         let union = object_decl(
             "u",
@@ -9255,14 +9678,11 @@ mod tests {
             vec![("a", ObjectMemberKind::NonLiteral)],
         );
         let empty = object_decl("q", 27, 35, "{}", vec![("a", ObjectMemberKind::Number)]);
-        let unparseable = object_decl(
-            "v",
-            36,
-            44,
-            "{ a?: number }",
-            vec![("a", ObjectMemberKind::Number)],
-        );
-        let decls = [union, nested, non_literal_member, empty, unparseable];
+        // NOTE (P037): `{ a?: number }` used to sit here as the fifth
+        // decline, but optional members are now admitted (absent silent,
+        // present checked) with their own differential cover — keeping it
+        // would assert the old verdict against the new subset.
+        let decls = [union, nested, non_literal_member, empty];
         let mut db = QueryDb::new();
         let report = check_file(FILE, &decls, &binder, &mut db);
         assert!(
@@ -9270,7 +9690,7 @@ mod tests {
             "diagnostics: {:?}",
             report.diagnostics
         );
-        assert_eq!(report.unsupported.len(), 5);
+        assert_eq!(report.unsupported.len(), 4);
     }
 
     #[test]
@@ -9332,8 +9752,9 @@ mod tests {
     fn parse_object_annotation_covers_separators() {
         let parsed = parse_object_annotation("{ a: number; b: string, c: boolean\n d: null }")
             .expect("parses");
-        let names: Vec<&str> = parsed.iter().map(|(name, _)| name.as_str()).collect();
+        let names: Vec<&str> = parsed.iter().map(|member| member.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "c", "d"]);
+        assert!(parsed.iter().all(|member| !member.optional));
         assert_eq!(
             parse_object_annotation("{ a: number; }")
                 .expect("parses")
@@ -9341,11 +9762,16 @@ mod tests {
             1
         );
         assert!(parse_object_annotation("{}").expect("parses").is_empty());
+        let opt = parse_object_annotation("{ a: number; b?: string }").expect("parses");
+        assert_eq!(opt.len(), 2);
+        assert!(!opt[0].optional);
+        assert!(opt[1].optional);
+        assert_eq!(opt[1].name, "b");
+        assert_eq!(opt[1].ty, "string");
         for bad in [
             "number",
             "{ a }",
             "{ 'a': number }",
-            "{ a?: number }",
             "{ : number }",
             "{ a: }",
         ] {
@@ -10509,15 +10935,15 @@ mod tests {
         let mut unannotated = callable("u", vec![("v", "number")]);
         unannotated.params[0].annotated = false;
         unannotated.params[0].annotation = None;
-        let mut optional = callable("o", vec![("b", "number")]);
-        optional.params[0].optional = true;
-        let mut rest = callable("r", vec![("items", "number[]")]);
-        rest.params[0].is_rest = true;
+        let mut after = callable("o", vec![("a", "number"), ("b", "number")]);
+        after.params[0].optional = true;
+        let mut non_array_rest = callable("r", vec![("items", "number")]);
+        non_array_rest.params[0].is_rest = true;
         let union = callable("n", vec![("v", "number | string")]);
         let unknown = callable("w", vec![("v", "Nope")]);
         let mut complex = callable("c", vec![("v", "number")]);
         complex.params_complex = true;
-        let decls = [unannotated, optional, rest, union, unknown, complex];
+        let decls = [unannotated, after, non_array_rest, union, unknown, complex];
         let calls = [
             call("u", span(0, 1), vec![(InitKind::Number, span(2, 3))]),
             call("o", span(10, 11), vec![(InitKind::Number, span(12, 13))]),
@@ -10546,12 +10972,12 @@ mod tests {
             reasons[0]
         );
         assert!(
-            reasons[1].contains("optional parameter"),
+            reasons[1].contains("follows an optional parameter"),
             "reason: {}",
             reasons[1]
         );
         assert!(
-            reasons[2].contains("rest parameter"),
+            reasons[2].contains("must be of an array type"),
             "reason: {}",
             reasons[2]
         );
@@ -10570,6 +10996,119 @@ mod tests {
             "reason: {}",
             reasons[5]
         );
+    }
+
+    #[test]
+    fn range_and_rest_arities_check() {
+        // `f(a: number, b?: number)`: 1-2 admit, 0 and 3 diagnose with the
+        // range spelling; `h(a: number, ...rest: number[])`: 0 diagnoses
+        // `TS2555`, extras check against the element type.
+        let binder = calls_binder(&[], &[]);
+        let mut optional = callable("f", vec![("a", "number"), ("b", "number")]);
+        optional.params[1].optional = true;
+        let mut rest = callable("h", vec![("a", "number"), ("items", "number[]")]);
+        rest.params[1].is_rest = true;
+        let decls = [optional, rest];
+        let nullary = Vec::new();
+        let calls = [
+            call("f", span(0, 1), nullary.clone()),
+            call(
+                "f",
+                span(10, 11),
+                vec![
+                    (InitKind::Number, span(12, 13)),
+                    (InitKind::Number, span(14, 15)),
+                    (InitKind::Number, span(16, 17)),
+                ],
+            ),
+            call("h", span(20, 21), nullary.clone()),
+            call(
+                "h",
+                span(30, 31),
+                vec![
+                    (InitKind::Number, span(32, 33)),
+                    (InitKind::String, span(34, 35)),
+                ],
+            ),
+        ];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 4);
+        assert_eq!(report.diagnostics[0].code, CODE_ARITY);
+        assert_eq!(report.diagnostics[0].span, span(0, 1));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Expected 1-2 arguments, but got 0."
+        );
+        assert_eq!(report.diagnostics[1].code, CODE_ARITY);
+        assert_eq!(report.diagnostics[1].span, span(16, 17));
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Expected 1-2 arguments, but got 3."
+        );
+        assert_eq!(report.diagnostics[2].code, CODE_ARITY_MIN);
+        assert_eq!(report.diagnostics[2].span, span(20, 21));
+        assert_eq!(
+            report.diagnostics[2].message,
+            "Expected at least 1 arguments, but got 0."
+        );
+        assert_eq!(report.diagnostics[3].code, CODE_ARG_TYPE);
+        assert_eq!(report.diagnostics[3].span, span(34, 35));
+        assert_eq!(
+            report.diagnostics[3].message,
+            "Argument of type 'string' is not assignable to parameter of type 'number'."
+        );
+    }
+
+    #[test]
+    fn explicit_undefined_is_silent_only_at_optional_positions() {
+        // Probed tsc 7.0.2 P037: `f(1, undefined)` over `(a: number, b?:
+        // number)` is silent, while the same `undefined` at the fixed
+        // position and at a rest extra both diagnose `TS2345`.
+        let binder = calls_binder(&[], &[]);
+        let mut optional = callable("f", vec![("a", "number"), ("b", "number")]);
+        optional.params[1].optional = true;
+        let mut rest = callable("h", vec![("a", "number"), ("items", "number[]")]);
+        rest.params[1].is_rest = true;
+        let decls = [optional, rest];
+        let calls = [
+            call(
+                "f",
+                span(0, 1),
+                vec![
+                    (InitKind::Number, span(2, 3)),
+                    (InitKind::Undefined, span(4, 5)),
+                ],
+            ),
+            call("f", span(10, 11), vec![(InitKind::Undefined, span(12, 13))]),
+            call(
+                "h",
+                span(20, 21),
+                vec![
+                    (InitKind::Number, span(22, 23)),
+                    (InitKind::Undefined, span(24, 25)),
+                ],
+            ),
+        ];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(report.diagnostics[0].span, span(12, 13));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'undefined' is not assignable to parameter of type 'number'."
+        );
+        assert_eq!(report.diagnostics[1].code, CODE_ARG_TYPE);
+        assert_eq!(report.diagnostics[1].span, span(24, 25));
     }
 
     fn union_decl(name: &str, lo: u32, hi: u32, ann: &str, init: Option<InitKind>) -> ConstDecl {
