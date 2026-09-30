@@ -121,10 +121,13 @@
 //!
 //! Parameter enabling (P014, entailed by the call checker): each
 //! [`FunctionParamFact`] additionally carries its annotation text plus
-//! `optional`/`is_rest` markers. Exact-arity checking needs to decline range
-//! (`b?: number`, defaulted) and variadic (`...rest`) lists, and arg-type
-//! checking needs the annotated names — none of which name-only params can
-//! express. No other declaration-fact surface changes.
+//! `optional`/`is_rest` markers. Range-arity checking reads them directly:
+//! `optional` (from `b?: T` and defaulted `b: T = …`) widens the admitted
+//! count to a range and admits explicit `undefined` at the position, while
+//! `is_rest` (from `...rest: T[]`) leaves the minimum with the element type
+//! checking the extras — and arg-type checking needs the annotated names,
+//! none of which name-only params can express. No other declaration-fact
+//! surface changes.
 //!
 //! Guard facts (P015): [`ParsedFile::guards`] carries one [`TypeofGuardFact`]
 //! per top-level `if (typeof x === "<lit>")` / `if (typeof x !== "<lit>")`
@@ -159,9 +162,10 @@
 //! `declare` forms), in visitor (pre-order) order. Each fact links its own
 //! [`SymbolFact`] exactly like [`DeclFact`] (per-file index plus owning
 //! scope) and records member facts ([`InterfaceMemberFact`]: name plus
-//! colon-stripped annotation text) in source order. Only plain non-optional
-//! properties with identifier keys feed the solver: methods, index/call/
-//! construct signatures, optional members, computed or non-identifier keys,
+//! colon-stripped annotation text) in source order. `optional` marks `y?: T`
+//! members (absent uses stay silent while present ones check — probed tsc
+//! 7.0.2 P037). Only plain properties with identifier keys feed the solver:
+//! methods, index/call/construct signatures, computed or non-identifier keys,
 //! and missing annotations each carry a `complex_reason` instead of
 //! mis-keying, and the solver declines those interfaces with per-member
 //! reasons. Heritage clauses record parent names
@@ -920,16 +924,18 @@ pub struct DeclineRegionFact {
 
 /// One member of an `interface` declaration: its name plus its annotation.
 ///
-/// Checkable members (plain non-optional properties with identifier keys)
-/// carry the colon-stripped annotation text verbatim (`Some("number")`);
-/// the solver classifies it into primitives (checked), unknown names
-/// (`TS2304`, mirroring the object path), or union/complex shapes
-/// (declined). Anything structural the subset cannot spell — methods,
-/// index/call/construct signatures, optional members, computed or
-/// non-identifier keys, missing annotations — carries a `complex_reason`
-/// instead, so the solver declines with a per-member reason, never a
-/// forced verdict. `readonly` is not structural: those members stay
-/// checkable (assignability ignores it — probed tsc 7.0.2).
+/// Checkable members (plain properties with identifier keys, optional or
+/// not) carry the colon-stripped annotation text verbatim
+/// (`Some("number")`); the solver classifies it into primitives (checked),
+/// unknown names (`TS2304`, mirroring the object path), or union/complex
+/// shapes (declined). `optional` marks `y?: number` members: absent uses
+/// stay silent while present ones check (probed tsc 7.0.2 P037).
+/// Anything structural the subset cannot spell — methods, index/call/
+/// construct signatures, computed or non-identifier keys, missing
+/// annotations — carries a `complex_reason` instead, so the solver declines
+/// with a per-member reason, never a forced verdict. `readonly` is not
+/// structural: those members stay checkable (assignability ignores it —
+/// probed tsc 7.0.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceMemberFact {
     /// Member name as written (identifier keys verbatim; sliced key text
@@ -938,6 +944,8 @@ pub struct InterfaceMemberFact {
     pub name: String,
     /// Colon-stripped annotation text; `None` when absent or keyless.
     pub annotation_text: Option<String>,
+    /// `true` for `y?: number` members (absent uses silent, present checked).
+    pub optional: bool,
     /// Span of the whole member signature.
     pub span: Span,
     /// Why this member is outside the subset; `None` when checkable.
@@ -1553,6 +1561,7 @@ fn declined_member(
     InterfaceMemberFact {
         name,
         annotation_text: None,
+        optional: false,
         span: Span {
             file,
             lo: span.start,
@@ -1564,12 +1573,13 @@ fn declined_member(
 
 /// Classifies one interface property signature.
 ///
-/// Plain non-optional properties with identifier keys and a sliced
-/// annotation stay checkable (`complex_reason: None`); computed or
-/// non-identifier keys, optional members, and missing annotations decline
-/// with per-member reasons. The annotation text is verbatim — the solver
-/// classifies primitives vs unknown names vs union/complex shapes, exactly
-/// like object-annotation members.
+/// Plain properties with identifier keys and a sliced annotation stay
+/// checkable (`complex_reason: None`), optional or not (`optional` records
+/// the `?` so the solver keeps absent uses silent while checking present
+/// ones — probed tsc 7.0.2 P037); computed or non-identifier keys and
+/// missing annotations decline with per-member reasons. The annotation text
+/// is verbatim — the solver classifies primitives vs unknown names vs
+/// union/complex shapes, exactly like object-annotation members.
 fn property_member_fact(
     source: &str,
     file: FileId,
@@ -1589,8 +1599,6 @@ fn property_member_fact(
         Some(format!(
             "computed or non-identifier key '{name}' is outside the subset"
         ))
-    } else if prop.optional {
-        Some(format!("optional member '{name}' is outside the subset"))
     } else if annotation.is_none() {
         Some(format!(
             "member '{name}' has no type annotation: outside the subset"
@@ -1601,6 +1609,7 @@ fn property_member_fact(
     InterfaceMemberFact {
         name,
         annotation_text: annotation.map(|fact| fact.text),
+        optional: prop.optional,
         span,
         complex_reason: reason,
     }
@@ -5718,17 +5727,21 @@ export function f(a: string): string { return a + b; }
             .complex_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("method") && reason.contains("run")));
-        // Plain members stay checkable; optional members decline.
+        // Plain members stay checkable; optional members stay checkable
+        // with the flag set (absent uses silent, present ones checked).
         assert!(pf.interfaces[1].members[0].complex_reason.is_none());
+        assert!(!pf.interfaces[1].members[0].optional);
         assert_eq!(
             pf.interfaces[1].members[0].annotation_text.as_deref(),
             Some("number")
         );
         assert_eq!(pf.interfaces[1].members[1].name, "b");
-        assert!(pf.interfaces[1].members[1]
-            .complex_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("optional")));
+        assert!(pf.interfaces[1].members[1].complex_reason.is_none());
+        assert!(pf.interfaces[1].members[1].optional);
+        assert_eq!(
+            pf.interfaces[1].members[1].annotation_text.as_deref(),
+            Some("string")
+        );
         // Index signatures keep their parameter name for the reason.
         assert_eq!(pf.interfaces[2].members[0].name, "key");
         assert!(pf.interfaces[2].members[0]
