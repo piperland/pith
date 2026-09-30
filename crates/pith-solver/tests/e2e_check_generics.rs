@@ -29,7 +29,7 @@
 //! (`TS2322`/`TS2345`/`TS2304`/`TS2558`/`TS2344` <-> `PITH*`) plus the
 //! unsupported count. Elaboration continuation lines (`'T' could be
 //! instantiated …`) fold away exactly like check-narrowing's union
-//! elaborations. Nine fixtures diverge by design (oracle clean or erroring
+//! elaborations. Eight fixtures diverge by design (oracle clean or erroring
 //! where the subset declines or skips); each pins its divergence explicitly
 //! instead of forcing a false match.
 
@@ -41,7 +41,7 @@ use pith_ids::{FileId, Span, SymbolId};
 use pith_solver::{
     check_generics, CallArg, CallSite, FileReport, FunctionBody, FunctionDecl, FunctionParam,
     FunctionReturn, GenericCall, GenericDecl, InitKind, JoinedReturns, ObjectInit,
-    ObjectMemberInit, ObjectMemberKind,
+    ObjectMemberInit, ObjectMemberKind, TypeParamBound,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -251,17 +251,16 @@ fn generics_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<GenericDecl>
                     .map(|param| param.name.clone())
                     .collect(),
                 type_params_complex: func.type_params_complex,
-                // First parameter's bounds only: multi-parameter lists
-                // decline on count before bounds ever read, so later bounds
-                // are unreachable on real paths.
-                constraint: func
+                // Every parameter's bounds verbatim: constraints and
+                // defaults compose per parameter solver-side (P036).
+                bounds: func
                     .type_params
-                    .first()
-                    .and_then(|param| param.constraint_text.clone()),
-                default: func
-                    .type_params
-                    .first()
-                    .and_then(|param| param.default_text.clone()),
+                    .iter()
+                    .map(|param| TypeParamBound {
+                        constraint: param.constraint_text.clone(),
+                        default: param.default_text.clone(),
+                    })
+                    .collect(),
             }
         })
         .collect()
@@ -396,6 +395,17 @@ fn args1(first: &str) -> Vec<String> {
     vec![first.to_owned()]
 }
 
+/// Builds a two-element explicit type-argument list
+/// (`pair<number, string>` -> `args2("number", "string")`).
+fn args2(first: &str, second: &str) -> Vec<String> {
+    vec![first.to_owned(), second.to_owned()]
+}
+
+/// Builds a three-element explicit type-argument list.
+fn args3(first: &str, second: &str, third: &str) -> Vec<String> {
+    vec![first.to_owned(), second.to_owned(), third.to_owned()]
+}
+
 macro_rules! fixture_test {
     ($test:ident, $source:literal, $expected:literal, $explicit:expr, $unsupported:expr) => {
         #[test]
@@ -496,10 +506,10 @@ fn inference_failure_pins_clean_oracle() {
 }
 
 #[test]
-fn multi_param_declined_against_clean_oracle() {
-    // Several type parameters are outside the single-`T` subset: oracle
-    // clean while the solver declines once (the call skips; the note covers
-    // it — no double-report).
+fn multi_param_admitted_against_clean_oracle() {
+    // Two independent type parameters now admit: oracle clean while the
+    // solver checks the call silently (the pass-through body still declines
+    // with its own note).
     let source = include_str!("../../../corpus/check-generics/multi-param-declined.ts");
     let expected = include_str!("../../../corpus/check-generics/multi-param-declined.expected.txt");
     assert!(
@@ -514,11 +524,91 @@ fn multi_param_declined_against_clean_oracle() {
     );
     assert_eq!(report.unsupported.len(), 1);
     assert!(
-        report.unsupported[0]
-            .reason
-            .contains("multiple type parameters"),
+        report.unsupported[0].reason.contains("non-literal return"),
         "reason: {}",
         report.unsupported[0].reason
+    );
+}
+
+fixture_test!(
+    pair_correct_binds_silently,
+    "pair-correct.ts",
+    "pair-correct.expected.txt",
+    &[None],
+    1
+);
+fixture_test!(
+    pair_wrong_first_matches_ts2345,
+    "pair-wrong-first.ts",
+    "pair-wrong-first.expected.txt",
+    &[None],
+    1
+);
+fixture_test!(
+    pair_wrong_second_matches_ts2345,
+    "pair-wrong-second.ts",
+    "pair-wrong-second.expected.txt",
+    &[None],
+    1
+);
+fixture_test!(
+    pair_explicit_correct_binds_silently,
+    "pair-explicit-correct.ts",
+    "pair-explicit-correct.expected.txt",
+    &[Some(args2("number", "string"))],
+    1
+);
+fixture_test!(
+    pair_explicit_wrong_matches_ts2345,
+    "pair-explicit-wrong.ts",
+    "pair-explicit-wrong.expected.txt",
+    &[Some(args2("number", "string"))],
+    1
+);
+fixture_test!(
+    pair_explicit_count_matches_ts2558,
+    "pair-explicit-count.ts",
+    "pair-explicit-count.expected.txt",
+    &[
+        Some(args1("number")),
+        Some(args3("number", "string", "boolean"))
+    ],
+    1
+);
+fixture_test!(
+    triple_correct_binds_silently,
+    "triple-correct.ts",
+    "triple-correct.expected.txt",
+    &[None],
+    1
+);
+
+#[test]
+fn pair_inference_failure_pins_clean_oracle() {
+    // No literal candidates: tsc binds from the identifiers' types (clean)
+    // while the subset declines naming the first uninferrable parameter
+    // (plus the body note).
+    let source = include_str!("../../../corpus/check-generics/pair-inference-failure.ts");
+    let expected =
+        include_str!("../../../corpus/check-generics/pair-inference-failure.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean without literal candidates"
+    );
+    let (_, report) = run_pipeline(source, &[None]);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 2);
+    assert!(
+        report
+            .unsupported
+            .iter()
+            .any(|note| note.reason.contains("cannot infer")),
+        "reasons: {:?}",
+        report.unsupported
     );
 }
 
@@ -748,13 +838,15 @@ fn driver_maps_facts_without_hand_feeding() {
     assert_eq!(decls.len(), 2);
     assert_eq!(decls[0].type_params, ["T"]);
     assert!(!decls[0].type_params_complex);
-    assert_eq!(decls[0].constraint, None);
-    assert_eq!(decls[0].default, None);
+    assert_eq!(decls[0].bounds.len(), 1);
+    assert_eq!(decls[0].bounds[0].constraint, None);
+    assert_eq!(decls[0].bounds[0].default, None);
     assert_eq!(decls[0].decl.return_annotation.as_deref(), Some("T"));
     assert_eq!(decls[1].type_params, ["T"]);
     assert!(!decls[1].type_params_complex);
-    assert_eq!(decls[1].constraint.as_deref(), Some("string"));
-    assert_eq!(decls[1].default, None);
+    assert_eq!(decls[1].bounds.len(), 1);
+    assert_eq!(decls[1].bounds[0].constraint.as_deref(), Some("string"));
+    assert_eq!(decls[1].bounds[0].default, None);
     for decl in &decls {
         assert_eq!(decl.decl.span.file, FILE);
         assert!(decl.decl.span.lo < decl.decl.span.hi);

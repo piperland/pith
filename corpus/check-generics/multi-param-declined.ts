@@ -1,4 +1,4 @@
-// Solver verdict: 1 UNSUPPORTED (multiple type parameters); the call skips. Oracle clean.
+// Solver verdict: silent calls (T binds from each literal) + 1 UNSUPPORTED (pass-through body declines). Oracle clean.
 function pair<T, U>(x: T, y: U): T {
   return x;
 }
