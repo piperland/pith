@@ -1,0 +1,2 @@
+pair-explicit-count.ts:TS2558: Expected 2 type arguments, but got 1.
+pair-explicit-count.ts:TS2558: Expected 2 type arguments, but got 3.
