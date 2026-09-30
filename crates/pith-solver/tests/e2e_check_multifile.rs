@@ -41,7 +41,8 @@ use pith_ids::{FileId, NodeId, Span, SymbolId};
 use pith_queries::{Dep, QueryDb, QueryKey, QueryKind};
 use pith_solver::{
     multifile::{
-        check_program, ImportUse, ProgramFile, ProgramReport, CODE_NO_EXPORTED, CODE_NO_MODULE,
+        check_program, AliasShape, ImportUse, ProgramFile, ProgramReport, CODE_NO_EXPORTED,
+        CODE_NO_MODULE,
     },
     CallArg, CallSite, ConstDecl, DeclKind, EnumMember, EnumMemberValue, EnumShape, FileReport,
     FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, InitKind, InterfaceHeritage,
@@ -479,6 +480,20 @@ fn namespaces_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<NamespaceS
         .collect()
 }
 
+/// The alias driver: a mechanical copy of each alias fact's name plus its
+/// sliced target text (spans never sliced driver-side).
+fn aliases_from_facts(parsed: &ParsedFile) -> Vec<AliasShape> {
+    parsed
+        .aliases
+        .iter()
+        .map(|fact| AliasShape {
+            name: fact.name.clone(),
+            target: fact.target_text.clone(),
+            has_type_params: fact.has_type_params,
+        })
+        .collect()
+}
+
 /// Maps one frontend imported name to the graph's, variant by variant.
 fn map_imported_name(name: &FrontendImportedName) -> ImportedName {
     match name {
@@ -579,6 +594,7 @@ fn run_program(specs: &[FileSpec<'_>]) -> Program {
             interfaces: interfaces_from_facts(file_parsed, &binder),
             enums: enums_from_facts(file_parsed, &binder),
             namespaces: namespaces_from_facts(file_parsed, &binder),
+            aliases: aliases_from_facts(file_parsed),
             imports: uses,
         });
     }
@@ -1023,13 +1039,13 @@ fn defu_graph_leaf_edit_invalidates_exactly_one_entry() {
     assert_eq!(dropped, 1, "leaf edit drops exactly its own entry");
 }
 
-/// Type-only imports decline instead of diagnosing (PITH-P022): type
-/// aliases emit no checker facts, so a failing `import type` may name a
-/// member the target does export as a type — `PITH2305`/`PITH2307`/`PITH2304`
-/// there would risk false verdicts where tsc stays clean (pinned
-/// divergence: tsc is silent for existing aliases and `TS2305`/`TS2307`
-/// for missing ones). Value imports keep the exact mirrors (pinned by the
-/// missing-module tests above).
+/// Type-only imports decline instead of diagnosing (PITH-P022): a failing
+/// `import type` may name a member the target exports only as a type through
+/// shapes the subset cannot spell — `PITH2305`/`PITH2307`/`PITH2304` there
+/// would risk false verdicts where tsc stays clean (pinned divergence: tsc
+/// is silent for existing aliases and `TS2305`/`TS2307` for missing ones).
+/// Value imports keep the exact mirrors (pinned by the missing-module tests
+/// above).
 #[test]
 fn type_only_import_declines_instead_of_diagnosing() {
     let program = run_program(&[
@@ -1064,13 +1080,13 @@ fn type_only_import_declines_instead_of_diagnosing() {
     );
 }
 
-/// `import type` of an existing alias stays silent like tsc (PITH-P022):
-/// `export type Alias` records a local-export fact through the same
-/// `Declaration::id` module-record path as interfaces (pinned by the
-/// clean-`Point` case), so the import resolves; the alias annotation then
-/// declines via the existing not-an-enum path.
+/// `import type` of an existing alias checks through expansion (PITH-P035):
+/// `export type Alias` records a local-export fact plus an alias fact, so the
+/// import resolves and the annotation expands to the target spelling — the
+/// P022 decline converts to a check (defu #9). tsc is silent for the clean
+/// use and `TS2322` for the wrong one; the solver mirrors both exactly.
 #[test]
-fn type_only_import_of_existing_alias_stays_silent() {
+fn type_alias_import_expands_and_checks() {
     let program = run_program(&[
         FileSpec {
             path: "t.ts",
@@ -1079,23 +1095,419 @@ fn type_only_import_of_existing_alias_stays_silent() {
         },
         FileSpec {
             path: "m.ts",
-            source: "import type { Alias } from \"./t\";\nconst a: Alias = 1;\n",
+            source: "import type { Alias } from \"./t\";\n\
+                      const a: Alias = 1;\n\
+                      const b: Alias = \"oops\";\n",
             objects: &[],
         },
     ]);
     let main = program.report.file(FileId(1)).expect("main report");
+    assert_eq!(
+        main.diagnostics.len(),
+        1,
+        "one PITH2322: {:?}",
+        main.diagnostics
+    );
+    assert_eq!(main.diagnostics[0].code, "PITH2322");
+    assert_eq!(
+        main.diagnostics[0].message,
+        "Type 'string' is not assignable to type 'number'."
+    );
+    assert!(
+        main.unsupported.is_empty(),
+        "expansion checks: {:?}",
+        main.unsupported
+    );
+}
+
+/// Re-exported interfaces check through chains (PITH-P035): the `iface-*`
+/// corpus case differentials against the recorded tsc baselines (one
+/// `TS2322` at the wrong member, one `TS2741` spelling the re-exported
+/// interface).
+#[test]
+fn reexported_interface_matches_baselines() {
+    let program = run_program(&[
+        FileSpec {
+            path: "iface-shared.ts",
+            source: include_str!("../../../corpus/check-multifile/iface-shared.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "iface-mid.ts",
+            source: include_str!("../../../corpus/check-multifile/iface-mid.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "iface-main.ts",
+            source: include_str!("../../../corpus/check-multifile/iface-main.ts"),
+            objects: &[
+                ObjectSpec {
+                    name: "ok",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::Number),
+                    ],
+                },
+                ObjectSpec {
+                    name: "wrong",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::String),
+                    ],
+                },
+                ObjectSpec {
+                    name: "missing",
+                    members: &[("x", ObjectMemberKind::Number)],
+                },
+            ],
+        },
+    ]);
+    expect_case(
+        "iface",
+        &program,
+        &[
+            (
+                FileId(0),
+                include_str!("../../../corpus/check-multifile/iface-shared.expected.txt"),
+                0,
+            ),
+            (
+                FileId(1),
+                include_str!("../../../corpus/check-multifile/iface-mid.expected.txt"),
+                0,
+            ),
+            (
+                FileId(2),
+                include_str!("../../../corpus/check-multifile/iface-main.expected.txt"),
+                0,
+            ),
+        ],
+    );
+}
+
+/// Re-exported aliases expand single-level (PITH-P035): the `alias-*` corpus
+/// case differentials against the recorded tsc baselines (the interface
+/// alias checks through the underlying shape, the primitive alias behaves
+/// exactly like its target spelling).
+#[test]
+fn reexported_alias_matches_baselines() {
+    let program = run_program(&[
+        FileSpec {
+            path: "alias-shared.ts",
+            source: include_str!("../../../corpus/check-multifile/alias-shared.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "alias-mid.ts",
+            source: include_str!("../../../corpus/check-multifile/alias-mid.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "alias-main.ts",
+            source: include_str!("../../../corpus/check-multifile/alias-main.ts"),
+            objects: &[
+                ObjectSpec {
+                    name: "ok",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::Number),
+                    ],
+                },
+                ObjectSpec {
+                    name: "wrong",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::String),
+                    ],
+                },
+            ],
+        },
+    ]);
+    expect_case(
+        "alias",
+        &program,
+        &[
+            (
+                FileId(0),
+                include_str!("../../../corpus/check-multifile/alias-shared.expected.txt"),
+                0,
+            ),
+            (
+                FileId(1),
+                include_str!("../../../corpus/check-multifile/alias-mid.expected.txt"),
+                0,
+            ),
+            (
+                FileId(2),
+                include_str!("../../../corpus/check-multifile/alias-main.expected.txt"),
+                0,
+            ),
+        ],
+    );
+}
+
+/// Star barrels re-export type members transparently (PITH-P035): the
+/// `typestar-*` corpus case differentials against the recorded tsc baseline.
+#[test]
+fn star_barrel_type_matches_baselines() {
+    let program = run_program(&[
+        FileSpec {
+            path: "typestar-shared.ts",
+            source: include_str!("../../../corpus/check-multifile/typestar-shared.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "typestar-index.ts",
+            source: include_str!("../../../corpus/check-multifile/typestar-index.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "typestar-main.ts",
+            source: include_str!("../../../corpus/check-multifile/typestar-main.ts"),
+            objects: &[
+                ObjectSpec {
+                    name: "ok",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::Number),
+                    ],
+                },
+                ObjectSpec {
+                    name: "wrong",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::String),
+                    ],
+                },
+            ],
+        },
+    ]);
+    expect_case(
+        "typestar",
+        &program,
+        &[
+            (
+                FileId(0),
+                include_str!("../../../corpus/check-multifile/typestar-shared.expected.txt"),
+                0,
+            ),
+            (
+                FileId(1),
+                include_str!("../../../corpus/check-multifile/typestar-index.expected.txt"),
+                0,
+            ),
+            (
+                FileId(2),
+                include_str!("../../../corpus/check-multifile/typestar-main.expected.txt"),
+                0,
+            ),
+        ],
+    );
+}
+
+/// Cyclic type re-exports decline (PITH-P035): the `typecyc-*` corpus files
+/// run through the pipeline for explicit assertions (never differentially —
+/// the oracle's `TS2303` errors land on the re-export statements, the pinned
+/// gap). The cycle declines at the import and the annotation stays
+/// uncheckable; the links themselves carry no verdict.
+#[test]
+fn cyclic_type_reexport_declines() {
+    let program = run_program(&[
+        FileSpec {
+            path: "typecyc-a.ts",
+            source: include_str!("../../../corpus/check-multifile/typecyc-a.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "typecyc-b.ts",
+            source: include_str!("../../../corpus/check-multifile/typecyc-b.ts"),
+            objects: &[],
+        },
+        FileSpec {
+            path: "typecyc-main.ts",
+            source: include_str!("../../../corpus/check-multifile/typecyc-main.ts"),
+            objects: &[],
+        },
+    ]);
+    for file in [FileId(0), FileId(1)] {
+        let report = program.report.file(file).expect("link report");
+        assert!(
+            report.diagnostics.is_empty(),
+            "links carry no verdict: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "links carry no decline: {:?}",
+            report.unsupported
+        );
+    }
+    let main = program.report.file(FileId(2)).expect("main report");
     assert!(
         main.diagnostics.is_empty(),
-        "diagnostics: {:?}",
+        "no false PITH2305 over the cycle: {:?}",
+        main.diagnostics
+    );
+    assert_eq!(main.unsupported.len(), 2, "reasons: {:?}", main.unsupported);
+    assert!(
+        main.unsupported
+            .iter()
+            .any(|note| note.reason.contains("cycle")),
+        "import decline names the cycle: {:?}",
+        main.unsupported
+    );
+    assert!(
+        main.unsupported
+            .iter()
+            .any(|note| note.reason.contains("not an enum or interface")),
+        "annotation decline: {:?}",
+        main.unsupported
+    );
+}
+
+/// Unexpandable aliases decline with reasons (PITH-P035): chained
+/// (alias-to-alias), complex (object-literal target), and generic aliases
+/// stay outside the single-level subset while the direct alias checks. tsc
+/// resolves every one of these (pinned divergence, probed 7.0.2).
+#[test]
+fn unexpandable_aliases_decline() {
+    let program = run_program(&[
+        FileSpec {
+            path: "shared.ts",
+            source: "export interface Point { x: number; y: number; }\n\
+                     export type First = Point;\n\
+                     export type Second = First;\n\
+                     export type Obj = { x: number };\n\
+                     export type Gen<T> = T;\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "mid.ts",
+            source: "export { First, Second, Obj, Gen } from \"./shared\";\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "main.ts",
+            source: "import { First, Second, Obj, Gen } from \"./mid\";\n\
+                      const f: First = { x: 1, y: 2 };\n\
+                      const s: Second = { x: 1, y: 2 };\n\
+                      const o: Obj = { x: 1 };\n\
+                      const g: Gen = 1;\n",
+            objects: &[ObjectSpec {
+                name: "f",
+                members: &[
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::Number),
+                ],
+            }],
+        },
+    ]);
+    let main = program.report.file(FileId(2)).expect("main report");
+    assert!(
+        main.diagnostics.is_empty(),
+        "declines, never verdicts: {:?}",
+        main.diagnostics
+    );
+    assert_eq!(main.unsupported.len(), 3, "reasons: {:?}", main.unsupported);
+    for fragment in ["chained aliases", "non-identifier alias targets", "generic"] {
+        assert!(
+            main.unsupported
+                .iter()
+                .any(|note| note.reason.contains(fragment)),
+            "missing '{fragment}': {:?}",
+            main.unsupported
+        );
+    }
+}
+
+/// Aliases over imported names decline as chained (PITH-P035): the target
+/// resolves only through the declaring file's own import, which is a second
+/// expansion level. tsc resolves it (pinned divergence, probed 7.0.2).
+#[test]
+fn alias_over_import_declines_as_chained() {
+    let program = run_program(&[
+        FileSpec {
+            path: "base.ts",
+            source: "export interface Point { x: number; y: number; }\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "mid.ts",
+            source: "import { Point } from \"./base\";\n\
+                      export type First = Point;\n\
+                      export { First };\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "main.ts",
+            source: "import { First } from \"./mid\";\nconst f: First = { x: 1, y: 2 };\n",
+            objects: &[],
+        },
+    ]);
+    let main = program.report.file(FileId(2)).expect("main report");
+    assert!(
+        main.diagnostics.is_empty(),
+        "declines, never verdicts: {:?}",
         main.diagnostics
     );
     assert_eq!(main.unsupported.len(), 1, "reasons: {:?}", main.unsupported);
     assert!(
-        main.unsupported[0]
-            .reason
-            .contains("not an enum or interface"),
+        main.unsupported[0].reason.contains("chained aliases"),
         "reason: {}",
         main.unsupported[0].reason
+    );
+}
+
+/// Ambiguous star type re-exports decline like values (PITH-P035): the import
+/// declines and the annotation stays uncheckable. tsc diagnoses `TS2308` at
+/// the barrel statement instead (pinned gap, probed 7.0.2).
+#[test]
+fn ambiguous_star_type_declines() {
+    let program = run_program(&[
+        FileSpec {
+            path: "a.ts",
+            source: "export interface Dup { x: number; }\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "b.ts",
+            source: "export interface Dup { x: string; }\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "index.ts",
+            source: "export * from \"./a\";\nexport * from \"./b\";\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "main.ts",
+            source: "import { Dup } from \"./index\";\nconst d: Dup = { x: 1 };\n",
+            objects: &[ObjectSpec {
+                name: "d",
+                members: &[("x", ObjectMemberKind::Number)],
+            }],
+        },
+    ]);
+    let main = program.report.file(FileId(3)).expect("main report");
+    assert!(
+        main.diagnostics.is_empty(),
+        "declines, never verdicts: {:?}",
+        main.diagnostics
+    );
+    assert_eq!(main.unsupported.len(), 2, "reasons: {:?}", main.unsupported);
+    assert!(
+        main.unsupported
+            .iter()
+            .any(|note| note.reason.contains("ambiguous")),
+        "import decline: {:?}",
+        main.unsupported
+    );
+    assert!(
+        main.unsupported
+            .iter()
+            .any(|note| note.reason.contains("not an enum or interface")),
+        "annotation decline: {:?}",
+        main.unsupported
     );
 }
 

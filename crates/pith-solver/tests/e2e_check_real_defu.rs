@@ -23,7 +23,7 @@ use pith_frontend::{
 use pith_ids::{FileId, NodeId, Span, SymbolId};
 use pith_queries::{QueryDb, QueryKey, QueryKind};
 use pith_solver::{
-    multifile::{check_program, ImportUse, ProgramFile, ProgramReport},
+    multifile::{check_program, AliasShape, ImportUse, ProgramFile, ProgramReport},
     CallArg, CallSite, ConstDecl, DeclKind, EnumMember, EnumMemberValue, EnumShape, FileReport,
     FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, InitKind, InterfaceHeritage,
     InterfaceMember, InterfaceShape, JoinedReturns, NamespaceShape, ObjectInit, ObjectMemberInit,
@@ -215,6 +215,8 @@ fn consts_from_facts(
             annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
             init,
             init_object,
+            // No array-member facts yet (see the check-functions driver).
+            init_array: None,
             cast: None,
         });
         idents.push(ident.map(str::to_owned));
@@ -243,6 +245,8 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     FunctionReturn {
         kind,
         init_object,
+        // No array-member facts yet (see the check-functions driver).
+        init_array: None,
         cast: None,
     }
 }
@@ -304,6 +308,8 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                     })
                     .collect(),
                 params_complex: func.params_complex,
+                // No async fact yet (see the check-functions driver).
+                is_async: false,
                 return_annotation: func.return_annotation.as_ref().map(|ann| ann.text.clone()),
                 body,
             }
@@ -437,6 +443,20 @@ fn namespaces_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<NamespaceS
         .collect()
 }
 
+/// The alias driver: a mechanical copy of each alias fact's name plus its
+/// sliced target text (spans never sliced driver-side).
+fn aliases_from_facts(parsed: &ParsedFile) -> Vec<AliasShape> {
+    parsed
+        .aliases
+        .iter()
+        .map(|fact| AliasShape {
+            name: fact.name.clone(),
+            target: fact.target_text.clone(),
+            has_type_params: fact.has_type_params,
+        })
+        .collect()
+}
+
 /// Maps one frontend imported name to the graph's, variant by variant.
 fn map_imported_name(name: &FrontendImportedName) -> ImportedName {
     match name {
@@ -542,6 +562,7 @@ fn run_program(specs: &[FileSpec<'_>]) -> Program {
             interfaces: interfaces_from_facts(file_parsed, &binder),
             enums: enums_from_facts(file_parsed, &binder),
             namespaces: namespaces_from_facts(file_parsed, &binder),
+            aliases: aliases_from_facts(file_parsed),
             imports: uses,
         });
     }
