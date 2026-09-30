@@ -988,6 +988,34 @@ pub struct InterfaceFact {
     pub exported: bool,
 }
 
+/// One `type` alias declaration's export-supporting facts: its name plus its
+/// aliased-type text.
+///
+/// Recorded for every `type X = <type>` declaration, regardless of `export`
+/// wrapper: specifier-list exports (`export { X }`, `export { X } from`)
+/// carry no wrapper, yet the module graph resolves them — visibility is the
+/// graph's business, never the fact's. The solver expands single-level
+/// aliases over interfaces, enums, and primitives through
+/// [`TypeAliasFact::target_text`]; chained, generic, and complex targets
+/// decline solver-side. `span` is the alias name's binding span (solver-side
+/// reasons anchor at use sites, so this span is identity only, never sliced
+/// twice). Binder-free by design: no occurrence ever resolves through the
+/// alias name itself — uses resolve through the importing binding's symbol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeAliasFact {
+    /// Alias name as written.
+    pub name: String,
+    /// Verbatim aliased-type text (`"Point"`, `"number"`). The declaration
+    /// records no fact when the span does not slice (only possible with
+    /// recovery from parse errors — skipped, never invented).
+    pub target_text: String,
+    /// Span of the alias name binding.
+    pub span: Span,
+    /// `true` when the alias declares type parameters (`type Box<T> = …`):
+    /// the solver declines instead of instantiating it.
+    pub has_type_params: bool,
+}
+
 /// One member of an `enum` declaration: its constant value, when computable
 /// without full const-eval.
 ///
@@ -1347,6 +1375,10 @@ pub struct ParsedFile {
     /// One fact per `interface` declaration, in visitor (pre-order) order.
     /// Empty when the file declares no interfaces.
     pub interfaces: Vec<InterfaceFact>,
+    /// One fact per `type` alias declaration, in visitor (pre-order) order.
+    /// Empty when the file declares no aliases. Sole consumer is cross-file
+    /// single-level alias expansion (see [`TypeAliasFact`]).
+    pub aliases: Vec<TypeAliasFact>,
     /// One fact per `enum` declaration, in visitor (pre-order) order.
     /// Empty when the file declares no enums.
     pub enums: Vec<EnumFact>,
@@ -1401,6 +1433,7 @@ struct DeclCollector<'a> {
     namespaces: Vec<NamespaceFact>,
     classes: Vec<ClassFact>,
     news: Vec<NewFact>,
+    aliases: Vec<TypeAliasFact>,
     /// `if` statements enclosing the current visit point: anything above zero
     /// means a nested guard (decline, never refine).
     if_depth: u32,
@@ -2763,6 +2796,33 @@ impl DeclCollector<'_> {
         });
     }
 
+    /// Records one type alias when its name and aliased type both slice.
+    ///
+    /// The aliased-type text is sliced at the [`TSType`] node's own span
+    /// (never re-derived from surrounding text); unsliceable spans (only
+    /// possible with recovery from parse errors) record nothing rather than
+    /// inventing text. Still counts for namespace visibility exactly like
+    /// before (see [`visit_ts_type_alias_declaration`]).
+    fn record_type_alias(&mut self, it: &TSTypeAliasDeclaration<'_>) {
+        let Some(name) = slice_at(self.source, it.id.span) else {
+            return;
+        };
+        self.note_exported(name);
+        let Some(target) = slice_at(self.source, it.type_annotation.span()) else {
+            return;
+        };
+        self.aliases.push(TypeAliasFact {
+            name: name.to_owned(),
+            target_text: target.to_owned(),
+            span: Span {
+                file: self.file,
+                lo: it.id.span.start,
+                hi: it.id.span.end,
+            },
+            has_type_params: it.type_parameters.is_some(),
+        });
+    }
+
     /// Records one enum declaration with its member facts.
     ///
     /// Symbol linkage reuses the `(name, binding start)` keying of
@@ -3585,11 +3645,7 @@ impl<'a> Visit<'a> for DeclCollector<'a> {
     }
 
     fn visit_ts_type_alias_declaration(&mut self, it: &TSTypeAliasDeclaration<'a>) {
-        // Type aliases count for namespace visibility (their qualified uses
-        // decline as non-types solver-side — kind is unknowable facts-side).
-        if let Some(name) = slice_at(self.source, it.id.span) {
-            self.note_exported(name);
-        }
+        self.record_type_alias(it);
         // Keep walking: the aliased type nests no declarators, but the walk
         // keeps the visitor total over future AST shapes.
         walk::walk_ts_type_alias_declaration(self, it);
@@ -3738,6 +3794,7 @@ pub fn parse_module(file: FileId, path_hint: &str, source: &str) -> ParsedFile {
         namespaces: collected.namespaces,
         classes: collected.classes,
         news: collected.news,
+        aliases: collected.aliases,
         errors,
     }
 }
@@ -3941,6 +3998,7 @@ struct CollectedFacts {
     namespaces: Vec<NamespaceFact>,
     classes: Vec<ClassFact>,
     news: Vec<NewFact>,
+    aliases: Vec<TypeAliasFact>,
 }
 
 /// Runs the targeted declarator walk and returns owned facts.
@@ -3982,6 +4040,7 @@ fn collect_decls<'a>(
         namespaces: Vec::new(),
         classes: Vec::new(),
         news: Vec::new(),
+        aliases: Vec::new(),
         if_depth: 0,
         fn_depth: 0,
         export_depth: 0,
@@ -4000,6 +4059,7 @@ fn collect_decls<'a>(
         enums,
         classes,
         news,
+        aliases,
         ..
     } = collector;
     assign_namespace_body_scopes(scopes, symbols, &mut namespaces);
@@ -4015,6 +4075,7 @@ fn collect_decls<'a>(
         namespaces,
         classes,
         news,
+        aliases,
     }
 }
 
@@ -4196,6 +4257,45 @@ export function f(a: string): string { return a + b; }
             "default exports record no local facts: {:?}",
             pf.local_exports
         );
+    }
+
+    #[test]
+    fn type_alias_facts_record_name_target_and_generics_flag() {
+        let source = "export type Alias = Point;\n\
+                      type Num = number;\n\
+                      export type Box<T> = T;\n";
+        let pf = parse_module(FileId(0), "t.ts", source);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let aliases: Vec<(String, String, bool)> = pf
+            .aliases
+            .iter()
+            .map(|fact| {
+                (
+                    fact.name.clone(),
+                    fact.target_text.clone(),
+                    fact.has_type_params,
+                )
+            })
+            .collect();
+        assert_eq!(
+            aliases,
+            [
+                ("Alias".to_owned(), "Point".to_owned(), false),
+                ("Num".to_owned(), "number".to_owned(), false),
+                ("Box".to_owned(), "T".to_owned(), true),
+            ]
+        );
+        for fact in &pf.aliases {
+            assert_eq!(fact.span.file, FileId(0));
+            assert!(fact.span.lo < fact.span.hi);
+            let sliced = source
+                .get(
+                    usize::try_from(fact.span.lo).expect("small span")
+                        ..usize::try_from(fact.span.hi).expect("small span"),
+                )
+                .unwrap_or("");
+            assert_eq!(sliced, fact.name, "name span slices the alias name");
+        }
     }
 
     #[test]
