@@ -1,0 +1,2 @@
+iface-main.ts:TS2322: Type 'string' is not assignable to type 'number'.
+iface-main.ts:TS2741: Property 'y' is missing in type '{ x: number; }' but required in type 'Point'.

@@ -1,0 +1,2 @@
+typecyc-a.ts:TS2303: Circular definition of import alias 'Cyc'.
+typecyc-b.ts:TS2303: Circular definition of import alias 'Cyc'.
