@@ -88,8 +88,8 @@ use pith_symbols::{
 };
 
 use super::{
-    check_calls, check_enums, check_functions, CallSite, ConstDecl, EnumDecl, EnumInput, EnumShape,
-    FileReport, FunctionDecl, InitKind, InterfaceShape, NamespaceShape, ObjectInit,
+    check_calls, check_enums, check_functions, ArrayInit, CallSite, ConstDecl, EnumDecl, EnumInput,
+    EnumShape, FileReport, FunctionDecl, InitKind, InterfaceShape, NamespaceShape, ObjectInit,
 };
 
 /// Code for missing exported members (oracle `TS2305`).
@@ -371,6 +371,8 @@ struct ResolvedInit {
     init: Option<InitKind>,
     /// Declaring object members, when the initializer is `{ ... }`.
     init_object: Option<ObjectInit>,
+    /// Declaring array members, when the initializer is `[ ... ]`.
+    init_array: Option<ArrayInit>,
     /// The declaring occurrence this use depends on.
     dep: Dep,
 }
@@ -413,6 +415,7 @@ fn resolve_value_init(ctx: &FileCtx<'_>, target: &str) -> Option<Result<Resolved
     Some(Ok(ResolvedInit {
         init: found.init,
         init_object: found.init_object.clone(),
+        init_array: found.init_array.clone(),
         dep: Dep {
             file: resolved.file,
             node: super::occurrence_node(index),
@@ -589,6 +592,7 @@ fn check_const_decls(ctx: &mut FileCtx<'_>) {
                     Some(Ok(hit)) => {
                         resolved.init = hit.init;
                         resolved.init_object = hit.init_object;
+                        resolved.init_array = hit.init_array;
                         deps.push(hit.dep);
                     }
                     Some(Err(reason)) => {
@@ -789,6 +793,7 @@ fn merged_functions(ctx: &FileCtx<'_>) -> Vec<FunctionDecl> {
                 symbol: None,
                 params: found.params.clone(),
                 params_complex: found.params_complex,
+                is_async: found.is_async,
                 return_annotation: found.return_annotation.clone(),
                 body: super::FunctionBody::Complex,
             });

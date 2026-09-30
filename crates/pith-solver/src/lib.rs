@@ -47,10 +47,12 @@
 //! [`UnsupportedDecl`] entries, never silently dropped.
 //!
 //! BLOCKER (P004 adapter gap): [`ConstDecl::annotation`], [`ConstDecl::init`],
-//! and [`ConstDecl::init_object`] are stand-ins for the missing adapter facts
+//! [`ConstDecl::init_object`], and [`ConstDecl::init_array`] are stand-ins
+//! for the missing adapter facts
 //! `DeclAnnotationFact` (annotation text + span), `InitLiteralFact`
-//! (initializer literal kind + span), and `ObjectMemberFact`s (member name +
-//! literal kind per `{ ... }` entry). `ParsedFile` v1 carries declaration
+//! (initializer literal kind + span), `ObjectMemberFact`s (member name +
+//! literal kind per `{ ... }` entry), and array-element facts (literal kind
+//! per `[ ... ]` entry). `ParsedFile` v1 carries declaration
 //! spans plus (since P012) declarator scopes only, so no implementation can
 //! recover these from facts alone without string-searching source text, which
 //! is forbidden. The corpus driver hand-feeds them per fixture — the same
@@ -372,6 +374,46 @@
 //! exists for enums — the union precedent); interface/plain paths memoize
 //! exactly like before.
 //!
+//! Lib types, first cut (P034, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p034-probes/`):
+//!
+//! - `Array<T>` and `T[]` admit single primitive or boundary (`any`/
+//!   `unknown`/`never`) element types. Array-literal members verify one by
+//!   one through the existing literal machinery: each mismatched member
+//!   diagnoses `TS2322` (`Type 'string' is not assignable to type 'number'.`,
+//!   one per member in literal order), non-literal members skip silently
+//!   (probed clean — the call-argument precedent), and `any`/`unknown`
+//!   elements admit everything. Expected types always spell the suffix form
+//!   (`Type 'number' is not assignable to type 'number[]'.`, even when the
+//!   annotation reads `Array<number>`).
+//! - `Promise<T>` admits async function returns carrying literal values:
+//!   the annotation unwraps to `T` (or to `U[]` for `Promise<Array<U>>`,
+//!   which then checks member-wise) and the return checks through the
+//!   existing paths. `await` is transparent in tsc (`return await "oops"`
+//!   diagnoses exactly like `return "oops"`); the adapter classifies `await`
+//!   as non-literal, so awaited kinds ride the hand-fed seam (see below).
+//!   Non-async `Promise` returns decline (tsc spells `TS2322`/`TS2739` the
+//!   subset cannot spell — never forced), as do `Promise<never>` (literal
+//!   spellings need value facts) and bare/multi-arg `Promise`/`Array`
+//!   (tsc `TS2314`).
+//! - Every other lib shape declines with a distinct reason, never a forced
+//!   `TS2304`: tuples (`[number, string]` — tuples are NOT arrays),
+//!   `readonly` arrays, utility types (`Record`, `Partial`, ...),
+//!   collections (`Map`, `Set`, ...), iterables, typed arrays, and DOM types.
+//!   Cross-shapes diagnose where tsc's spelling is facts-expressible:
+//!   array inits against primitive/`never` annotations spell the actual
+//!   (`number[]`, `never[]` for empty, `unknown` for `as unknown` results);
+//!   mixed-kind arrays spell unions in tsc (`(string | number)[]`), so they
+//!   decline instead of mis-spelling. Array inits against object/interface
+//!   annotations spell the oracle's `TS2741`/`TS2739` missing family with
+//!   the array spelling as the actual type.
+//!
+//! BLOCKER (P004 adapter gap, same seam as [`ObjectInit`]): [`ArrayInit`]
+//! members, [`FunctionDecl::is_async`], and awaited return kinds are
+//! hand-fed per fixture — the adapter emits no array-member facts, no async
+//! flag, and classifies `await` as non-literal. Spans/scopes/identities
+//! always come from adapter facts; only shapes ride the seam.
+//!
 //! Design law (H-002): literal freshness and every other per-occurrence
 //! verdict lives in query-side tables keyed by occurrence
 //! ([`NodeId`], see [`FreshnessTable`] plus the [`QueryDb`] memo entries),
@@ -617,6 +659,75 @@ pub struct ObjectInit {
     pub fresh: bool,
 }
 
+/// Hand-fed array-literal initializer facts for one declaration.
+///
+/// `members` holds one [`ArrayMemberKind`] per element in literal source
+/// order. Unlike [`ObjectInit`] there is no freshness flag: arrays have no
+/// excess-property checks, so every literal occurrence checks member-wise
+/// identically.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayInit {
+    /// Element facts in literal source order.
+    pub members: Vec<ArrayMemberKind>,
+}
+
+/// One array-literal element: its literal kind.
+///
+/// Deliberately payload-free (mirroring the call-argument precedent): tsc's
+/// array diagnostics always spell widened names (`Type 'string' is not
+/// assignable to type 'number'.`, probed 7.0.2), so no boolean value rides
+/// along. Anything expression-shaped is [`ArrayMemberKind::NonLiteral`]:
+/// those elements skip silently (probed clean), exactly like non-literal
+/// call arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrayMemberKind {
+    /// A numeric literal element.
+    Number,
+    /// A string literal element.
+    String,
+    /// A `true` / `false` element.
+    Boolean,
+    /// A `null` element.
+    Null,
+    /// An `undefined` element.
+    Undefined,
+    /// Any non-literal element (identifier, spread, call, ...): skipped,
+    /// never verdict.
+    NonLiteral,
+}
+
+impl ArrayMemberKind {
+    /// Widened tsc name, used in `TS2322`-family messages.
+    #[must_use]
+    pub fn widened_name(self) -> &'static str {
+        match self {
+            Self::Number => "number",
+            Self::String => "string",
+            Self::Boolean => "boolean",
+            Self::Null => "null",
+            Self::Undefined => "undefined",
+            Self::NonLiteral => "unknown",
+        }
+    }
+
+    /// The builtin [`TypeId`] this element literal inhabits.
+    ///
+    /// `NonLiteral` has no known type here, so it yields
+    /// [`TypeStore::UNKNOWN`]; callers skip those elements, never verdict
+    /// them.
+    #[must_use]
+    pub fn type_id(self) -> TypeId {
+        match self {
+            Self::Number => TypeStore::NUMBER,
+            Self::String => TypeStore::STRING,
+            Self::Boolean => TypeStore::BOOLEAN,
+            Self::Null => TypeStore::NULL,
+            Self::Undefined => TypeStore::UNDEFINED,
+            Self::NonLiteral => TypeStore::UNKNOWN,
+        }
+    }
+}
+
 /// One `const`/`let` declarator to check.
 ///
 /// `annotation`/`init`/`init_object` are hand-fed stand-ins for the missing
@@ -646,6 +757,11 @@ pub struct ConstDecl {
     /// otherwise. A `Some` paired with a primitive `init` (or vice versa)
     /// is contradictory input and becomes an [`UnsupportedDecl`].
     pub init_object: Option<ObjectInit>,
+    /// Array-literal members when the initializer is `[ ... ]`; `None`
+    /// otherwise. Pairs with any other initializer shape (`init`,
+    /// `init_object`, `cast`) the same contradictory way, and becomes an
+    /// [`UnsupportedDecl`].
+    pub init_array: Option<ArrayInit>,
     /// Outermost assertion facts when the initializer is an `as` /
     /// `satisfies` / angle assertion (`None` otherwise). Driver-mapped
     /// from the adapter's cast facts; [`check_one`] evaluates the
@@ -677,18 +793,21 @@ pub struct FunctionParam {
 ///
 /// Shapes reuse [`InitKind`]/[`ObjectInit`] so the return delegates to the
 /// existing check paths unchanged: `kind` is the literal kind (`None` iff
-/// the return is an object literal), `init_object` the member facts (always
-/// fresh — only direct syntactic literals carry them). A
+/// the return is an object or array literal), `init_object` the member facts
+/// (always fresh — only direct syntactic literals carry them), `init_array`
+/// the element facts for `[ ... ]` returns. A
 /// `Some(NonLiteral)` kind declines before delegation; the impossible pairs
 /// (`Some` + `Some`, `None` + `None`) delegate into the shared
 /// contradictory/missing unsupported paths rather than growing
 /// function-specific ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionReturn {
-    /// Literal kind; `None` iff the return is an object literal.
+    /// Literal kind; `None` iff the return is an object or array literal.
     pub kind: Option<InitKind>,
     /// Object-literal members when the return is `{ ... }`; `None` otherwise.
     pub init_object: Option<ObjectInit>,
+    /// Array-literal members when the return is `[ ... ]`; `None` otherwise.
+    pub init_array: Option<ArrayInit>,
     /// Outermost assertion facts when the return is an `as` / `satisfies` /
     /// angle assertion (`None` otherwise). Rides the synthetic [`ConstDecl`]
     /// into [`check_one`], so returns share the const cast rule exactly.
@@ -719,12 +838,15 @@ pub struct InnerDecl {
     pub kind: DeclKind,
     /// Raw annotation text; `None` means unannotated.
     pub annotation: Option<String>,
-    /// Initializer literal kind; `None` for object literals (whose shape
-    /// lives in `init_object`) or missing initializers.
+    /// Initializer literal kind; `None` for object/array literals (whose
+    /// shapes live in `init_object`/`init_array`) or missing initializers.
     pub init: Option<InitKind>,
     /// Object-literal members when the initializer is `{ ... }`; `None`
     /// otherwise.
     pub init_object: Option<ObjectInit>,
+    /// Array-literal members when the initializer is `[ ... ]`; `None`
+    /// otherwise.
+    pub init_array: Option<ArrayInit>,
     /// Outermost assertion facts when the initializer is an `as` /
     /// `satisfies` / angle assertion (`None` otherwise). Rides the synthetic
     /// [`ConstDecl`] into [`check_one`], so leading positions share the
@@ -831,6 +953,11 @@ pub struct FunctionDecl {
     /// `true` when the parameter list holds an unrepresentable pattern:
     /// the declaration declines regardless of `params`.
     pub params_complex: bool,
+    /// `true` for `async function` declarations. Hand-fed per fixture until
+    /// the adapter emits an async fact (see the module-level P034 BLOCKER):
+    /// only async functions unwrap `Promise<T>` returns; non-async
+    /// `Promise` returns decline instead of mis-checking.
+    pub is_async: bool,
     /// Raw return annotation text; `None` means unannotated.
     pub return_annotation: Option<String>,
     /// Body shape; single returns and the three P023 joins are checkable.
@@ -870,6 +997,360 @@ pub fn boundary_annotation_type(name: &str) -> Option<TypeId> {
         "never" => Some(TypeStore::NEVER),
         _ => None,
     }
+}
+
+/// Strips all ASCII whitespace so generic wrappers match regardless of
+/// source spacing (`Array <number>` reads `Array<number>`).
+fn compact_annotation(annotation: &str) -> String {
+    annotation.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// One admitted array element type: its canonical spelling plus its builtin
+/// [`TypeId`]. `any`/`unknown` admit every element silently; `never`
+/// diagnoses every literal element with its widened name (probed 7.0.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArrayElement {
+    /// Canonical element spelling for messages (`number`, `any`, ...).
+    spelling: &'static str,
+    /// Builtin [`TypeId`] members compare against.
+    id: TypeId,
+}
+
+/// Outcome of [`classify_array_annotation`]: admit with the element type,
+/// or decline with the reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ArrayAnnotation {
+    /// `Array<T>` / `T[]` with a single primitive-or-boundary `T`.
+    Admit(ArrayElement),
+    /// Array-like but outside the subset (bare `Array`, multi-arg,
+    /// union/nested/complex/`void` elements).
+    Decline(String),
+}
+
+/// Classifies one element type text into its builtin [`TypeId`] plus its
+/// canonical message spelling, or `None` for non-primitive shapes.
+fn classify_element_type(text: &str) -> Option<ArrayElement> {
+    if let Some(id) = annotation_type(text) {
+        let spelling = match id {
+            id if id == TypeStore::NUMBER => "number",
+            id if id == TypeStore::STRING => "string",
+            id if id == TypeStore::BOOLEAN => "boolean",
+            id if id == TypeStore::NULL => "null",
+            id if id == TypeStore::UNDEFINED => "undefined",
+            _ => return None,
+        };
+        return Some(ArrayElement { spelling, id });
+    }
+    if let Some(id) = boundary_annotation_type(text) {
+        let spelling = if id == TypeStore::ANY {
+            "any"
+        } else if id == TypeStore::UNKNOWN {
+            "unknown"
+        } else {
+            "never"
+        };
+        return Some(ArrayElement { spelling, id });
+    }
+    None
+}
+
+/// Classifies one annotation as an array spelling (`Array<T>` or `T[]`).
+///
+/// Returns `None` for non-array spellings (the caller falls through to the
+/// union/lib/primitive paths). Single primitive-or-boundary elements admit;
+/// everything else array-shaped declines with a distinct reason — never a
+/// forced verdict, never a false `TS2304`.
+fn classify_array_annotation(annotation: &str) -> Option<ArrayAnnotation> {
+    let compact = compact_annotation(annotation);
+    if let Some(inner) = compact
+        .strip_prefix("Array<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        return Some(classify_array_element(inner, annotation));
+    }
+    if compact == "Array" {
+        return Some(ArrayAnnotation::Decline(format!(
+            "array annotation '{annotation}' needs exactly one type argument: \
+            generic arity is outside the subset"
+        )));
+    }
+    if let Some(element) = compact.strip_suffix("[]") {
+        if element.is_empty() || element.starts_with('[') {
+            return None;
+        }
+        return Some(classify_array_suffix_element(element, annotation));
+    }
+    None
+}
+
+/// Classifies the `T` in `Array<T>`: arity, then element shape.
+fn classify_array_element(inner: &str, annotation: &str) -> ArrayAnnotation {
+    if inner.is_empty() || inner.contains(',') {
+        return ArrayAnnotation::Decline(format!(
+            "array annotation '{annotation}' needs exactly one type argument: \
+            generic arity is outside the subset"
+        ));
+    }
+    classify_admitted_element(inner, "array")
+}
+
+/// Classifies the `T` in `T[]`, catching the `readonly` prefix the suffix
+/// form (but not `Array<T>`) admits in tsc. The prefix test reads the
+/// uncompacted annotation so `readonlyx[]` (an unknown element, not a
+/// readonly array) keeps its element decline.
+fn classify_array_suffix_element(element: &str, annotation: &str) -> ArrayAnnotation {
+    if let Some(rest) = element.strip_prefix("readonly") {
+        if annotation.contains("readonly ") {
+            return ArrayAnnotation::Decline(format!(
+                "readonly array element type '{rest}' is outside the subset"
+            ));
+        }
+    }
+    classify_admitted_element(element, "array")
+}
+
+/// Admits primitive-or-boundary elements; declines union, nested, `void`,
+/// and complex shapes with distinct reasons.
+fn classify_admitted_element(inner: &str, kind: &str) -> ArrayAnnotation {
+    if inner.contains('|') {
+        return ArrayAnnotation::Decline(format!(
+            "union {kind} element type '{inner}' is outside the subset"
+        ));
+    }
+    if inner.trim() == "void" {
+        return ArrayAnnotation::Decline(format!(
+            "{kind} element type 'void' is outside the subset"
+        ));
+    }
+    if classify_array_annotation(inner).is_some() || classify_promise_annotation(inner).is_some() {
+        return ArrayAnnotation::Decline(format!(
+            "nested {kind} element type '{inner}' is outside the subset"
+        ));
+    }
+    match classify_element_type(inner) {
+        Some(element) => ArrayAnnotation::Admit(element),
+        None => ArrayAnnotation::Decline(format!(
+            "{kind} element type '{inner}' is outside the subset"
+        )),
+    }
+}
+
+/// One admitted promise payload: a primitive-or-boundary `T`, or an
+/// `Array<U>` whose members then check member-wise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromiseInner {
+    /// `Promise<T>` with primitive-or-boundary `T` (`any`/`unknown` admit
+    /// every return silently).
+    Element(ArrayElement),
+    /// `Promise<Array<U>>` / `Promise<U[]>` with primitive-or-boundary `U`.
+    Array(ArrayElement),
+}
+
+impl PromiseInner {
+    /// The unwrapped annotation spelling async returns check against:
+    /// `T` directly, or the suffix form `U[]` (tsc's canonical expected
+    /// spelling — probed 7.0.2).
+    fn spelling(self) -> String {
+        match self {
+            Self::Element(element) => element.spelling.to_owned(),
+            Self::Array(element) => format!("{}[]", element.spelling),
+        }
+    }
+}
+
+/// Outcome of [`classify_promise_annotation`]: admit with the payload, or
+/// decline with the reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PromiseAnnotation {
+    /// `Promise<T>` with a checkable `T`.
+    Admit(PromiseInner),
+    /// Promise-like but outside the subset (bare/multi-arg, union/complex/
+    /// `void`/`never` payloads — `never` needs literal value facts for its
+    /// literal spelling, probed 7.0.2).
+    Decline(String),
+}
+
+/// Classifies one annotation as a promise spelling (`Promise<T>`).
+///
+/// Returns `None` for non-promise spellings (bare `Promise` falls through
+/// to the lib gate, which declines it with the arity reason).
+fn classify_promise_annotation(annotation: &str) -> Option<PromiseAnnotation> {
+    let compact = compact_annotation(annotation);
+    let inner = compact
+        .strip_prefix("Promise<")
+        .and_then(|rest| rest.strip_suffix('>'))?;
+    if inner.is_empty() || inner.contains(',') {
+        return Some(PromiseAnnotation::Decline(format!(
+            "promise annotation '{annotation}' needs exactly one type argument: \
+            generic arity is outside the subset"
+        )));
+    }
+    Some(classify_promise_payload(inner))
+}
+
+/// Admits primitive, `any`/`unknown`, and single-primitive-array payloads;
+/// declines union, `void`, `never`, nested, and complex shapes.
+fn classify_promise_payload(inner: &str) -> PromiseAnnotation {
+    if inner.contains('|') {
+        return PromiseAnnotation::Decline(format!(
+            "union promise element type '{inner}' is outside the subset"
+        ));
+    }
+    if inner.trim() == "void" {
+        return PromiseAnnotation::Decline(
+            "promise element type 'void' is outside the subset".to_owned(),
+        );
+    }
+    if classify_promise_annotation(inner).is_some() {
+        return PromiseAnnotation::Decline(format!(
+            "nested promise element type '{inner}' is outside the subset"
+        ));
+    }
+    if let Some(array) = classify_array_annotation(inner) {
+        return match array {
+            ArrayAnnotation::Admit(element) => {
+                PromiseAnnotation::Admit(PromiseInner::Array(element))
+            }
+            ArrayAnnotation::Decline(reason) => PromiseAnnotation::Decline(reason),
+        };
+    }
+    match classify_element_type(inner) {
+        Some(element) if element.id == TypeStore::NEVER => PromiseAnnotation::Decline(
+            "promise element type 'never' needs literal value facts: outside the subset".to_owned(),
+        ),
+        Some(element) => PromiseAnnotation::Admit(PromiseInner::Element(element)),
+        None => PromiseAnnotation::Decline(format!(
+            "promise element type '{inner}' is outside the subset"
+        )),
+    }
+}
+
+/// Lib heads by family: utility/mapped types, collections, iterables,
+/// binary buffers plus typed arrays, and DOM types.
+const UTILITY_HEADS: &[&str] = &[
+    "Record",
+    "Partial",
+    "Required",
+    "Readonly",
+    "Pick",
+    "Omit",
+    "Exclude",
+    "Extract",
+    "NonNullable",
+    "Awaited",
+    "ReturnType",
+    "Parameters",
+    "ConstructorParameters",
+    "InstanceType",
+    "ThisType",
+    "Uppercase",
+    "Lowercase",
+    "Capitalize",
+    "Uncapitalize",
+];
+/// Collection constructors with generic arity.
+const COLLECTION_HEADS: &[&str] = &["Map", "Set", "WeakMap", "WeakSet"];
+/// Iteration protocol types.
+const ITERABLE_HEADS: &[&str] = &[
+    "Iterable",
+    "Iterator",
+    "IterableIterator",
+    "AsyncIterable",
+    "AsyncIterator",
+    "Generator",
+];
+/// Binary buffers plus typed arrays.
+const TYPED_ARRAY_HEADS: &[&str] = &[
+    "ArrayBuffer",
+    "SharedArrayBuffer",
+    "DataView",
+    "Int8Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
+];
+/// Ambient DOM types with no value-semantics facts in the subset.
+const DOM_HEADS: &[&str] = &[
+    "Console",
+    "Window",
+    "Document",
+    "Element",
+    "HTMLElement",
+    "Node",
+    "Event",
+    "EventTarget",
+    "Navigator",
+    "Location",
+    "History",
+    "Storage",
+    "Request",
+    "Response",
+    "Headers",
+    "FormData",
+    "URL",
+    "URLSearchParams",
+    "XMLHttpRequest",
+];
+
+/// Whether `head` names a lib type of one family: utility/mapped types,
+/// collections, iterables, binary buffers plus typed arrays, or DOM types.
+/// Structural admission only (no `.d.ts` modeling anywhere): every match
+/// declines with a family reason, never a false `TS2304`.
+fn lib_family(head: &str) -> Option<&'static str> {
+    if UTILITY_HEADS.contains(&head) {
+        Some("utility")
+    } else if COLLECTION_HEADS.contains(&head) {
+        Some("collection")
+    } else if ITERABLE_HEADS.contains(&head) {
+        Some("iterable")
+    } else if TYPED_ARRAY_HEADS.contains(&head) {
+        Some("typed-array")
+    } else if DOM_HEADS.contains(&head) {
+        Some("DOM")
+    } else {
+        None
+    }
+}
+
+/// The decline reason for a non-admitted lib annotation, or `None` when the
+/// annotation is not lib-shaped (the caller falls through to `TS2304`).
+///
+/// Tuples decline here too: `[number, string]` is lib-adjacent syntax but
+/// tuples are NOT arrays, so they need their own reason rather than the
+/// array path or a false `TS2304`.
+fn lib_decline_reason(annotation: &str) -> Option<String> {
+    if annotation.starts_with('[') {
+        return Some(format!(
+            "tuple annotation '{annotation}' is outside the subset: tuples are not arrays"
+        ));
+    }
+    if annotation.starts_with("readonly ") || annotation.starts_with("readonly\t") {
+        return Some(format!(
+            "readonly array annotation '{annotation}' is outside the subset"
+        ));
+    }
+    let head = annotation.split('<').next().unwrap_or(annotation).trim();
+    if head == "Array" || head == "Promise" {
+        return Some(format!(
+            "generic annotation '{head}' needs exactly one type argument: \
+            generic arity is outside the subset"
+        ));
+    }
+    if head == "ReadonlyArray" {
+        return Some(format!(
+            "readonly array annotation '{annotation}' is outside the subset"
+        ));
+    }
+    lib_family(head).map(|family| {
+        format!("{family} type annotation '{annotation}' is outside the subset: lib modeling")
+    })
 }
 
 /// Which assertion form one [`CastInput`] records.
@@ -1158,6 +1639,7 @@ pub fn check_functions(
                         annotation: shaped_return.site.annotation,
                         init: shaped_return.kind,
                         init_object: shaped_return.init_object,
+                        init_array: shaped_return.init_array,
                         cast: shaped_return.cast,
                     });
                 }
@@ -1222,11 +1704,14 @@ struct SynthSite {
 struct SynthReturn {
     /// Who and what this position checks.
     site: SynthSite,
-    /// Literal kind; `None` iff the position is an object literal.
+    /// Literal kind; `None` iff the position is an object or array literal.
     kind: Option<InitKind>,
     /// Object-literal members when the position is `{ ... }`; `None`
     /// otherwise.
     init_object: Option<ObjectInit>,
+    /// Array-literal members when the position is `[ ... ]`; `None`
+    /// otherwise.
+    init_array: Option<ArrayInit>,
     /// Assertion facts riding into the synthetic [`ConstDecl`].
     cast: Option<CastInput>,
 }
@@ -1255,6 +1740,33 @@ fn return_site(decl: &FunctionDecl, annotation: &str) -> SynthSite {
     }
 }
 
+/// Unwraps one `Promise<T>` return annotation for an async function into
+/// the `T` its returns check against (`U[]` for `Promise<Array<U>>`, which
+/// then checks member-wise); every other annotation passes through
+/// unchanged.
+///
+/// Non-async `Promise` returns decline (tsc spells `TS2322`/`TS2739` shapes
+/// the subset cannot spell — never forced), as do uncheckable payloads
+/// (each carries its own reason from the promise classifier).
+fn promise_effective_annotation(decl: &FunctionDecl, annotation: &str) -> Result<String, String> {
+    let Some(promise) = classify_promise_annotation(annotation.trim()) else {
+        return Ok(annotation.to_owned());
+    };
+    match promise {
+        PromiseAnnotation::Decline(reason) => Err(reason),
+        PromiseAnnotation::Admit(inner) => {
+            if !decl.is_async {
+                return Err(format!(
+                    "non-async function '{}' returns '{annotation}': \
+                    promise returns need an async function",
+                    decl.name
+                ));
+            }
+            Ok(inner.spelling())
+        }
+    }
+}
+
 /// Gates one function declaration: `Ok` carries the [`ShapedBody`] (one
 /// [`SynthReturn`] per checkable position, in source order);
 /// `Err` carries the unsupported reason.
@@ -1274,28 +1786,29 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
             decl.name
         ));
     };
+    let effective = promise_effective_annotation(decl, annotation)?;
     let returns = match &decl.body {
         FunctionBody::SingleReturn(body) => {
-            vec![shape_return(body, "return", return_site(decl, annotation))?]
+            vec![shape_return(body, "return", return_site(decl, &effective))?]
         }
         FunctionBody::SequenceReturns(join) => vec![
-            shape_return(&join.first, "first return", return_site(decl, annotation))?,
-            shape_return(&join.second, "second return", return_site(decl, annotation))?,
+            shape_return(&join.first, "first return", return_site(decl, &effective))?,
+            shape_return(&join.second, "second return", return_site(decl, &effective))?,
         ],
         FunctionBody::GuardReturn(join) => vec![
-            shape_return(&join.first, "guard return", return_site(decl, annotation))?,
-            shape_return(&join.second, "tail return", return_site(decl, annotation))?,
+            shape_return(&join.first, "guard return", return_site(decl, &effective))?,
+            shape_return(&join.second, "tail return", return_site(decl, &effective))?,
         ],
         FunctionBody::BranchReturns(join) => vec![
             shape_return(
                 &join.first,
                 "then-branch return",
-                return_site(decl, annotation),
+                return_site(decl, &effective),
             )?,
             shape_return(
                 &join.second,
                 "else-branch return",
-                return_site(decl, annotation),
+                return_site(decl, &effective),
             )?,
         ],
         FunctionBody::StraightBody(straight) => {
@@ -1308,7 +1821,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
             positions.push(shape_return(
                 &straight.tail,
                 "tail return",
-                return_site(decl, annotation),
+                return_site(decl, &effective),
             )?);
             positions
         }
@@ -1363,6 +1876,7 @@ fn shape_leading(inner: &InnerDecl) -> Option<SynthReturn> {
         },
         kind: inner.init,
         init_object: inner.init_object.clone(),
+        init_array: inner.init_array.clone(),
         cast: inner.cast.clone(),
     })
 }
@@ -1371,9 +1885,12 @@ fn shape_leading(inner: &InnerDecl) -> Option<SynthReturn> {
 /// returns decline the whole declaration with a position-naming reason
 /// (never a partial verdict over the remaining positions). Assertion
 /// returns ride through instead: their facts evaluate solver-side in
-/// [`check_one`], so the gate must not swallow them. The impossible
-/// kind/member pairs (`Some` + `Some`, `None` + `None`) pass through into
-/// the shared contradictory/missing unsupported paths in [`check_one`].
+/// [`check_one`], so the gate must not swallow them. Object and array
+/// returns carry their shapes alongside (a bare `NonLiteral` kind with a
+/// shape rides into the shared contradictory path in [`check_one`]). The
+/// impossible kind/member pairs (`Some` + `Some`, `None` + `None`) pass
+/// through into the shared contradictory/missing unsupported paths in
+/// [`check_one`].
 fn shape_return(
     body: &FunctionReturn,
     position: &str,
@@ -1384,10 +1901,14 @@ fn shape_return(
             site,
             kind: body.kind,
             init_object: body.init_object.clone(),
+            init_array: body.init_array.clone(),
             cast: body.cast.clone(),
         });
     }
-    if body.kind == Some(InitKind::NonLiteral) {
+    if body.kind == Some(InitKind::NonLiteral)
+        && body.init_object.is_none()
+        && body.init_array.is_none()
+    {
         return Err(format!(
             "non-literal {position} in '{}' is outside the subset",
             site.name
@@ -1397,6 +1918,7 @@ fn shape_return(
         site,
         kind: body.kind,
         init_object: body.init_object.clone(),
+        init_array: body.init_array.clone(),
         cast: None,
     })
 }
@@ -2244,6 +2766,7 @@ fn check_one_class<'a>(decl: &'a ClassDecl, run: &mut ClassRun<'a, 'a>) {
         symbol: decl.symbol,
         params: decl.ctor_params.clone(),
         params_complex: decl.ctor_complex,
+        is_async: false,
         return_annotation: None,
         body: FunctionBody::Empty,
     });
@@ -2319,6 +2842,7 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             annotation: prop.annotation.clone(),
             init: prop.init,
             init_object: prop.init_object.clone(),
+            init_array: None,
             cast: None,
         };
         let mut ctx = CheckCtx {
@@ -3593,6 +4117,59 @@ fn split_union_members(annotation: &str) -> (Vec<&str>, bool) {
     (unknown, shaped)
 }
 
+/// Routes a union-annotated declaration for [`check_narrowing_decl`]:
+/// unknown names diagnose (`TS2304`), shaped members decline, degenerates
+/// decline, object initializers decline, otherwise the initializer checks
+/// against the canonical members.
+fn check_narrowing_union(
+    file: FileId,
+    span: Span,
+    decl: &ConstDecl,
+    annotation: &str,
+    nctx: &mut NarrowDeclCtx<'_>,
+) {
+    let (unknown, shaped) = split_union_members(annotation);
+    if !unknown.is_empty() {
+        for name in unknown {
+            nctx.report.diagnostics.push(PithDiagnostic {
+                code: CODE_UNKNOWN_ANNOTATION.to_owned(),
+                file,
+                span,
+                message: format!("Cannot find name '{name}'."),
+            });
+        }
+        return;
+    }
+    if shaped {
+        nctx.report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: format!("union member shape in '{annotation}' is outside the subset"),
+        });
+        return;
+    }
+    let Some(members) = parse_union_annotation(annotation) else {
+        nctx.report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: format!("degenerate union annotation '{annotation}' is outside the subset"),
+        });
+        return;
+    };
+    let spelling = union_spelling(&members);
+    if decl.init_object.is_some() {
+        nctx.report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: format!(
+                "object initializer against union annotation '{annotation}' is outside the subset"
+            ),
+        });
+        return;
+    }
+    check_union_init(file, span, decl, members, spelling, nctx);
+}
+
 fn check_narrowing_decl(
     file: FileId,
     node: NodeId,
@@ -3622,6 +4199,16 @@ fn check_narrowing_decl(
         });
         return;
     }
+    if decl.init_array.is_some() && (decl.init.is_some() || decl.init_object.is_some()) {
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: "contradictory initializer facts: array members with \
+                another initializer shape"
+                .to_owned(),
+        });
+        return;
+    }
     if annotation.starts_with('{') {
         let mut ctx = CheckCtx {
             file,
@@ -3631,7 +4218,13 @@ fn check_narrowing_decl(
             report,
             extra: &[],
         };
-        check_object(decl, span, annotation, decl.init, &mut ctx);
+        // Array initializers need the array-aware object path in
+        // [`check_one`]; every other shape keeps the direct object path.
+        if decl.init_array.is_some() {
+            check_one(decl, binder, &mut ctx);
+        } else {
+            check_object(decl, span, annotation, decl.init, &mut ctx);
+        }
         return;
     }
     // `unknown` absorbs every union it joins (tsc: `number | unknown` is
@@ -3654,46 +4247,7 @@ fn check_narrowing_decl(
         check_one(decl, binder, &mut ctx);
         return;
     }
-    let (unknown, shaped) = split_union_members(annotation);
-    if !unknown.is_empty() {
-        for name in unknown {
-            report.diagnostics.push(PithDiagnostic {
-                code: CODE_UNKNOWN_ANNOTATION.to_owned(),
-                file,
-                span,
-                message: format!("Cannot find name '{name}'."),
-            });
-        }
-        return;
-    }
-    if shaped {
-        report.unsupported.push(UnsupportedDecl {
-            file,
-            span,
-            reason: format!("union member shape in '{annotation}' is outside the subset"),
-        });
-        return;
-    }
-    let Some(members) = parse_union_annotation(annotation) else {
-        report.unsupported.push(UnsupportedDecl {
-            file,
-            span,
-            reason: format!("degenerate union annotation '{annotation}' is outside the subset"),
-        });
-        return;
-    };
-    let spelling = union_spelling(&members);
-    if decl.init_object.is_some() {
-        report.unsupported.push(UnsupportedDecl {
-            file,
-            span,
-            reason: format!(
-                "object initializer against union annotation '{annotation}' is outside the subset"
-            ),
-        });
-        return;
-    }
-    check_union_init(file, span, decl, members, spelling, nctx);
+    check_narrowing_union(file, span, decl, annotation, nctx);
 }
 
 /// Checks a union-annotated declaration's initializer: missing and
@@ -4515,6 +5069,14 @@ fn apply_assertion(
         });
         return AssertedInit::Done;
     }
+    if decl.init_array.is_some() {
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: "contradictory initializer facts: assertion with array members".to_owned(),
+        });
+        return AssertedInit::Done;
+    }
     match evaluate_cast(cast) {
         CastEvaluation::Complex(reason) => {
             // `any` annotations admit complex casts silently (nothing can
@@ -4610,22 +5172,15 @@ fn resolve_boundary_annotation(
     Some(ann_ty)
 }
 
-/// Takes the shared [`CheckCtx`] (file, node, memo store, freshness table,
-/// report, and extra cross-file edges) so the arity stays flat as the
-/// subset grows; `binder` and `decl` ride alongside.
-fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
-    let file = ctx.file;
-    let node = ctx.node;
-    let db: &mut QueryDb = &mut *ctx.db;
-    let freshness = ctx.freshness;
-    let report: &mut FileReport = &mut *ctx.report;
-    let extra = ctx.extra;
-    let span = binder_span(binder, file, decl);
-    let Some(raw) = decl.annotation.as_deref() else {
-        decline_unannotated(decl, span, file, &mut *report);
-        return;
-    };
-    let annotation = raw.trim();
+/// Rejects contradictory initializer facts for [`check_one`]: at most one
+/// of primitive kind, object members, and array members may be present.
+/// Returns true when a note was pushed and the declaration is done.
+fn check_contradictory_inits(
+    decl: &ConstDecl,
+    span: Span,
+    file: FileId,
+    report: &mut FileReport,
+) -> bool {
     if decl.init.is_some() && decl.init_object.is_some() {
         report.unsupported.push(UnsupportedDecl {
             file,
@@ -4633,43 +5188,36 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
             reason: "contradictory initializer facts: primitive kind with object members"
                 .to_owned(),
         });
-        return;
+        return true;
     }
-    // Assertion evaluation runs before annotation routing (see
-    // `apply_assertion`): declined casts diagnose independently of the
-    // annotation while admitted results substitute the initializer kind.
-    let init = match apply_assertion(decl, span, file, annotation, &mut *report) {
-        AssertedInit::Check(init) => init,
-        AssertedInit::Done => return,
-    };
-    if annotation.starts_with('{') {
-        let mut ctx = CheckCtx {
-            file,
-            node,
-            db,
-            freshness,
-            report,
-            extra,
-        };
-        check_object(decl, span, annotation, init, &mut ctx);
-        return;
-    }
-    if annotation.contains('|') {
+    if decl.init_array.is_some() && (decl.init.is_some() || decl.init_object.is_some()) {
         report.unsupported.push(UnsupportedDecl {
             file,
             span,
-            reason: format!("union annotation '{annotation}' is outside the subset"),
+            reason: "contradictory initializer facts: array members with \
+                another initializer shape"
+                .to_owned(),
         });
-        return;
+        return true;
     }
-    // Boundary annotations (probed tsc 7.0.2 — see
-    // `resolve_boundary_annotation`): bearing means any initializer shape,
-    // object members, or assertion facts are present.
-    let bearing = init.is_some() || decl.init_object.is_some() || decl.cast.is_some();
-    let Some(ann_ty) = resolve_boundary_annotation(annotation, span, file, bearing, &mut *report)
-    else {
-        return;
-    };
+    false
+}
+
+/// Finishes a primitive-annotation declaration for [`check_one`]: memoizes
+/// the annotation type, then dispatches object/array initializers or checks
+/// the literal kind (missing and non-literal initializers decline).
+fn finish_primitive_check(
+    ann_ty: TypeId,
+    init: Option<InitKind>,
+    decl: &ConstDecl,
+    span: Span,
+    annotation: &str,
+    ctx: &mut CheckCtx<'_>,
+) {
+    let file = ctx.file;
+    let node = ctx.node;
+    let db: &mut QueryDb = &mut *ctx.db;
+    let report: &mut FileReport = &mut *ctx.report;
     // Thread through the memo database: the annotation type is the answer
     // to this declaration's TypeOf query; the self-dep plus any cross-file
     // edges let a later edit invalidate exactly the entries that read them.
@@ -4678,13 +5226,25 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
         node,
         kind: QueryKind::TypeOf,
     };
-    let mut deps = Vec::with_capacity(extra.len().saturating_add(1));
+    let mut deps = Vec::with_capacity(ctx.extra.len().saturating_add(1));
     deps.push(Dep { file, node });
-    deps.extend_from_slice(extra);
+    deps.extend_from_slice(ctx.extra);
     let stored = db.type_of(key, &deps, || ann_ty);
     debug_assert_eq!(stored, ann_ty);
     if let Some(init_object) = decl.init_object.as_ref() {
         check_primitive_annotation_object_init(file, span, annotation, init_object, report);
+        return;
+    }
+    if let Some(init_array) = decl.init_array.as_ref() {
+        let mut ctx = CheckCtx {
+            file,
+            node,
+            db,
+            freshness: ctx.freshness,
+            report,
+            extra: ctx.extra,
+        };
+        check_array_init_vs_annotation(span, annotation, &init_array.members, &mut ctx);
         return;
     }
     let Some(init) = init else {
@@ -4714,6 +5274,112 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
             ),
         });
     }
+}
+
+/// Takes the shared [`CheckCtx`] (file, node, memo store, freshness table,
+/// report, and extra cross-file edges) so the arity stays flat as the
+/// subset grows; `binder` and `decl` ride alongside.
+fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
+    let file = ctx.file;
+    let node = ctx.node;
+    let db: &mut QueryDb = &mut *ctx.db;
+    let freshness = ctx.freshness;
+    let report: &mut FileReport = &mut *ctx.report;
+    let extra = ctx.extra;
+    let span = binder_span(binder, file, decl);
+    let Some(raw) = decl.annotation.as_deref() else {
+        decline_unannotated(decl, span, file, &mut *report);
+        return;
+    };
+    let annotation = raw.trim();
+    if check_contradictory_inits(decl, span, file, &mut *report) {
+        return;
+    }
+    // Assertion evaluation runs before annotation routing (see
+    // `apply_assertion`): declined casts diagnose independently of the
+    // annotation while admitted results substitute the initializer kind.
+    let init = match apply_assertion(decl, span, file, annotation, &mut *report) {
+        AssertedInit::Check(init) => init,
+        AssertedInit::Done => return,
+    };
+    if annotation.starts_with('{') {
+        let mut ctx = CheckCtx {
+            file,
+            node,
+            db,
+            freshness,
+            report,
+            extra,
+        };
+        if let Some(init_array) = decl.init_array.as_ref() {
+            check_object_annotation_array_init(span, annotation, &init_array.members, &mut ctx);
+            return;
+        }
+        check_object(decl, span, annotation, init, &mut ctx);
+        return;
+    }
+    if let Some(array) = classify_array_annotation(annotation) {
+        let mut ctx = CheckCtx {
+            file,
+            node,
+            db,
+            freshness,
+            report,
+            extra,
+        };
+        check_array_annotation(decl, span, &array, init, &mut ctx);
+        return;
+    }
+    if let Some(promise) = classify_promise_annotation(annotation) {
+        let reason = match &promise {
+            PromiseAnnotation::Admit(inner) => format!(
+                "promise annotation '{annotation}' on a const-style declaration: \
+                only async function returns carry promise values (unwraps to '{}')",
+                inner.spelling()
+            ),
+            PromiseAnnotation::Decline(reason) => reason.clone(),
+        };
+        report
+            .unsupported
+            .push(UnsupportedDecl { file, span, reason });
+        return;
+    }
+    if annotation.contains('|') {
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: format!("union annotation '{annotation}' is outside the subset"),
+        });
+        return;
+    }
+    if let Some(reason) = lib_decline_reason(annotation) {
+        report
+            .unsupported
+            .push(UnsupportedDecl { file, span, reason });
+        return;
+    }
+    // Boundary annotations (probed tsc 7.0.2 — see
+    // `resolve_boundary_annotation`): bearing means any initializer shape,
+    // object or array members, or assertion facts are present.
+    let bearing = init.is_some()
+        || decl.init_object.is_some()
+        || decl.init_array.is_some()
+        || decl.cast.is_some();
+    let Some(ann_ty) = resolve_boundary_annotation(annotation, span, file, bearing, &mut *report)
+    else {
+        return;
+    };
+    // Thread through the memo database: the annotation type is the answer
+    // to this declaration's TypeOf query (see `finish_primitive_check`).
+    let mut tail = CheckCtx {
+        file,
+        node,
+        db: &mut *db,
+        freshness,
+        report: &mut *report,
+        extra,
+    };
+    finish_primitive_check(ann_ty, init, decl, span, annotation, &mut tail);
 }
 
 /// Primitive annotation with an object-literal initializer (oracle spells
@@ -4786,16 +5452,7 @@ fn check_object(
     let Some(expected) = classify_expected(&parsed, span, ctx) else {
         return;
     };
-    let expected_text = object_type_text(
-        &expected
-            .iter()
-            .map(|(name, _, _)| name.as_str())
-            .collect::<Vec<&str>>(),
-        &expected
-            .iter()
-            .map(|(_, _, ty)| ty.as_str())
-            .collect::<Vec<&str>>(),
-    );
+    let expected_text = expected_object_text(&expected);
     finish_object_check(decl, span, &expected, &expected_text, init, ctx);
 }
 
@@ -5070,27 +5727,16 @@ fn diagnose_missing_members(
         .map(|(name, _, _)| name.as_str())
         .filter(|name| actual.iter().all(|slot| slot.0 != *name))
         .collect();
-    if missing.len() == 1 {
-        ctx.report.diagnostics.push(PithDiagnostic {
-            code: CODE_MISSING_MEMBER.to_owned(),
-            file: ctx.file,
+    emit_missing(
+        ctx.file,
+        &MissingEmission {
             span,
-            message: format!(
-                "Property '{}' is missing in type '{actual_text}' but required in type '{expected_text}'.",
-                missing[0]
-            ),
-        });
-    } else if !missing.is_empty() {
-        ctx.report.diagnostics.push(PithDiagnostic {
-            code: CODE_MISSING_MANY.to_owned(),
-            file: ctx.file,
-            span,
-            message: format!(
-                "Type '{actual_text}' is missing the following properties from type '{expected_text}': {}",
-                missing.join(", ")
-            ),
-        });
-    }
+            expected_text,
+            actual_text,
+            missing,
+        },
+        &mut *ctx.report,
+    );
 }
 
 /// Object annotation with a non-object initializer.
@@ -5130,6 +5776,273 @@ fn check_object_annotation_non_object_init(
             init.name()
         ),
     });
+}
+
+/// Spells one array initializer the way tsc elaborations do: `never[]` for
+/// empty, `number[]` for uniform literals.
+///
+/// Returns `None` for unspellable shapes — any non-literal element (no
+/// value-type facts) or mixed literal kinds (tsc spells unions like
+/// `(string | number)[]`, which the subset refuses): the caller declines
+/// instead of mis-spelling.
+fn spell_array_actual(members: &[ArrayMemberKind]) -> Option<String> {
+    if members.is_empty() {
+        return Some("never[]".to_owned());
+    }
+    let mut spelling: Option<&str> = None;
+    for member in members {
+        if *member == ArrayMemberKind::NonLiteral {
+            return None;
+        }
+        let name = member.widened_name();
+        match spelling {
+            None => spelling = Some(name),
+            Some(known) if known == name => {}
+            Some(_) => return None,
+        }
+    }
+    spelling.map(|name| format!("{name}[]"))
+}
+
+/// Array annotation with an admitted element type against any initializer.
+///
+/// Array declarations skip the [`QueryDb`] memo: [`TypeData`] has no array
+/// shape (and `pith-types` is outside this task's scope), so there is
+/// nothing sound to intern — the enum precedent. Always safe, just less
+/// incremental.
+fn check_array_admitted(
+    decl: &ConstDecl,
+    span: Span,
+    element: &ArrayElement,
+    init: Option<InitKind>,
+    ctx: &mut CheckCtx<'_>,
+) {
+    match decl.init_array.as_ref() {
+        Some(init_array) => {
+            check_array_members(span, element, &init_array.members, ctx);
+        }
+        None => check_array_annotation_non_array_init(init, span, element, ctx),
+    }
+}
+
+/// Routes one array spelling: declines carry their reason; admitted
+/// elements check through [`check_array_admitted`].
+fn check_array_annotation(
+    decl: &ConstDecl,
+    span: Span,
+    array: &ArrayAnnotation,
+    init: Option<InitKind>,
+    ctx: &mut CheckCtx<'_>,
+) {
+    match array {
+        ArrayAnnotation::Decline(reason) => {
+            ctx.report.unsupported.push(UnsupportedDecl {
+                file: ctx.file,
+                span,
+                reason: reason.clone(),
+            });
+        }
+        ArrayAnnotation::Admit(element) => {
+            check_array_admitted(decl, span, element, init, ctx);
+        }
+    }
+}
+
+/// Verifies array-literal members one by one against the element type.
+///
+/// Each mismatched member diagnoses `TS2322` in literal order (probed
+/// 7.0.2); non-literal members skip silently (probed clean); `any`/`unknown`
+/// elements admit everything silently.
+fn check_array_members(
+    span: Span,
+    element: &ArrayElement,
+    members: &[ArrayMemberKind],
+    ctx: &mut CheckCtx<'_>,
+) {
+    if element.id == TypeStore::ANY || element.id == TypeStore::UNKNOWN {
+        return;
+    }
+    for member in members {
+        if *member == ArrayMemberKind::NonLiteral {
+            continue;
+        }
+        if member.type_id() != element.id {
+            ctx.report.diagnostics.push(PithDiagnostic {
+                code: CODE_MISMATCH.to_owned(),
+                file: ctx.file,
+                span,
+                message: format!(
+                    "Type '{}' is not assignable to type '{}'.",
+                    member.widened_name(),
+                    element.spelling
+                ),
+            });
+        }
+    }
+}
+
+/// Array annotation with a non-array initializer.
+///
+/// Missing/non-literal initializers decline with the usual reasons;
+/// primitive literals diagnose compositionally with the suffix spelling
+/// (`Type 'number' is not assignable to type 'number[]'.`, probed 7.0.2).
+fn check_array_annotation_non_array_init(
+    init: Option<InitKind>,
+    span: Span,
+    element: &ArrayElement,
+    ctx: &mut CheckCtx<'_>,
+) {
+    let Some(init) = init else {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: "missing initializer: nothing to check against".to_owned(),
+        });
+        return;
+    };
+    if init == InitKind::NonLiteral {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: "non-literal initializer is outside the subset".to_owned(),
+        });
+        return;
+    }
+    ctx.report.diagnostics.push(PithDiagnostic {
+        code: CODE_MISMATCH.to_owned(),
+        file: ctx.file,
+        span,
+        message: format!(
+            "Type '{}' is not assignable to type '{}[]'.",
+            init.name(),
+            element.spelling
+        ),
+    });
+}
+
+/// Array initializer against a primitive/`never` annotation.
+///
+/// Diagnoses with the spelled actual (`number[]`, `never[]` for empty);
+/// unspellable shapes decline instead of mis-spelling.
+fn check_array_init_vs_annotation(
+    span: Span,
+    annotation: &str,
+    members: &[ArrayMemberKind],
+    ctx: &mut CheckCtx<'_>,
+) {
+    let Some(actual) = spell_array_actual(members) else {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: "array initializer has no single spellable element type: \
+                unions need value facts outside the subset"
+                .to_owned(),
+        });
+        return;
+    };
+    ctx.report.diagnostics.push(PithDiagnostic {
+        code: CODE_MISMATCH.to_owned(),
+        file: ctx.file,
+        span,
+        message: format!("Type '{actual}' is not assignable to type '{annotation}'."),
+    });
+}
+
+/// Inputs for one missing-member emission: expected/actual spellings plus
+/// the missing names in annotation order.
+struct MissingEmission<'a> {
+    /// Declaration span the diagnostic points at.
+    span: Span,
+    /// Expected-type spelling (expanded `{ ... }` or an interface name).
+    expected_text: &'a str,
+    /// Actual-type spelling (expanded `{ ... }` or a spelled array).
+    actual_text: String,
+    /// Missing member names in annotation order.
+    missing: Vec<&'a str>,
+}
+
+/// Emits one missing-member family: one member is `TS2741`, several
+/// collapse into one `TS2739` (probed 7.0.2).
+fn emit_missing(file: FileId, emission: &MissingEmission<'_>, report: &mut FileReport) {
+    if emission.missing.len() == 1 {
+        report.diagnostics.push(PithDiagnostic {
+            code: CODE_MISSING_MEMBER.to_owned(),
+            file,
+            span: emission.span,
+            message: format!(
+                "Property '{}' is missing in type '{}' but required in type '{}'.",
+                emission.missing[0], emission.actual_text, emission.expected_text
+            ),
+        });
+    } else if !emission.missing.is_empty() {
+        report.diagnostics.push(PithDiagnostic {
+            code: CODE_MISSING_MANY.to_owned(),
+            file,
+            span: emission.span,
+            message: format!(
+                "Type '{}' is missing the following properties from type '{}': {}",
+                emission.actual_text,
+                emission.expected_text,
+                emission.missing.join(", ")
+            ),
+        });
+    }
+}
+
+/// Spells the expected object type in annotation order (the shared
+/// elaboration for inline annotations).
+fn expected_object_text(expected: &[ExpectedMember]) -> String {
+    object_type_text(
+        &expected
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect::<Vec<&str>>(),
+        &expected
+            .iter()
+            .map(|(_, _, ty)| ty.as_str())
+            .collect::<Vec<&str>>(),
+    )
+}
+
+/// Array initializer against an object annotation: tsc reports the missing
+/// family with the array spelling as the actual type (`Property 'x' is
+/// missing in type 'number[]' but required in type '{ x: number; }'.`,
+/// probed 7.0.2). Arrays carry no named members, so every expected member
+/// is missing; unspellable arrays decline.
+fn check_object_annotation_array_init(
+    span: Span,
+    annotation: &str,
+    members: &[ArrayMemberKind],
+    ctx: &mut CheckCtx<'_>,
+) {
+    let Some(parsed) = parse_object_members(annotation, span, ctx) else {
+        return;
+    };
+    let Some(expected) = classify_expected(&parsed, span, ctx) else {
+        return;
+    };
+    let expected_text = expected_object_text(&expected);
+    let Some(actual) = spell_array_actual(members) else {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: "array initializer has no single spellable element type: \
+                unions need value facts outside the subset"
+                .to_owned(),
+        });
+        return;
+    };
+    let missing: Vec<&str> = expected.iter().map(|(name, _, _)| name.as_str()).collect();
+    emit_missing(
+        ctx.file,
+        &MissingEmission {
+            span,
+            expected_text: expected_text.as_str(),
+            actual_text: actual,
+            missing,
+        },
+        &mut *ctx.report,
+    );
 }
 
 /// One heritage parent of an interface: name plus span.
@@ -5446,6 +6359,9 @@ fn route_declaration(route: &mut InterfaceDeclCtx<'_, '_>) {
     if annotation.starts_with('{')
         || annotation.contains('|')
         || annotation_type(annotation).is_some()
+        || classify_array_annotation(annotation).is_some()
+        || classify_promise_annotation(annotation).is_some()
+        || lib_decline_reason(annotation).is_some()
     {
         route.delegate();
         return;
@@ -5454,23 +6370,16 @@ fn route_declaration(route: &mut InterfaceDeclCtx<'_, '_>) {
     route.resolve_shape(span, annotation);
 }
 
-/// Gates one resolved interface shape, then runs the shared object
-/// comparison with the interface name as the expected spelling.
-///
-/// Gate order is structural-first (contradictory facts, heritage, generics,
-/// complex members — first complex member wins so reasons stay single);
-/// member-type classification and literal comparison reuse
-/// [`classify_expected`] plus [`finish_object_check`], so verdicts match
-/// the `{...}` path by construction. Annotation-less members past the
-/// complex gate are unreachable on real paths (the adapter marks them
-/// complex) and decline rather than panic.
-fn check_interface_shape(
+/// Gates one resolved interface shape for [`check_interface_shape`]:
+/// contradictory facts, heritage, generics, then the first complex member
+/// (so reasons stay single). Returns true when a note was pushed and the
+/// declaration is done.
+fn decline_interface_shape(
     decl: &ConstDecl,
     span: Span,
-    annotation: &str,
     shape: &InterfaceShape,
     ctx: &mut CheckCtx<'_>,
-) {
+) -> bool {
     if decl.init.is_some() && decl.init_object.is_some() {
         ctx.report.unsupported.push(UnsupportedDecl {
             file: ctx.file,
@@ -5478,7 +6387,17 @@ fn check_interface_shape(
             reason: "contradictory initializer facts: primitive kind with object members"
                 .to_owned(),
         });
-        return;
+        return true;
+    }
+    if decl.init_array.is_some() && (decl.init.is_some() || decl.init_object.is_some()) {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: "contradictory initializer facts: array members with \
+                another initializer shape"
+                .to_owned(),
+        });
+        return true;
     }
     if !shape.heritage.is_empty() {
         let parents = shape
@@ -5502,7 +6421,7 @@ fn check_interface_shape(
                 )
             },
         });
-        return;
+        return true;
     }
     if shape.has_type_params {
         ctx.report.unsupported.push(UnsupportedDecl {
@@ -5510,7 +6429,7 @@ fn check_interface_shape(
             span,
             reason: format!("generic interface '{}' is outside the subset", shape.name),
         });
-        return;
+        return true;
     }
     if let Some(member) = shape
         .members
@@ -5529,6 +6448,78 @@ fn check_interface_shape(
                 shape.name, member.name
             ),
         });
+        return true;
+    }
+    false
+}
+
+/// Checks an array initializer against an interface shape for
+/// [`check_interface_shape`]: every member is missing (arrays carry no
+/// named members), spelled the oracle way with the interface name
+/// (probed 7.0.2). Unspellable arrays decline instead of mis-spelling.
+/// Returns true when the declaration is done.
+fn check_interface_array_init(
+    decl: &ConstDecl,
+    span: Span,
+    annotation: &str,
+    shape: &InterfaceShape,
+    ctx: &mut CheckCtx<'_>,
+) -> bool {
+    let Some(init_array) = decl.init_array.as_ref() else {
+        return false;
+    };
+    let Some(actual) = spell_array_actual(&init_array.members) else {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: "array initializer has no single spellable element type: \
+                unions need value facts outside the subset"
+                .to_owned(),
+        });
+        return true;
+    };
+    let missing: Vec<&str> = shape
+        .members
+        .iter()
+        .map(|member| member.name.as_str())
+        .collect();
+    emit_missing(
+        ctx.file,
+        &MissingEmission {
+            span,
+            expected_text: annotation,
+            actual_text: actual,
+            missing,
+        },
+        &mut *ctx.report,
+    );
+    true
+}
+
+/// Gates one resolved interface shape, then runs the shared object
+/// comparison with the interface name as the expected spelling.
+///
+/// Gate order is structural-first (contradictory facts, heritage, generics,
+/// complex members — first complex member wins so reasons stay single);
+/// member-type classification and literal comparison reuse
+/// [`classify_expected`] plus [`finish_object_check`], so verdicts match
+/// the `{...}` path by construction. Annotation-less members past the
+/// complex gate are unreachable on real paths (the adapter marks them
+/// complex) and decline rather than panic.
+fn check_interface_shape(
+    decl: &ConstDecl,
+    span: Span,
+    annotation: &str,
+    shape: &InterfaceShape,
+    ctx: &mut CheckCtx<'_>,
+) {
+    if decline_interface_shape(decl, span, shape, ctx) {
+        return;
+    }
+    // Array initializers against an interface spell the oracle's missing
+    // family with the interface name (probed 7.0.2): every member is
+    // missing, since arrays carry no named members.
+    if check_interface_array_init(decl, span, annotation, shape, ctx) {
         return;
     }
     let mut parsed = Vec::with_capacity(shape.members.len());
@@ -6062,6 +7053,15 @@ impl EnumDeclCtx<'_, '_> {
             );
             return;
         }
+        if decl.init_array.is_some() && (decl.init.is_some() || decl.init_object.is_some()) {
+            self.unsupported(
+                span,
+                "contradictory initializer facts: array members with \
+                another initializer shape"
+                    .to_owned(),
+            );
+            return;
+        }
         if shape.declared {
             self.unsupported(
                 span,
@@ -6091,6 +7091,25 @@ impl EnumDeclCtx<'_, '_> {
         }
         if let Some(init_object) = decl.init_object.as_ref() {
             check_primitive_annotation_object_init(file, span, display, init_object, self.report);
+            return;
+        }
+        // Array initializers against an enum spell compositionally
+        // (`Type 'number[]' is not assignable to type 'Color'.`); unspellable
+        // arrays decline instead of mis-spelling.
+        if let Some(init_array) = decl.init_array.as_ref() {
+            match spell_array_actual(&init_array.members) {
+                Some(actual) => self.diagnose(
+                    span,
+                    CODE_MISMATCH,
+                    format!("Type '{actual}' is not assignable to type '{display}'."),
+                ),
+                None => self.unsupported(
+                    span,
+                    "array initializer has no single spellable element type: \
+                    unions need value facts outside the subset"
+                        .to_owned(),
+                ),
+            }
             return;
         }
         let Some(init) = decl.init else {
@@ -6208,6 +7227,9 @@ fn route_enum_declaration(route: &mut EnumDeclCtx<'_, '_>) {
     if annotation.starts_with('{')
         || annotation.contains('|')
         || annotation_type(annotation).is_some()
+        || classify_array_annotation(annotation).is_some()
+        || classify_promise_annotation(annotation).is_some()
+        || lib_decline_reason(annotation).is_some()
     {
         route.delegate();
         return;
@@ -6361,6 +7383,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: Some(init),
             init_object: None,
+            init_array: None,
             cast: None,
         }
     }
@@ -6390,6 +7413,7 @@ mod tests {
                     .collect(),
                 fresh: true,
             }),
+            init_array: None,
             cast: None,
         }
     }
@@ -6738,6 +7762,7 @@ mod tests {
                 annotation: None,
                 init: Some(InitKind::Number),
                 init_object: None,
+                init_array: None,
                 cast: None,
             },
             // An interface-annotated use resolves through the merged id.
@@ -6816,6 +7841,7 @@ mod tests {
             annotation: ann.map(str::to_owned),
             init: Some(InitKind::NonLiteral),
             init_object: None,
+            init_array: None,
             cast: Some(CastInput {
                 operand,
                 target: target.to_owned(),
@@ -6885,6 +7911,7 @@ mod tests {
             annotation: Some("any".to_owned()),
             init: None,
             init_object: None,
+            init_array: None,
             cast: None,
         }];
         let mut db = QueryDb::new();
@@ -7366,6 +8393,7 @@ mod tests {
                 annotation: None,
                 init: Some(InitKind::Number),
                 init_object: None,
+                init_array: None,
                 cast: None,
             },
             decl("e", 18, 26, "number", InitKind::NonLiteral),
@@ -7378,6 +8406,7 @@ mod tests {
                 annotation: Some("number".to_owned()),
                 init: None,
                 init_object: None,
+                init_array: None,
                 cast: None,
             },
         ];
@@ -7480,6 +8509,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: Some(init),
             init_object: None,
+            init_array: None,
             cast: None,
         }
     }
@@ -7522,6 +8552,7 @@ mod tests {
             annotation: Some("number".to_owned()),
             init: Some(InitKind::String),
             init_object: None,
+            init_array: None,
             cast: None,
         };
         let mut db = QueryDb::new();
@@ -7548,6 +8579,7 @@ mod tests {
             annotation: Some("string".to_owned()),
             init: Some(InitKind::Number),
             init_object: None,
+            init_array: None,
             cast: None,
         };
         let mut db = QueryDb::new();
@@ -7572,6 +8604,7 @@ mod tests {
             annotation: Some("string".to_owned()),
             init: Some(InitKind::Number),
             init_object: None,
+            init_array: None,
             cast: None,
         };
         let mut db = QueryDb::new();
@@ -7905,6 +8938,7 @@ mod tests {
             annotation: Some("{ a: number }".to_owned()),
             init: Some(InitKind::Number),
             init_object: None,
+            init_array: None,
             cast: None,
         };
         let mut db = QueryDb::new();
@@ -7981,6 +9015,233 @@ mod tests {
         );
     }
 
+    /// One array-literal declaration for lib tests.
+    fn array_decl(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        ann: &str,
+        members: Vec<ArrayMemberKind>,
+    ) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: Some(ann.to_owned()),
+            init: None,
+            init_object: None,
+            init_array: Some(ArrayInit { members }),
+            cast: None,
+        }
+    }
+
+    #[test]
+    fn array_annotation_classifier_admits_single_primitive_elements() {
+        for (text, spelling) in [
+            ("Array<number>", "number"),
+            ("number[]", "number"),
+            ("Array<string>", "string"),
+            ("boolean[]", "boolean"),
+            ("Array<null>", "null"),
+            ("undefined[]", "undefined"),
+            ("Array<any>", "any"),
+            ("Array<unknown>", "unknown"),
+            ("Array<never>", "never"),
+            ("Array <number>", "number"),
+        ] {
+            match classify_array_annotation(text) {
+                Some(ArrayAnnotation::Admit(element)) => {
+                    assert_eq!(element.spelling, spelling, "spelling for {text:?}");
+                }
+                other => panic!("must admit {text:?}: {other:?}"),
+            }
+        }
+        for bad in [
+            "Array",
+            "Array<>",
+            "Array<number, string>",
+            "Array<number | string>",
+            "Array<Array<number>>",
+            "Array<Promise<number>>",
+            "Array<void>",
+            "Array<{ x: number }>",
+            "readonly number[]",
+        ] {
+            match classify_array_annotation(bad) {
+                Some(ArrayAnnotation::Decline(_)) => {}
+                other => panic!("must decline {bad:?}: {other:?}"),
+            }
+        }
+        for plain in [
+            "number",
+            "Record<string, number>",
+            "number | string",
+            // Union spellings are not array spellings even when a member
+            // is one: `None` routes them to union handling, which declines
+            // shaped members there instead of mis-attributing the verdict.
+            "number[] | string",
+        ] {
+            assert!(
+                classify_array_annotation(plain).is_none(),
+                "not an array spelling: {plain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn promise_annotation_classifier_admits_checkable_payloads() {
+        match classify_promise_annotation("Promise<number>") {
+            Some(PromiseAnnotation::Admit(PromiseInner::Element(element))) => {
+                assert_eq!(element.spelling, "number");
+            }
+            other => panic!("must admit payload: {other:?}"),
+        }
+        match classify_promise_annotation("Promise<Array<number>>") {
+            Some(PromiseAnnotation::Admit(PromiseInner::Array(element))) => {
+                assert_eq!(element.spelling, "number");
+            }
+            other => panic!("must admit array payload: {other:?}"),
+        }
+        match classify_promise_annotation("Promise<unknown>") {
+            Some(PromiseAnnotation::Admit(PromiseInner::Element(element))) => {
+                assert_eq!(element.spelling, "unknown");
+            }
+            other => panic!("must admit unknown payload: {other:?}"),
+        }
+        for bad in [
+            "Promise<>",
+            "Promise<number, string>",
+            "Promise<number | string>",
+            "Promise<never>",
+            "Promise<void>",
+            "Promise<Promise<number>>",
+            "Promise<{ x: number }>",
+            "Promise<Record<string, number>>",
+        ] {
+            match classify_promise_annotation(bad) {
+                Some(PromiseAnnotation::Decline(_)) => {}
+                other => panic!("must decline {bad:?}: {other:?}"),
+            }
+        }
+        for plain in ["Promise", "number", "Array<number>"] {
+            assert!(
+                classify_promise_annotation(plain).is_none(),
+                "not a promise spelling: {plain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lib_decline_reason_names_families() {
+        for (text, family) in [
+            ("[number, string]", "tuple"),
+            ("Record<string, number>", "utility"),
+            ("Partial<{ x: number }>", "utility"),
+            ("Iterable<number>", "iterable"),
+            ("Map<string, number>", "collection"),
+            ("Set<number>", "collection"),
+            ("Int32Array", "typed-array"),
+            ("Window", "DOM"),
+            ("Array", "generic"),
+            ("Promise", "generic"),
+            ("ReadonlyArray<number>", "readonly"),
+        ] {
+            let reason =
+                lib_decline_reason(text).unwrap_or_else(|| panic!("must decline {text:?}"));
+            assert!(reason.contains(family), "reason for {text:?}: {reason}");
+        }
+        for plain in ["number", "Nope", "{ a: number }", "NS.Point"] {
+            assert!(
+                lib_decline_reason(plain).is_none(),
+                "not lib-shaped: {plain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn array_members_diagnose_per_member_and_skip_non_literals() {
+        // Wrong members diagnose one `TS2322` each in literal order;
+        // non-literal members skip silently (probed tsc 7.0.2).
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            array_decl(
+                "a",
+                0,
+                10,
+                "Array<number>",
+                vec![
+                    ArrayMemberKind::String,
+                    ArrayMemberKind::NonLiteral,
+                    ArrayMemberKind::Boolean,
+                ],
+            ),
+            array_decl("b", 11, 21, "string[]", vec![ArrayMemberKind::Number]),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 3);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(0, 10));
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'boolean' is not assignable to type 'number'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert_eq!(report.diagnostics[2].span, span(11, 21));
+    }
+
+    #[test]
+    fn promise_returns_unwrap_only_for_async_functions() {
+        // The non-async declaration declines (tsc's `TS2322`/`TS2739`
+        // shapes are unspellable); the async one unwraps and diagnoses.
+        let binder = binder_with(&[("f", span(0, 10)), ("g", span(11, 21))]);
+        let sync = function(
+            "f",
+            0,
+            10,
+            vec![],
+            Some("Promise<number>"),
+            single(InitKind::Number),
+        );
+        let mut asynk = function(
+            "g",
+            11,
+            21,
+            vec![],
+            Some("Promise<number>"),
+            single(InitKind::String),
+        );
+        asynk.is_async = true;
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &[sync, asynk], &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(11, 21));
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("non-async"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
     fn function(
         name: &str,
         lo: u32,
@@ -8005,6 +9266,7 @@ mod tests {
                 })
                 .collect(),
             params_complex: false,
+            is_async: false,
             return_annotation: annotation.map(str::to_owned),
             body,
         }
@@ -8014,6 +9276,7 @@ mod tests {
         FunctionBody::SingleReturn(FunctionReturn {
             kind: Some(kind),
             init_object: None,
+            init_array: None,
             cast: None,
         })
     }
@@ -8037,6 +9300,7 @@ mod tests {
                 })
                 .collect(),
             params_complex: false,
+            is_async: false,
             return_annotation: Some("number".to_owned()),
             body: single(InitKind::Number),
         }
@@ -8072,6 +9336,7 @@ mod tests {
                     .collect(),
                 fresh: true,
             }),
+            init_array: None,
             cast: None,
         })
     }
@@ -8081,6 +9346,7 @@ mod tests {
         FunctionReturn {
             kind: Some(kind),
             init_object: None,
+            init_array: None,
             cast: None,
         }
     }
@@ -8100,6 +9366,7 @@ mod tests {
                     .collect(),
                 fresh: true,
             }),
+            init_array: None,
             cast: None,
         }
     }
@@ -8946,6 +10213,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init,
             init_object: None,
+            init_array: None,
             cast: None,
         }
     }
@@ -8960,6 +10228,7 @@ mod tests {
             annotation: Some("unknown".to_owned()),
             init,
             init_object: None,
+            init_array: None,
             cast: None,
         }
     }
@@ -9451,6 +10720,7 @@ mod tests {
                 annotation: Some("number | string".to_owned()),
                 init: None,
                 init_object: None,
+                init_array: None,
                 cast: None,
             },
         ];
@@ -9750,6 +11020,7 @@ mod tests {
                 annotation: None,
                 init: Some(InitKind::NonLiteral),
                 init_object: None,
+                init_array: None,
                 cast: None,
             },
         ];
@@ -9823,6 +11094,7 @@ mod tests {
                 symbol: None,
                 params: vec![generic_param(param_ann)],
                 params_complex: false,
+                is_async: false,
                 return_annotation: ret_ann.map(str::to_owned),
                 body,
             },
@@ -9847,6 +11119,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
                 init_object: None,
+                init_array: None,
                 cast: None,
             }),
         )
@@ -10017,6 +11290,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::String),
                 init_object: None,
+                init_array: None,
                 cast: None,
             }),
         )];
@@ -10059,6 +11333,7 @@ mod tests {
                     }],
                     fresh: true,
                 }),
+                init_array: None,
                 cast: None,
             }),
         )];
@@ -10085,6 +11360,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::Number),
                 init_object: None,
+                init_array: None,
                 cast: None,
             }),
         )];
@@ -10184,6 +11460,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
                 init_object: None,
+                init_array: None,
                 cast: None,
             }),
         );
@@ -10390,6 +11667,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
                 init_object: None,
+                init_array: None,
                 cast: None,
             })
         };
@@ -10456,6 +11734,7 @@ mod tests {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
                 init_object: None,
+                init_array: None,
                 cast: None,
             })
         };
@@ -10668,6 +11947,7 @@ mod tests {
                 annotation: Some(annotation.to_owned()),
                 init: Some(init),
                 init_object: None,
+                init_array: None,
                 cast: None,
             },
             init_text: text.map(str::to_owned),
