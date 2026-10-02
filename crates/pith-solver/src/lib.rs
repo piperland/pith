@@ -183,6 +183,28 @@
 //!   any other statement (e.g. a trailing `return`) stays
 //!   [`FunctionBody::Complex`]: two paths, no join.
 //!
+//! Counted-`for` bodies (P041, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p041-probes/`):
+//!
+//! - `for (let i = 0; i < 3; i++) { return 1; } return 2;` against `: number`
+//!   is clean; a wrong loop-body return reports one `TS2322` at its own
+//!   position and a wrong tail one at the tail — each position checks
+//!   independently through the same synthetic delegation as joins (no
+//!   fixpoint, single pass). A provably zero-trip loop (`i < 0`) still
+//!   reports its wrong body (trip counts are not modeled), and the braceless
+//!   `for (...) return "oops";` anchors at the returned expression.
+//! - Non-literal bounds (`i < n`), non-numeric bounds, non-idiom headers
+//!   (`var`, multi-declarator, mismatched identifiers, non-`++` updates),
+//!   non-`for` loops (`while`/`do`/`for-in`/`for-of`), infinite `for(;;)`,
+//!   `break`/`continue` bodies (bare or labelled — labels are the only value
+//!   either carries), and complex bodies each decline with a distinct reason
+//!   (pinned divergences: the oracle checks every one of these shapes — the
+//!   solver records one note, never a forced verdict).
+//! - Loop-carried (cross-iteration) verdicts are an explicit pinned gap:
+//!   positions check as if each runs once, so a `return i` over the loop
+//!   variable rides the existing non-literal position gate (whole-decl
+//!   decline, 0 diagnostics, where tsc types the value).
+//!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
 //! corpus: tsc accepts `undefined` for `void` while the shared annotation
@@ -1043,9 +1065,11 @@ pub struct StraightBody {
 /// lives in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002); the
 /// P031 [`FunctionBody::StraightBody`] delegates each leading declarator
 /// plus the terminal return the same way, as does the P039
-/// [`FunctionBody::TryCatch`] per arm (plus the optional tail) and the P040
-/// [`FunctionBody::Switch`] per case (plus the optional default); the rest
-/// decline to [`UnsupportedDecl`] with distinct reasons.
+/// [`FunctionBody::TryCatch`] per arm (plus the optional tail), the P040
+/// [`FunctionBody::Switch`] per case (plus the optional default), and the
+/// P041 [`FunctionBody::CountedFor`] per position (loop body plus the
+/// optional tail); the rest decline to [`UnsupportedDecl`] with distinct
+/// reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
     /// Exactly one statement, `return <expr>;` with an argument.
@@ -1074,6 +1098,14 @@ pub enum FunctionBody {
     /// occurrence node, exactly like the P023 joins (no fixpoint, single
     /// pass).
     Switch(SwitchBody),
+    /// Exactly one statement, a counted `for (let i = 0; i < N; i++)` with
+    /// literal numeric bounds whose body is exactly one `return <expr>;`,
+    /// plus an optional trailing `return`: tsc checks each position
+    /// independently (probed 7.0.2 P041). Each position delegates through
+    /// its own synthetic [`ConstDecl`] with its own occurrence node,
+    /// exactly like the P023 joins (no fixpoint, single pass —
+    /// loop-carried verdicts are a pinned gap, see the module rules).
+    CountedFor(CountedForBody),
     /// Leading `const`/`let` declarators plus a terminal literal `return`
     /// (single-level blocks flattened): tsc checks each position
     /// independently (probed 7.0.2 P031). Each position delegates through
@@ -1104,10 +1136,19 @@ pub enum FunctionBody {
         /// Frontend-recorded decline reason.
         reason: String,
     },
-    /// Anything else: longer/multi-path bodies (including a `switch`
-    /// statement paired with any other statement), loops,
-    /// `else-if` chains, `if/else` plus a tail return, `throw`/bare
-    /// branches outside `try` arms, `continue`, bare or missing `return`.
+    /// A loop body outside the checkable [`FunctionBody::CountedFor`]
+    /// shape: the frontend recorded why (non-literal or non-numeric bound,
+    /// non-idiom header, non-`for` loop, infinite `for(;;)`,
+    /// `break`/`continue` body, or a complex body/tail). Shaping declines
+    /// with the reason verbatim — never a partial verdict.
+    LoopUnsupported {
+        /// Frontend-recorded decline reason.
+        reason: String,
+    },
+    /// Anything else: longer/multi-path bodies (including a loop or `switch`
+    /// statement paired with a non-return statement), `else-if` chains,
+    /// `if/else` plus a tail return, `throw`/bare branches outside `try`
+    /// arms, `continue`, bare or missing `return`.
     Complex,
 }
 
@@ -1164,6 +1205,25 @@ pub struct SwitchBody {
     pub cases: Vec<FunctionReturn>,
     /// The `default` clause's `return` position, when present.
     pub default: Option<FunctionReturn>,
+}
+
+/// A checkable counted-`for` body (P041): the loop-body return plus the
+/// optional trailing return, each checked independently.
+///
+/// Driver-mapped from the adapter's counted-`for` fact variant (mechanical
+/// field copies, each position exactly like [`FunctionReturn`]). Each
+/// position delegates through its own synthetic [`ConstDecl`] with its own
+/// occurrence node (see [`check_functions`]), so per-occurrence state stays
+/// in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002, and
+/// counts/messages match tsc's per-position verdicts (no fixpoint, single
+/// pass — the P023 join semantics; loop-carried verdicts are a pinned gap,
+/// see the module-level counted-`for` rules).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CountedForBody {
+    /// The loop body's `return` position.
+    pub body: FunctionReturn,
+    /// The trailing `return` position, when present.
+    pub tail: Option<FunctionReturn>,
 }
 
 /// One `function name(params): ret` declaration to check.
@@ -1862,7 +1922,8 @@ fn sort_report(report: &mut FileReport) {
 /// return annotation, then non-straight-line bodies all decline to
 /// [`UnsupportedDecl`]. Checkable declarations (identifier params all
 /// annotated, return annotated, single literal `return`, one of the three
-/// P023 joins, a P031 straight body, a P039 try/catch, or a P040 switch)
+/// P023 joins, a P031 straight body, a P039 try/catch, a P040 switch, or a
+/// P041 counted-`for`)
 /// delegate to the same [`check_one`]
 /// path as [`check_file`]
 /// through synthetic [`ConstDecl`]s — one per return position, each with its
@@ -1984,7 +2045,8 @@ struct SynthReturn {
 /// A checkable function shape: one [`SynthReturn`] per checkable position
 /// (one for straight-line single returns, two for P023 joins, leading
 /// declarators plus the tail return for P031 straight bodies, arms plus the
-/// tail for P039 try/catch, cases plus the default for P040 switch — all in
+/// tail for P039 try/catch, cases plus the default for P040 switch, the
+/// loop body plus the tail for P041 counted-`for` — all in
 /// source order).
 #[derive(Debug)]
 struct ShapedBody {
@@ -2089,6 +2151,31 @@ fn shape_switch(
     Ok(positions)
 }
 
+/// Shapes one counted-`for` body for [`function_shape`]: the loop-body
+/// return, then the optional tail return — one [`SynthReturn`] per position
+/// in source order, like the P023 join arms (no fixpoint, single pass; see
+/// the module-level counted-`for` rules).
+fn shape_counted_for(
+    decl: &FunctionDecl,
+    body: &CountedForBody,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    let mut positions = Vec::with_capacity(2);
+    positions.push(shape_return(
+        &body.body,
+        "loop return",
+        return_site(decl, effective),
+    )?);
+    if let Some(tail) = body.tail.as_ref() {
+        positions.push(shape_return(
+            tail,
+            "tail return",
+            return_site(decl, effective),
+        )?);
+    }
+    Ok(positions)
+}
+
 /// Gates one function declaration: `Ok` carries the [`ShapedBody`] (one
 /// [`SynthReturn`] per checkable position, in source order);
 /// `Err` carries the unsupported reason.
@@ -2135,6 +2222,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         ],
         FunctionBody::TryCatch(body) => shape_try_catch(decl, body, &effective)?,
         FunctionBody::Switch(body) => shape_switch(decl, body, &effective)?,
+        FunctionBody::CountedFor(body) => shape_counted_for(decl, body, &effective)?,
         FunctionBody::StraightBody(straight) => {
             let mut positions = Vec::with_capacity(straight.leading.len().saturating_add(1));
             for inner in &straight.leading {
@@ -2167,7 +2255,9 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
                 decl.name
             ));
         }
-        FunctionBody::TryUnsupported { reason } | FunctionBody::SwitchUnsupported { reason } => {
+        FunctionBody::TryUnsupported { reason }
+        | FunctionBody::SwitchUnsupported { reason }
+        | FunctionBody::LoopUnsupported { reason } => {
             return Err(reason.clone());
         }
         FunctionBody::Complex => {
@@ -3858,7 +3948,9 @@ fn check_generic_decl(
         | FunctionBody::TryCatch(_)
         | FunctionBody::TryUnsupported { .. }
         | FunctionBody::Switch(_)
-        | FunctionBody::SwitchUnsupported { .. } => {
+        | FunctionBody::SwitchUnsupported { .. }
+        | FunctionBody::CountedFor(_)
+        | FunctionBody::LoopUnsupported { .. } => {
             // Joined and straight returns over a bare type parameter need
             // per-position instantiation the subset refuses: decline like
             // complex bodies.
