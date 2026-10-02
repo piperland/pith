@@ -78,3 +78,25 @@ pass). Still declining by design with distinct recorded reasons:
 `finally` clauses, destructured catch patterns, and non-straight
 arms or tails (multi-statement, bare returns). Probes in
 `.agent/scratch/p039-probes/`.
+
+## P040 switch bodies
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| switch-clean.ts | clean | silent, 0 notes (cases + default per position) |
+| switch-case-wrong.ts | 1x TS2322 (case arm) | 1x PITH2322 |
+| switch-default-wrong.ts | 1x TS2322 (default arm) | 1x PITH2322 |
+| switch-two-wrong.ts | 2x TS2322 | 2x PITH2322 (cases independent) |
+| switch-fallthrough-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| switch-complex-case-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+
+Differential: 6/6 match-or-pin (4 diagnostic/silent pairs + 2 pinned
+oracle-clean divergences — fallthrough and multi-statement cases need
+control-flow facts the subset refuses). Each case plus the optional
+default checks independently through the same synthetic delegation as
+joins (no fixpoint, single pass). Still declining by design with
+distinct recorded reasons: fallthrough, complex cases, case-level
+declarations, non-literal discriminants or labels, duplicate defaults.
+A missing `default` admits (tsc's `TS2366` exhaustiveness error is a
+pinned gap — no corpus fixture). Probes in
+`.agent/scratch/p040-probes/`.
