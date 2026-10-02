@@ -431,6 +431,48 @@
 //! exists for enums — the union precedent); interface/plain paths memoize
 //! exactly like before.
 //!
+//! Local type aliases (P038, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p038-probes/`):
+//!
+//! - Single-level expansion only, mirroring the P035 imported-alias rules:
+//!   alias-to-primitive/boundary rewrites the annotation to the target
+//!   spelling and checks exactly as if written (`Num = number`: clean uses
+//!   stay silent, `"oops"` diagnoses `TS2322` spelling `number`);
+//!   alias-to-interface/enum relinks the underlying shape and checks through
+//!   the existing shape paths with the UNDERLYING name as the display text
+//!   (alias transparency: missing members spell `required in type 'Point'`,
+//!   excess spells `does not exist in type 'Point'`, enum values spell
+//!   `type 'Color'` — each probed, unlike the P035 multifile pinned
+//!   divergence, which spells the alias).
+//! - Declines, each with a distinct reason, never a forced verdict:
+//!   chained (alias-to-alias; tsc resolves transitively — pinned divergence),
+//!   generic (`has_type_params`, bare or `Box<number>`-head uses), circular
+//!   (self-targets; tsc's `TS2456` at the declaration is the pinned gap),
+//!   complex/non-identifier targets (unions, object literals, `T<K>` spells),
+//!   unclaimed targets (no interface, enum, or primitive owns the name), and
+//!   duplicate same-name aliases (tsc's `TS2300` is the pinned gap).
+//! - Shadowing: a local const bearing the alias name wins — the use declines
+//!   instead of expanding, so an expansion can never hijack a value binding
+//!   (multifile `has_local_const` precedent). tsc checks the type meaning
+//!   there, so top-level shadowing is a pinned oracle-clean divergence;
+//!   same-name interface/enum shapes win automatically (the binder merges
+//!   same-scope redeclarations, so the shape claim fires first — probed: the
+//!   use still checks as the interface alongside tsc's `TS2300`s).
+//! - Entry coverage: [`check_enums_with_aliases`] relinks shapes;
+//!   [`check_file_with_aliases`] rewrites primitives but declines
+//!   named-shape targets — it holds no shape tables — with an entry-point
+//!   reason. The base [`check_file`]/[`check_enums`] entries thread empty
+//!   tables and keep today's verdicts, as does [`multifile`] (which keeps
+//!   its own import-alias rules and never calls the variants — a pinned
+//!   gap: multifile-local aliases keep today's declines). Qualified
+//!   (`NS.Alias`), union-member, narrowing, function-return, class, and
+//!   legacy-interface-entry sites keep today's verdicts (pinned gaps: those
+//!   paths thread an empty scope).
+//! - Flips (P037 discipline): annotations naming a local alias no longer
+//!   diagnose `PITH2304` — primitives/boundaries check, the rest decline
+//!   with reasons. No existing corpus fixture declares an alias, so no
+//!   baseline moves.
+//!
 //! Lib types, first cut (P034, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p034-probes/`):
 //!
@@ -1617,6 +1659,25 @@ pub fn check_file(
     binder: &Binder,
     db: &mut QueryDb,
 ) -> FileReport {
+    check_file_with_aliases(file, decls, binder, db, &[])
+}
+
+/// Checks every `const`/`let` declarator in `decls` for `file` with local
+/// type aliases in scope, returning the sorted [`FileReport`].
+///
+/// `aliases` feeds single-level expansion (P038):
+/// alias-to-primitive/boundary annotations check as if the target were
+/// written, everything else named declines with a distinct reason.
+/// [`check_file`] threads an empty table; [`multifile`] keeps its own
+/// import-alias rules and never calls this entry.
+#[must_use]
+pub fn check_file_with_aliases(
+    file: FileId,
+    decls: &[ConstDecl],
+    binder: &Binder,
+    db: &mut QueryDb,
+    aliases: &[TypeAliasShape],
+) -> FileReport {
     let mut freshness = FreshnessTable::default();
     for (index, decl) in decls.iter().enumerate() {
         if let Some(init) = decl.init_object.as_ref() {
@@ -1625,6 +1686,11 @@ pub fn check_file(
                 .insert((file, occurrence_node(index)), init.fresh);
         }
     }
+    let const_names: Vec<&str> = decls.iter().map(|decl| decl.name.as_str()).collect();
+    let scope = LocalAliasScope {
+        aliases,
+        const_names: &const_names,
+    };
     let mut report = FileReport::default();
     for (index, decl) in decls.iter().enumerate() {
         let mut ctx = CheckCtx {
@@ -1635,7 +1701,7 @@ pub fn check_file(
             report: &mut report,
             extra: &[],
         };
-        check_one(decl, binder, &mut ctx);
+        check_one(decl, binder, &mut ctx, &scope);
     }
     sort_report(&mut report);
     report
@@ -1726,7 +1792,9 @@ pub fn check_functions(
             report: &mut report,
             extra: &[],
         };
-        check_one(decl, binder, &mut ctx);
+        // Function returns thread no alias tables (pinned P038 gap: return
+        // annotations naming aliases keep today's verdicts).
+        check_one(decl, binder, &mut ctx, &LocalAliasScope::EMPTY);
     }
     sort_report(&mut report);
     report
@@ -3116,7 +3184,8 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             report: &mut *run.report,
             extra: &[],
         };
-        check_one(&synth, run.binder, &mut ctx);
+        // Class properties thread no alias tables (pinned P038 gap).
+        check_one(&synth, run.binder, &mut ctx, &LocalAliasScope::EMPTY);
     }
     run.occurrence = base.saturating_add(offset_count(decl.properties.len()));
 }
@@ -4852,8 +4921,10 @@ fn check_narrowing_decl(
         };
         // Array initializers need the array-aware object path in
         // [`check_one`]; every other shape keeps the direct object path.
+        // Both thread no alias tables (pinned P038 gap: narrowing keeps
+        // today's verdicts for alias annotations).
         if decl.init_array.is_some() {
-            check_one(decl, binder, &mut ctx);
+            check_one(decl, binder, &mut ctx, &LocalAliasScope::EMPTY);
         } else {
             check_object(decl, span, annotation, decl.init, &mut ctx);
         }
@@ -4876,7 +4947,7 @@ fn check_narrowing_decl(
             report: &mut *report,
             extra: &[],
         };
-        check_one(decl, binder, &mut ctx);
+        check_one(decl, binder, &mut ctx, &LocalAliasScope::EMPTY);
         return;
     }
     check_narrowing_union(file, span, decl, annotation, nctx);
@@ -5929,10 +6000,228 @@ fn finish_primitive_check(
     }
 }
 
+/// One single-level local alias expansion step for an annotation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LocalAliasStep {
+    /// No alias claims the name: the existing paths apply.
+    Keep,
+    /// Alias-to-primitive/boundary: check as if the target were written.
+    Primitive(String),
+    /// Alias-to-shape: the underlying interface/enum/namespace name, for the
+    /// caller to relink (or decline when it holds no shape tables).
+    Shape(String),
+    /// Unexpandable: chained, generic, circular, complex, duplicate,
+    /// shadowed, or unclaimed targets decline with distinct reasons.
+    Decline(String),
+}
+
+/// Expands one annotation naming a file-local alias, ONE level (mirrors the
+/// P035 `expand_imported_alias` rules locally).
+///
+/// `Keep` means no expansion applies: non-bare spellings, primitive/boundary
+/// names (those check directly — aliases can never shadow them), and names
+/// no alias claims (the existing unknown-name path applies). Primitives and
+/// boundaries rewrite to their spelling; interfaces, enums, and namespaces
+/// surface as [`LocalAliasStep::Shape`] for the caller to relink; chains
+/// (alias-to-alias), generic aliases, circular references, non-identifier
+/// targets, duplicate declarations, and const-shadowed names decline — tsc
+/// resolves chains transitively and checks shadowed type meanings, so those
+/// declines are pinned divergences.
+fn expand_local_alias(scope: &LocalAliasScope<'_, '_>, annotation: &str) -> LocalAliasStep {
+    if annotation_type(annotation).is_some()
+        || boundary_annotation_type(annotation).is_some()
+        || !is_name_segment(annotation)
+    {
+        return LocalAliasStep::Keep;
+    }
+    let mut claimed = scope
+        .aliases
+        .iter()
+        .filter(|shape| shape.name == annotation);
+    let Some(alias) = claimed.next() else {
+        return LocalAliasStep::Keep;
+    };
+    if claimed.next().is_some() {
+        return LocalAliasStep::Decline(format!(
+            "multiple type alias declarations for '{annotation}': \
+             merging is outside the subset"
+        ));
+    }
+    if scope.const_names.contains(&annotation) {
+        return LocalAliasStep::Decline(format!(
+            "local value '{annotation}' shadows the type alias: \
+             expanding it would hijack a value binding"
+        ));
+    }
+    classify_alias_target(scope.aliases, alias)
+}
+
+/// Classifies one claimed alias's target: generics, circularities,
+/// primitives/boundaries, complex spellings, chains, or a shape name.
+fn classify_alias_target(aliases: &[TypeAliasShape], alias: &TypeAliasShape) -> LocalAliasStep {
+    if alias.has_type_params {
+        return LocalAliasStep::Decline(format!(
+            "type alias '{}' is generic: generic aliases are outside the subset",
+            alias.name
+        ));
+    }
+    let target = alias.target.trim();
+    if target.is_empty() || target == alias.name {
+        return LocalAliasStep::Decline(format!(
+            "type alias '{}' is circular: circular aliases are outside the subset",
+            alias.name
+        ));
+    }
+    if annotation_type(target).is_some() || boundary_annotation_type(target).is_some() {
+        return LocalAliasStep::Primitive(target.to_owned());
+    }
+    if !is_name_segment(target) {
+        return LocalAliasStep::Decline(format!(
+            "type alias '{}' targets '{target}': \
+             non-identifier alias targets are outside the subset",
+            alias.name
+        ));
+    }
+    if aliases.iter().any(|shape| shape.name == target) {
+        return LocalAliasStep::Decline(format!(
+            "type alias '{}' targets '{target}': \
+             chained aliases are outside the subset (single-level expansion only)",
+            alias.name
+        ));
+    }
+    LocalAliasStep::Shape(target.to_owned())
+}
+
+/// Decline reason for a generic-alias instantiation head (`Box` in
+/// `Box<number>`): only generic heads decline here — every other head keeps
+/// the existing verdict path (a raw check would add a misleading `PITH2304`
+/// where tsc stays clean).
+fn generic_head_decline(scope: &LocalAliasScope<'_, '_>, annotation: &str) -> Option<String> {
+    let (head, _) = annotation.split_once('<')?;
+    if let LocalAliasStep::Decline(reason) = expand_local_alias(scope, head.trim()) {
+        return Some(reason);
+    }
+    None
+}
+
+/// One same-file shape lookup for an alias target, by name.
+#[derive(Clone, Debug, PartialEq)]
+enum LocalShapeHit<'a> {
+    /// Exactly one interface bears the name.
+    Interface(&'a InterfaceShape),
+    /// Exactly one enum bears the name (no interface does).
+    Enum(&'a EnumShape),
+    /// A namespace bears the name (no interface or enum does).
+    Namespace,
+    /// Several interfaces or several enums bear the name: merging is
+    /// outside the subset (the multiple-declaration precedent).
+    Multiple(String),
+    /// No shape bears the name.
+    Absent,
+}
+
+/// Finds one same-file shape by name for alias relinking: enums before
+/// interfaces (the [`EnumDeclCtx::claim`] order — merged enum+interface
+/// pairs are illegal in tsc), namespaces last.
+fn find_local_shape<'m>(input: &'m EnumInput<'_>, target: &str) -> LocalShapeHit<'m> {
+    if input
+        .enums
+        .iter()
+        .filter(|shape| shape.name == target)
+        .count()
+        > 1
+    {
+        return LocalShapeHit::Multiple(format!(
+            "multiple enum declarations for '{target}': merging is outside the subset"
+        ));
+    }
+    if let Some(shape) = input.enums.iter().find(|shape| shape.name == target) {
+        return LocalShapeHit::Enum(shape);
+    }
+    if input
+        .interfaces
+        .iter()
+        .filter(|shape| shape.name == target)
+        .count()
+        > 1
+    {
+        return LocalShapeHit::Multiple(format!(
+            "multiple interface declarations for '{target}': merging is outside the subset"
+        ));
+    }
+    if let Some(shape) = input.interfaces.iter().find(|shape| shape.name == target) {
+        return LocalShapeHit::Interface(shape);
+    }
+    if input.namespaces.iter().any(|shape| shape.name == target) {
+        return LocalShapeHit::Namespace;
+    }
+    LocalShapeHit::Absent
+}
+
+/// Outcome of [`expand_local_annotation`]: the caller either returns
+/// (decline pushed), keeps the original spelling, or checks the rewritten
+/// spelling. A custom enum because clippy forbids `Option<Option<_>>`.
+enum LocalAnnotation {
+    /// Decline note pushed; the caller returns.
+    Done,
+    /// Keep the original annotation spelling.
+    Keep,
+    /// Rewritten (primitive/boundary target) spelling.
+    Rewritten(String),
+}
+
+/// Local alias expansion step for [`check_one`]: bare alias names rewrite
+/// (primitives/boundaries) or decline, and generic-instantiation heads
+/// decline, so the boundary path never invents a `PITH2304` for them.
+/// Sits after the promise/array/union/lib gates so those spellings keep
+/// their verdicts.
+fn expand_local_annotation(
+    scope: &LocalAliasScope<'_, '_>,
+    annotation: &str,
+    file: FileId,
+    span: Span,
+    report: &mut FileReport,
+) -> LocalAnnotation {
+    match expand_local_alias(scope, annotation) {
+        LocalAliasStep::Keep => {
+            if let Some(reason) = generic_head_decline(scope, annotation) {
+                report
+                    .unsupported
+                    .push(UnsupportedDecl { file, span, reason });
+                return LocalAnnotation::Done;
+            }
+            LocalAnnotation::Keep
+        }
+        LocalAliasStep::Primitive(spelling) => LocalAnnotation::Rewritten(spelling),
+        LocalAliasStep::Shape(target) => {
+            report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: format!(
+                    "annotation '{annotation}' is a local alias for '{target}': \
+                     named-shape aliases check through the interface/enum paths"
+                ),
+            });
+            LocalAnnotation::Done
+        }
+        LocalAliasStep::Decline(reason) => {
+            report
+                .unsupported
+                .push(UnsupportedDecl { file, span, reason });
+            LocalAnnotation::Done
+        }
+    }
+}
+
 /// Takes the shared [`CheckCtx`] (file, node, memo store, freshness table,
 /// report, and extra cross-file edges) so the arity stays flat as the
 /// subset grows; `binder` and `decl` ride alongside.
-fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
+fn check_one(
+    decl: &ConstDecl,
+    binder: &Binder,
+    ctx: &mut CheckCtx<'_>,
+    scope: &LocalAliasScope<'_, '_>,
+) {
     let file = ctx.file;
     let node = ctx.node;
     let db: &mut QueryDb = &mut *ctx.db;
@@ -6011,6 +6300,15 @@ fn check_one(decl: &ConstDecl, binder: &Binder, ctx: &mut CheckCtx<'_>) {
             .push(UnsupportedDecl { file, span, reason });
         return;
     }
+    // Local alias expansion sits after the promise/array/union/lib gates
+    // so those spellings keep their verdicts (see
+    // `expand_local_annotation`).
+    let rewritten = match expand_local_annotation(scope, annotation, file, span, &mut *report) {
+        LocalAnnotation::Done => return,
+        LocalAnnotation::Keep => None,
+        LocalAnnotation::Rewritten(spelling) => Some(spelling),
+    };
+    let annotation: &str = rewritten.as_deref().unwrap_or(annotation);
     // Boundary annotations (probed tsc 7.0.2 — see
     // `resolve_boundary_annotation`): bearing means any initializer shape,
     // object or array members, or assertion facts are present.
@@ -6910,6 +7208,45 @@ pub struct EnumDecl {
     pub cross_file_deps: Vec<Dep>,
 }
 
+/// One single-file local type alias available for expansion.
+/// Driver-mapped from the frontend's `TypeAliasFact` (mechanical name +
+/// target-text copy; the binding span stays frontend-side because decline
+/// reasons anchor at use sites, never at the alias).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeAliasShape {
+    /// Alias name as written (`"Alias"` in `type Alias = Point`).
+    pub name: String,
+    /// Verbatim aliased-type text (`"Point"`, `"number"`).
+    pub target: String,
+    /// `true` when the alias declares type parameters (`type Box<T> = …`):
+    /// expansion declines instead of instantiating it.
+    pub has_type_params: bool,
+}
+
+/// Single-file local alias tables for one checking run, bundled so the
+/// per-decl helpers stay lean (pedantic arity discipline).
+///
+/// `aliases` maps from the adapter's alias facts; `const_names` lists every
+/// const/let declarator name in the file (built solver-side from the checked
+/// declarations) so shadowing checks never depend on binder symbol identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAliasScope<'a, 'b> {
+    /// Local type aliases in source order.
+    pub aliases: &'a [TypeAliasShape],
+    /// Every const/let declarator name in the file.
+    pub const_names: &'b [&'b str],
+}
+
+impl LocalAliasScope<'static, 'static> {
+    /// Empty scope for paths that thread no alias tables (functions,
+    /// narrowing, classes, the legacy interface entry): alias annotations
+    /// there keep today's verdicts.
+    pub const EMPTY: Self = Self {
+        aliases: &[],
+        const_names: &[],
+    };
+}
+
 /// The shape tables one [`check_enums`] run resolves against, bundled so
 /// the per-decl helpers stay lean (pedantic arity discipline, mirroring
 /// [`GenericCallCtx`]).
@@ -6995,7 +7332,9 @@ impl InterfaceDeclCtx<'_, '_> {
             report: &mut *self.report,
             extra: &[],
         };
-        check_one(self.decl, self.binder, &mut ctx);
+        // The legacy interface entry threads no alias tables (pinned P038
+        // gap: alias annotations there keep today's verdicts).
+        check_one(self.decl, self.binder, &mut ctx, &LocalAliasScope::EMPTY);
     }
 
     /// Resolves an interface-named annotation to its shape: unknown names
@@ -7267,6 +7606,28 @@ pub fn check_enums(
     binder: &Binder,
     db: &mut QueryDb,
 ) -> FileReport {
+    check_enums_with_aliases(file, decls, input, &[], binder, db)
+}
+
+/// Checks `const`/`let` declarators with local type aliases in scope,
+/// returning the sorted [`FileReport`].
+///
+/// `aliases` feeds single-level expansion (P038): alias-to-primitive
+/// annotations rewrite and check as if written, alias-to-interface/enum
+/// annotations relink the underlying shape and check through the existing
+/// shape paths spelling the underlying name, and unexpandable targets
+/// decline with distinct reasons. [`check_enums`] threads an empty table;
+/// [`multifile`] keeps its own import-alias rules and never calls this
+/// entry.
+#[must_use]
+pub fn check_enums_with_aliases(
+    file: FileId,
+    decls: &[EnumDecl],
+    input: &EnumInput<'_>,
+    aliases: &[TypeAliasShape],
+    binder: &Binder,
+    db: &mut QueryDb,
+) -> FileReport {
     let mut freshness = FreshnessTable::default();
     for (index, decl) in decls.iter().enumerate() {
         if let Some(init) = decl.decl.init_object.as_ref() {
@@ -7276,12 +7637,18 @@ pub fn check_enums(
         }
     }
     let mut report = FileReport::default();
+    let const_names: Vec<&str> = decls.iter().map(|decl| decl.decl.name.as_str()).collect();
+    let alias_scope = LocalAliasScope {
+        aliases,
+        const_names: &const_names,
+    };
     for (index, decl) in decls.iter().enumerate() {
         let mut route = EnumDeclCtx {
             file,
             node: occurrence_node(index),
             decl,
             input,
+            alias_scope: &alias_scope,
             binder,
             db: &mut *db,
             freshness: &freshness,
@@ -7296,18 +7663,20 @@ pub fn check_enums(
 /// Routing state for one [`check_enums`] declaration, bundled so the
 /// per-decl helpers stay lean (pedantic arity discipline, mirroring
 /// [`InterfaceDeclCtx`]).
-struct EnumDeclCtx<'a, 'b> {
+struct EnumDeclCtx<'a, 'b, 'c> {
     file: FileId,
     node: NodeId,
     decl: &'a EnumDecl,
     input: &'a EnumInput<'b>,
+    /// Local alias tables for single-level expansion (P038).
+    alias_scope: &'c LocalAliasScope<'b, 'c>,
     binder: &'a Binder,
     db: &'a mut QueryDb,
     freshness: &'a FreshnessTable,
     report: &'a mut FileReport,
 }
 
-impl EnumDeclCtx<'_, '_> {
+impl EnumDeclCtx<'_, '_, '_> {
     /// Plain spellings (and missing annotations) keep [`check_one`]'s
     /// verdicts by construction.
     fn delegate(&mut self) {
@@ -7319,7 +7688,7 @@ impl EnumDeclCtx<'_, '_> {
             report: &mut *self.report,
             extra: &self.decl.cross_file_deps,
         };
-        check_one(&self.decl.decl, self.binder, &mut ctx);
+        check_one(&self.decl.decl, self.binder, &mut ctx, self.alias_scope);
     }
 
     /// Pushes one [`UnsupportedDecl`] at `span`.
@@ -7386,7 +7755,8 @@ impl EnumDeclCtx<'_, '_> {
     }
 
     /// Single names that resolve past the enum set: interfaces check with
-    /// the full name, namespaces diagnose `PITH2709`, the rest decline.
+    /// the full name, namespaces diagnose `PITH2709`, local aliases expand
+    /// one level (P038), and the rest decline.
     fn resolve_single_non_enum(&mut self, span: Span, annotation: &str, id: SymbolId) {
         let input = self.input;
         if let Some(shape) = input
@@ -7406,12 +7776,86 @@ impl EnumDeclCtx<'_, '_> {
                 format!("Cannot use namespace '{annotation}' as a type."),
             );
         } else {
-            self.unsupported(
-                span,
-                format!(
-                    "annotation '{annotation}' is not an enum or interface: outside the subset"
-                ),
-            );
+            self.expand_local_single(span, annotation);
+        }
+    }
+
+    /// Unclaimed single names (P038): local aliases expand one level —
+    /// primitives rewrite and check as if written, interfaces/enums relink
+    /// through the existing shape paths spelling the UNDERLYING name (alias
+    /// transparency, probed tsc 7.0.2), and unexpandable targets decline.
+    /// Anything no alias claims keeps the historical decline.
+    fn expand_local_single(&mut self, span: Span, annotation: &str) {
+        match expand_local_alias(self.alias_scope, annotation) {
+            LocalAliasStep::Keep => {
+                self.unsupported(
+                    span,
+                    format!(
+                        "annotation '{annotation}' is not an enum or interface: outside the subset"
+                    ),
+                );
+            }
+            LocalAliasStep::Primitive(spelling) => {
+                self.check_rewritten_primitive(spelling);
+            }
+            LocalAliasStep::Shape(target) => {
+                self.relink_local_shape(span, annotation, &target);
+            }
+            LocalAliasStep::Decline(reason) => {
+                self.unsupported(span, reason);
+            }
+        }
+    }
+
+    /// Alias-to-primitive: checks as if the target spelling were written,
+    /// through [`check_one`] with the file's alias tables.
+    fn check_rewritten_primitive(&mut self, spelling: String) {
+        let mut rewritten = self.decl.decl.clone();
+        rewritten.annotation = Some(spelling);
+        let mut ctx = CheckCtx {
+            file: self.file,
+            node: self.node,
+            db: &mut *self.db,
+            freshness: self.freshness,
+            report: &mut *self.report,
+            extra: &self.decl.cross_file_deps,
+        };
+        check_one(&rewritten, self.binder, &mut ctx, self.alias_scope);
+    }
+
+    /// Alias-to-shape: relinks the underlying interface/enum by NAME and
+    /// checks through the existing shape paths with the underlying spelling.
+    /// Namespace targets diagnose `PITH2709` (tsc reports `TS2709` at the
+    /// alias declaration instead — disclosed anchor divergence); names no
+    /// shape owns decline instead of verdicting.
+    fn relink_local_shape(&mut self, span: Span, annotation: &str, target: &str) {
+        let input = self.input;
+        match find_local_shape(input, target) {
+            LocalShapeHit::Multiple(reason) => {
+                self.unsupported(span, reason);
+            }
+            LocalShapeHit::Interface(shape) => {
+                self.check_named_interface(span, target, shape);
+            }
+            LocalShapeHit::Enum(shape) => {
+                self.check_enum_shape(span, target, shape);
+            }
+            LocalShapeHit::Namespace => {
+                self.diagnose(
+                    span,
+                    CODE_NAMESPACE_AS_TYPE,
+                    format!("Cannot use namespace '{target}' as a type."),
+                );
+            }
+            LocalShapeHit::Absent => {
+                self.unsupported(
+                    span,
+                    format!(
+                        "type alias '{annotation}' targets '{target}': \
+                         no interface, enum, or primitive claims it"
+                    ),
+                );
+            }
         }
     }
 
@@ -7920,7 +8364,7 @@ impl EnumDeclCtx<'_, '_> {
 
 /// Routes one declaration: unannotated and plain-spelling annotations
 /// delegate to [`check_one`]; any other name resolves single or qualified.
-fn route_enum_declaration(route: &mut EnumDeclCtx<'_, '_>) {
+fn route_enum_declaration(route: &mut EnumDeclCtx<'_, '_, '_>) {
     let annotation = route.decl.decl.annotation.as_deref().map(str::trim);
     let Some(annotation) = annotation else {
         route.delegate();
@@ -13934,5 +14378,468 @@ mod tests {
             "Cannot access 'Point.X' because 'Point' is a type, but not a namespace. Did you mean to retrieve the type of the property 'X' in 'Point' with 'Point[\"X\"]'?"
         );
         assert!(report.unsupported.is_empty());
+    }
+
+    /// One local alias shape for the P038 tests.
+    fn alias_shape(name: &str, target: &str) -> TypeAliasShape {
+        TypeAliasShape {
+            name: name.to_owned(),
+            target: target.to_owned(),
+            has_type_params: false,
+        }
+    }
+
+    /// One generic local alias shape (`type Box<T> = …`).
+    fn generic_alias_shape(name: &str, target: &str) -> TypeAliasShape {
+        TypeAliasShape {
+            name: name.to_owned(),
+            target: target.to_owned(),
+            has_type_params: true,
+        }
+    }
+
+    /// Runs [`check_file_with_aliases`] with local aliases (P038).
+    fn file_report_with_aliases(
+        decls: &[ConstDecl],
+        aliases: &[TypeAliasShape],
+        binder: &Binder,
+    ) -> FileReport {
+        let mut db = QueryDb::new();
+        check_file_with_aliases(FILE, decls, binder, &mut db, aliases)
+    }
+
+    /// Runs [`check_enums_with_aliases`] with local aliases (P038).
+    fn enums_report_with_aliases(
+        decls: &[EnumDecl],
+        input: &EnumInput<'_>,
+        aliases: &[TypeAliasShape],
+        binder: &Binder,
+    ) -> FileReport {
+        let mut db = QueryDb::new();
+        check_enums_with_aliases(FILE, decls, input, aliases, binder, &mut db)
+    }
+
+    #[test]
+    fn local_alias_primitive_rewrites_spelling() {
+        // Probed tsc 7.0.2 (p038-probes/b-wrong.ts): `Num` checks exactly
+        // like `number`, clean or `TS2322`.
+        let binder = binder_with(&[
+            ("Num", span(0, 3)),
+            ("ok", span(10, 20)),
+            ("bad", span(30, 40)),
+        ]);
+        let aliases = [alias_shape("Num", "number")];
+        let decls = [
+            decl("ok", 10, 20, "Num", InitKind::Number),
+            decl("bad", 30, 40, "Num", InitKind::String),
+        ];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_boundary_rewrites_spelling() {
+        // Probed tsc 7.0.2 (p038-probes/k-boundary.ts): `any`/`unknown`
+        // admit bearing values while `never` rejects literals.
+        let binder = binder_with(&[
+            ("An", span(0, 2)),
+            ("U2", span(3, 5)),
+            ("Nev", span(6, 9)),
+            ("a", span(10, 20)),
+            ("u", span(21, 31)),
+            ("n", span(32, 42)),
+        ]);
+        let aliases = [
+            alias_shape("An", "any"),
+            alias_shape("U2", "unknown"),
+            alias_shape("Nev", "never"),
+        ];
+        let decls = [
+            decl("a", 10, 20, "An", InitKind::Number),
+            decl("u", 21, 31, "U2", InitKind::Number),
+            decl("n", 32, 42, "Nev", InitKind::Number),
+        ];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert!(
+            report.diagnostics[0]
+                .message
+                .ends_with("is not assignable to type 'never'."),
+            "message: {}",
+            report.diagnostics[0].message
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_chained_declines() {
+        // Probed tsc 7.0.2 (p038-probes/d-chain.ts): tsc resolves
+        // transitively, so the single-level decline is a pinned divergence.
+        let binder = binder_with(&[("A", span(0, 1)), ("B", span(2, 3)), ("b", span(4, 14))]);
+        let aliases = [alias_shape("A", "number"), alias_shape("B", "A")];
+        let decls = [decl("b", 4, 14, "B", InitKind::Number)];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("chained aliases"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn local_alias_generic_declines_bare_and_head() {
+        // Probed tsc 7.0.2 (p038-probes/f-generic.ts): clean in tsc, so
+        // both declines are pinned divergences — never a forced `PITH2304`.
+        let binder = binder_with(&[
+            ("Box", span(0, 3)),
+            ("b", span(10, 20)),
+            ("h", span(30, 40)),
+        ]);
+        let aliases = [generic_alias_shape("Box", "T")];
+        let decls = [
+            decl("b", 10, 20, "Box", InitKind::Number),
+            decl("h", 30, 40, "Box<number>", InitKind::Number),
+        ];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        for note in &report.unsupported {
+            assert!(note.reason.contains("generic"), "reason: {}", note.reason);
+        }
+    }
+
+    #[test]
+    fn local_alias_circular_declines() {
+        // Probed tsc 7.0.2 (p038-probes/g-circular.ts): tsc reports
+        // `TS2456` at the declaration, which the subset never synthesizes.
+        let binder = binder_with(&[("A", span(0, 1)), ("a", span(2, 12))]);
+        let aliases = [alias_shape("A", "A")];
+        let decls = [decl("a", 2, 12, "A", InitKind::Number)];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("circular"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn local_alias_complex_target_declines() {
+        // Probed tsc 7.0.2 (p038-probes/h-complex.ts): union and object
+        // targets check in tsc; the subset declines instead of spelling them.
+        let binder = binder_with(&[
+            ("U", span(0, 1)),
+            ("S", span(2, 3)),
+            ("u", span(10, 20)),
+            ("s", span(30, 40)),
+        ]);
+        let aliases = [
+            alias_shape("U", "number | string"),
+            alias_shape("S", "{ x: number }"),
+        ];
+        let decls = [
+            decl("u", 10, 20, "U", InitKind::Number),
+            decl("s", 30, 40, "S", InitKind::Number),
+        ];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        for note in &report.unsupported {
+            assert!(
+                note.reason.contains("non-identifier"),
+                "reason: {}",
+                note.reason
+            );
+        }
+    }
+
+    #[test]
+    fn local_alias_shadowed_by_const_declines() {
+        // Probed tsc 7.0.2 (p038-probes/e-shadow.ts): clean in tsc, which
+        // reads the type meaning past the value. The solver declines so an
+        // expansion can never hijack a value binding (pinned divergence).
+        let binder = binder_with(&[("Alias", span(0, 5)), ("n", span(10, 20))]);
+        let aliases = [alias_shape("Alias", "number")];
+        let decls = [
+            decl("Alias", 0, 5, "string", InitKind::String),
+            decl("n", 10, 20, "Alias", InitKind::Number),
+        ];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("shadows"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn local_alias_multiple_declines() {
+        // Duplicate aliases are `TS2300` in tsc; the subset records the gap.
+        let binder = binder_with(&[("Dup", span(0, 3)), ("d", span(10, 20))]);
+        let aliases = [alias_shape("Dup", "number"), alias_shape("Dup", "string")];
+        let decls = [decl("d", 10, 20, "Dup", InitKind::Number)];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("multiple type alias"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn local_alias_shape_target_declines_in_check_file() {
+        // `check_file_with_aliases` holds no shape tables, so named-shape
+        // targets decline with the entry-point reason;
+        // [`check_enums_with_aliases`] relinks them.
+        let binder = binder_with(&[("Alias", span(0, 5)), ("a", span(10, 20))]);
+        let aliases = [alias_shape("Alias", "Point")];
+        let decls = [decl("a", 10, 20, "Alias", InitKind::Number)];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("interface/enum paths"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn local_alias_unknown_name_still_2304() {
+        // Names no alias claims keep the historical `PITH2304`.
+        let binder = binder_with(&[("x", span(0, 10))]);
+        let aliases = [alias_shape("Num", "number")];
+        let decls = [decl("x", 0, 10, "Nope", InitKind::Number)];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_UNKNOWN_ANNOTATION);
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_interface_relinks_with_underlying_spelling() {
+        // Probed tsc 7.0.2 (p038-probes/b-wrong.ts, c-missing.ts): wrong
+        // members diagnose per member, missing members spell the UNDERLYING
+        // interface (alias transparency).
+        let binder = binder_with(&[
+            ("Point", span(0, 5)),
+            ("Alias", span(6, 11)),
+            ("good", span(20, 30)),
+            ("wrong", span(40, 50)),
+            ("missing", span(60, 70)),
+        ]);
+        let point = interface_shape(&binder, "Point", 0, vec![("x", "number"), ("y", "number")]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[point],
+            namespaces: &[],
+        };
+        let aliases = [alias_shape("Alias", "Point")];
+        let decls = [
+            EnumDecl {
+                decl: object_decl(
+                    "good",
+                    20,
+                    30,
+                    "Alias",
+                    vec![
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::Number),
+                    ],
+                ),
+                init_text: None,
+                cross_file_deps: Vec::new(),
+            },
+            EnumDecl {
+                decl: object_decl(
+                    "wrong",
+                    40,
+                    50,
+                    "Alias",
+                    vec![
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::String),
+                    ],
+                ),
+                init_text: None,
+                cross_file_deps: Vec::new(),
+            },
+            EnumDecl {
+                decl: object_decl(
+                    "missing",
+                    60,
+                    70,
+                    "Alias",
+                    vec![("x", ObjectMemberKind::Number)],
+                ),
+                init_text: None,
+                cross_file_deps: Vec::new(),
+            },
+        ];
+        let report = enums_report_with_aliases(&decls, &input, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[1].code, CODE_MISSING_MEMBER);
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Property 'y' is missing in type '{ x: number; }' but required in type 'Point'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_enum_relinks_with_underlying_spelling() {
+        // Probed tsc 7.0.2 (p038-probes/i-enum.ts): values spell the
+        // underlying enum (`type 'Color'`).
+        let binder = binder_with(&[
+            ("Color", span(0, 5)),
+            ("C", span(6, 7)),
+            ("a", span(10, 20)),
+            ("b", span(30, 40)),
+        ]);
+        let shape = color_shape(&binder);
+        let input = EnumInput {
+            enums: &[shape],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let aliases = [alias_shape("C", "Color")];
+        let decls = [
+            enum_decl_for("a", 10, 20, "C", InitKind::Number, Some("1")),
+            enum_decl_for("b", 30, 40, "C", InitKind::Number, Some("5")),
+        ];
+        let report = enums_report_with_aliases(&decls, &input, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type '5' is not assignable to type 'Color'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_primitive_rewrites_through_enums() {
+        // The enums entry rewrites primitives exactly like [`check_file`].
+        let binder = binder_with(&[("Num", span(0, 3)), ("b", span(10, 20))]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let aliases = [alias_shape("Num", "number")];
+        let decls = [enum_decl_for(
+            "b",
+            10,
+            20,
+            "Num",
+            InitKind::String,
+            Some("\"oops\""),
+        )];
+        let report = enums_report_with_aliases(&decls, &input, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_unclaimed_target_declines_through_enums() {
+        // Targets no shape owns decline instead of verdicting.
+        let binder = binder_with(&[("Z", span(0, 1)), ("z", span(10, 20))]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let aliases = [alias_shape("Z", "Nowhere")];
+        let decls = [enum_decl_for("z", 10, 20, "Z", InitKind::Number, Some("1"))];
+        let report = enums_report_with_aliases(&decls, &input, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("no interface, enum"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn local_alias_namespace_target_diagnoses_2709() {
+        // Probed tsc 7.0.2 (p038-probes/l-ns-target.ts): tsc reports
+        // `TS2709` at the alias declaration; the solver mirrors the family
+        // at the use (disclosed anchor divergence).
+        let binder = enum_binder(
+            &[
+                ("NS", 0, span(0, 2)),
+                ("N", 0, span(3, 4)),
+                ("v", 0, span(10, 20)),
+            ],
+            &[],
+        );
+        let ns = namespace_shape_for(&binder, "NS", 0, 1, false, vec![]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[ns],
+        };
+        let aliases = [alias_shape("N", "NS")];
+        let decls = [enum_decl_for("v", 10, 20, "N", InitKind::Number, Some("1"))];
+        let report = enums_report_with_aliases(&decls, &input, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_NAMESPACE_AS_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Cannot use namespace 'NS' as a type."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_shadowed_declines_through_enums() {
+        // The const-shadowing guard holds on the enums entry too.
+        let binder = binder_with(&[("Alias", span(0, 5)), ("n", span(10, 20))]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let aliases = [alias_shape("Alias", "number")];
+        let decls = [
+            enum_decl_for("Alias", 0, 5, "string", InitKind::String, Some("\"hello\"")),
+            enum_decl_for("n", 10, 20, "Alias", InitKind::Number, Some("1")),
+        ];
+        let report = enums_report_with_aliases(&decls, &input, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("shadows"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
     }
 }
