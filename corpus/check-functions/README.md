@@ -123,3 +123,28 @@ reasons: non-literal bounds, non-numeric bounds, non-idiom headers,
 non-`for` loops, infinite `for(;;)`, `break`/`continue` bodies, complex
 bodies/tails (unit-pinned). Probes in
 `.agent/scratch/p041-probes/`.
+
+## P043 throw bodies
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| throw-guard-clean.ts | clean | silent, 0 notes (guard throw emits no verdict; tail checks) |
+| throw-guard-tail-wrong.ts | 1x TS2322 (tail) | 1x PITH2322 |
+| throw-straight-clean.ts | clean | silent, 0 notes (mid-sequence throw skipped) |
+| throw-straight-inner-wrong.ts | 1x TS2322 (inner) | 1x PITH2322 (positions independent) |
+| throw-straight-tail-wrong.ts | 1x TS2322 (tail) | 1x PITH2322 (unreachable tail still checks) |
+| throw-terminal-inner-wrong.ts | 1x TS2322 (inner) | 1x PITH2322 (no tail; leadings still check) |
+| throw-only.ts | clean | silent, 0 notes (zero positions) |
+| throw-complex-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+
+Differential: 8/8 match-or-pin (7 diagnostic/silent pairs + 1 pinned
+oracle-clean divergence — `if/else` with a throw branch needs flow facts
+the subset refuses). `throw` accepts any value (`throw "s"` is clean), so
+throw positions emit no diagnostic family and carry no facts; guard
+throws (block-transparent, any condition) plus tail returns, straight
+bodies with throws anywhere in the sequence, terminal throws, and lone
+throws admit through the same synthetic delegation as joins (no fixpoint,
+single pass). Still declining by design with distinct recorded reasons:
+`throw` arms in `try`/`catch`, `throw` cases or defaults in `switch`,
+throw tails after guard returns, and any other multi-path body. Probes in
+`.agent/scratch/p043-probes/`.
