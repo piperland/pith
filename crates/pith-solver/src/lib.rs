@@ -94,9 +94,15 @@
 //!   independently of narrowing, so any condition qualifies.
 //! - A non-literal position declines the whole declaration with a
 //!   position-naming reason (never a partial verdict); loops, `switch`,
-//!   `try`, `else-if` chains, `if/else` plus a tail return, `throw`/bare
-//!   branches, `continue`, and bare returns stay [`FunctionBody::Complex`]
-//!   with the control-flow reason.
+//!   `else-if` chains, `if/else` plus a tail return, `throw`/bare
+//!   branches outside `try` arms, `continue`, and bare returns stay
+//!   [`FunctionBody::Complex`]
+//!   with the control-flow reason. `try` bodies classify P039 (each arm
+//!   exactly one `return <expr>;`, optional trailing return): `finally`
+//!   clauses, destructured catch patterns, `throw` statements, and
+//!   non-straight arms decline with distinct recorded reasons instead.
+//!   A plain `catch (e)` admits structurally (the binding carries no
+//!   facts); a used `return e` then rides the non-literal arm gate below.
 //!
 //! Straight-line multi-statement bodies (P031, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p031-probes/`):
@@ -119,6 +125,31 @@
 //!   subset has no value-type facts), and unannotated declined casts still
 //!   diagnose `TS2352` at the operand span (`u3`). Inner object literals
 //!   check through the object path (`t5`).
+//!
+//! Try/catch bodies (P039, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p039-probes/`):
+//!
+//! - `try { return 1; } catch { return 2; }` against `: number` is clean;
+//!   a wrong `try` return and a wrong `catch` return each report one
+//!   `TS2322` at their own position, and both wrong report twice — each
+//!   arm checks independently through the same synthetic delegation as
+//!   joins (no fixpoint, single pass). A trailing `return` after the
+//!   `try` statement checks as another position (a wrong tail reports
+//!   once; a wrong arm plus a wrong tail report twice).
+//! - `finally` never suppresses: a wrong `try` return still reports with
+//!   a clean `finally` return, and all-wrong `try`/`catch`/`finally`
+//!   reports three times. The subset still declines every `finally`
+//!   shape with its own reason (pinned divergence: the oracle checks,
+//!   the solver records one note — never a forced verdict).
+//! - A plain `catch (e)` admits structurally: an unused `e` changes no
+//!   verdict (the binding carries no facts — oracle and solver both stay
+//!   clean), while a used `return e` classifies `NonLiteral` and rides the
+//!   existing position-naming decline in [`function_shape`] (whole-decl
+//!   decline, 0 diagnostics, where tsc diagnoses `unknown`). Only
+//!   destructured catch patterns decline at the frontend (no binding facts
+//!   exist for patterns), as do `throw` statements in either arm (clean
+//!   in tsc) and non-straight arms (multi-statement, bare returns). Each
+//!   declines with a distinct reason.
 //!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
@@ -979,8 +1010,9 @@ pub struct StraightBody {
 /// [`ConstDecl`] with its own occurrence node, so per-occurrence join state
 /// lives in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002); the
 /// P031 [`FunctionBody::StraightBody`] delegates each leading declarator
-/// plus the terminal return the same way; the rest decline to
-/// [`UnsupportedDecl`] with distinct reasons.
+/// plus the terminal return the same way, as does the P039
+/// [`FunctionBody::TryCatch`] per arm (plus the optional tail); the rest
+/// decline to [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
     /// Exactly one statement, `return <expr>;` with an argument.
@@ -995,6 +1027,13 @@ pub enum FunctionBody {
     /// Exactly one statement, `if (c) { return A; } else { return B; }`:
     /// tsc checks each branch return independently (probed 7.0.2).
     BranchReturns(JoinedReturns),
+    /// Exactly one statement, `try { return A; } catch { return B; }`
+    /// (each arm exactly one `return <expr>;`), plus an optional trailing
+    /// literal `return C;`: tsc checks each position independently
+    /// (probed 7.0.2 P039). Each position delegates through its own
+    /// synthetic [`ConstDecl`] with its own occurrence node, exactly like
+    /// the P023 joins (no fixpoint, single pass).
+    TryCatch(TryCatchBody),
     /// Leading `const`/`let` declarators plus a terminal literal `return`
     /// (single-level blocks flattened): tsc checks each position
     /// independently (probed 7.0.2 P031). Each position delegates through
@@ -1008,9 +1047,17 @@ pub enum FunctionBody {
     },
     /// A body with no statements.
     Empty,
-    /// Anything else: longer/multi-path bodies, loops, `switch`, `try`,
+    /// A `try` body outside the checkable [`FunctionBody::TryCatch`]
+    /// shape: the frontend recorded why (`finally` clause, destructured
+    /// catch pattern, `throw` statement, or a non-straight arm/tail).
+    /// Shaping declines with the reason verbatim — never a partial verdict.
+    TryUnsupported {
+        /// Frontend-recorded decline reason.
+        reason: String,
+    },
+    /// Anything else: longer/multi-path bodies, loops, `switch`,
     /// `else-if` chains, `if/else` plus a tail return, `throw`/bare
-    /// branches, `continue`, bare or missing `return`.
+    /// branches outside `try` arms, `continue`, bare or missing `return`.
     Complex,
 }
 
@@ -1029,6 +1076,26 @@ pub struct JoinedReturns {
     pub first: FunctionReturn,
     /// The second return in source order (tail return / else-branch return).
     pub second: FunctionReturn,
+}
+
+/// A checkable `try/catch` body (P039): one return per arm plus an
+/// optional trailing return, each checked independently.
+///
+/// Driver-mapped from the adapter's try/catch fact variant (mechanical
+/// field copies, each position exactly like [`FunctionReturn`]). Each
+/// position delegates through its own synthetic [`ConstDecl`] with its own
+/// occurrence node (see [`check_functions`]), so per-occurrence state
+/// stays in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002, and
+/// counts/messages match tsc's per-position verdicts (no fixpoint, single
+/// pass — the P023 join semantics).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TryCatchBody {
+    /// The `try` block's `return` position.
+    pub try_branch: FunctionReturn,
+    /// The `catch` block's `return` position.
+    pub catch_branch: FunctionReturn,
+    /// The trailing `return` position, when present.
+    pub tail: Option<FunctionReturn>,
 }
 
 /// One `function name(params): ret` declaration to check.
@@ -1062,7 +1129,8 @@ pub struct FunctionDecl {
     pub is_async: bool,
     /// Raw return annotation text; `None` means unannotated.
     pub return_annotation: Option<String>,
-    /// Body shape; single returns and the three P023 joins are checkable.
+    /// Body shape; single returns, the three P023 joins, P031 straight
+    /// bodies, and P039 try/catch bodies are checkable.
     pub body: FunctionBody,
 }
 
@@ -1726,7 +1794,7 @@ fn sort_report(report: &mut FileReport) {
 /// return annotation, then non-straight-line bodies all decline to
 /// [`UnsupportedDecl`]. Checkable declarations (identifier params all
 /// annotated, return annotated, single literal `return`, one of the three
-/// P023 joins, or a P031 straight body) delegate to the same [`check_one`]
+/// P023 joins, a P031 straight body, or a P039 try/catch) delegate to the same [`check_one`]
 /// path as [`check_file`]
 /// through synthetic [`ConstDecl`]s — one per return position, each with its
 /// own occurrence node, the return literal as initializer, always fresh — so
@@ -1895,6 +1963,36 @@ fn promise_effective_annotation(decl: &FunctionDecl, annotation: &str) -> Result
     }
 }
 
+/// Shapes one `try/catch` body for [`function_shape`]: the try return, the
+/// catch return, then the optional tail return — one [`SynthReturn`] per
+/// position in source order, like the P023 join arms (no fixpoint, single
+/// pass; see the module-level try/catch rules).
+fn shape_try_catch(
+    decl: &FunctionDecl,
+    body: &TryCatchBody,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    let mut positions = Vec::with_capacity(3);
+    positions.push(shape_return(
+        &body.try_branch,
+        "try return",
+        return_site(decl, effective),
+    )?);
+    positions.push(shape_return(
+        &body.catch_branch,
+        "catch return",
+        return_site(decl, effective),
+    )?);
+    if let Some(tail) = body.tail.as_ref() {
+        positions.push(shape_return(
+            tail,
+            "tail return",
+            return_site(decl, effective),
+        )?);
+    }
+    Ok(positions)
+}
+
 /// Gates one function declaration: `Ok` carries the [`ShapedBody`] (one
 /// [`SynthReturn`] per checkable position, in source order);
 /// `Err` carries the unsupported reason.
@@ -1939,6 +2037,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
                 return_site(decl, &effective),
             )?,
         ],
+        FunctionBody::TryCatch(body) => shape_try_catch(decl, body, &effective)?,
         FunctionBody::StraightBody(straight) => {
             let mut positions = Vec::with_capacity(straight.leading.len().saturating_add(1));
             for inner in &straight.leading {
@@ -1971,6 +2070,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
                 decl.name
             ));
         }
+        FunctionBody::TryUnsupported { reason } => return Err(reason.clone()),
         FunctionBody::Complex => {
             return Err(format!(
                 "complex body on '{}': control flow is outside the subset",
@@ -3655,7 +3755,9 @@ fn check_generic_decl(
         FunctionBody::SequenceReturns(_)
         | FunctionBody::GuardReturn(_)
         | FunctionBody::BranchReturns(_)
-        | FunctionBody::StraightBody(_) => {
+        | FunctionBody::StraightBody(_)
+        | FunctionBody::TryCatch(_)
+        | FunctionBody::TryUnsupported { .. } => {
             // Joined and straight returns over a bare type parameter need
             // per-position instantiation the subset refuses: decline like
             // complex bodies.
@@ -10631,6 +10733,20 @@ mod tests {
         })
     }
 
+    /// A try/catch body for try/catch tests: one return per arm plus an
+    /// optional trailing return.
+    fn try_catch(
+        try_branch: FunctionReturn,
+        catch_branch: FunctionReturn,
+        tail: Option<FunctionReturn>,
+    ) -> FunctionBody {
+        FunctionBody::TryCatch(TryCatchBody {
+            try_branch,
+            catch_branch,
+            tail,
+        })
+    }
+
     #[test]
     fn function_correct_is_silent_and_memoized() {
         let binder = binder_with(&[("add", span(0, 10)), ("point", span(11, 21))]);
@@ -11074,6 +11190,139 @@ mod tests {
             reasons[1].contains("then-branch return"),
             "reason: {}",
             reasons[1]
+        );
+    }
+
+    #[test]
+    fn try_catch_diagnoses_per_arm() {
+        // Probed tsc 7.0.2 (P039): each `try`/`catch` arm checks
+        // independently — one side wrong reports once, both wrong twice.
+        let binder = binder_with(&[("pick", span(0, 10)), ("both", span(11, 21))]);
+        let decls = [
+            function(
+                "pick",
+                0,
+                10,
+                Vec::new(),
+                Some("number"),
+                try_catch(lit(InitKind::Number), lit(InitKind::String), None),
+            ),
+            function(
+                "both",
+                11,
+                21,
+                Vec::new(),
+                Some("number"),
+                try_catch(lit(InitKind::String), lit(InitKind::String), None),
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 3);
+        for diag in &report.diagnostics {
+            assert_eq!(diag.code, CODE_MISMATCH);
+            assert_eq!(
+                diag.message,
+                "Type 'string' is not assignable to type 'number'."
+            );
+        }
+    }
+
+    #[test]
+    fn try_catch_tail_checks_as_third_position() {
+        // Probed tsc 7.0.2 (P039): a trailing `return` after the `try`
+        // statement checks as another position — clean arms plus a wrong
+        // tail report once, at the tail.
+        let binder = binder_with(&[("tailed", span(0, 10))]);
+        let decls = [function(
+            "tailed",
+            0,
+            10,
+            Vec::new(),
+            Some("number"),
+            try_catch(
+                lit(InitKind::Number),
+                lit(InitKind::Number),
+                Some(lit(InitKind::String)),
+            ),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
+    fn try_catch_non_literal_arm_declines_whole_body() {
+        // No partial verdicts: one identifier (non-literal) arm declines
+        // the whole declaration with a position-naming reason, even when
+        // the other arm is clean.
+        let binder = binder_with(&[("thrown", span(0, 10))]);
+        let decls = [function(
+            "thrown",
+            0,
+            10,
+            Vec::new(),
+            Some("number"),
+            try_catch(lit(InitKind::NonLiteral), lit(InitKind::Number), None),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("non-literal try return"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn try_unsupported_declines_with_recorded_reason() {
+        // Frontend-recorded try/catch declines (`finally`, destructured
+        // catch pattern, `throw`, non-straight arm) surface verbatim — never a verdict.
+        let binder = binder_with(&[("finalized", span(0, 10))]);
+        let decls = [function(
+            "finalized",
+            0,
+            10,
+            Vec::new(),
+            Some("number"),
+            FunctionBody::TryUnsupported {
+                reason: "finally clause is outside the subset".to_owned(),
+            },
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "finally clause is outside the subset"
         );
     }
 
