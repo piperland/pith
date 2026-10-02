@@ -48,6 +48,15 @@
 //! where the subset declines — each pins the clean baseline plus one
 //! unsupported note): `switch-fallthrough-declined` and
 //! `switch-complex-case-declined`.
+//! Counted-`for` bodies check per position plus the optional tail (P041):
+//! `for-clean` is silent with zero notes; `for-body-wrong` and
+//! `for-zero-trip` match their oracle `TS2322`s (trip counts are not
+//! modeled — the zero-trip body still reports). Three more fixtures diverge
+//! by design: `for-nonliteral-bound-declined` (the oracle errors `TS2322`
+//! where the subset rides the bound gate — silent plus one unsupported
+//! note) and `for-while-declined` plus `for-complex-body-declined` (the
+//! oracle is clean where the subset declines — each pins the clean baseline
+//! plus one unsupported note).
 //! One fixture still diverges by design
 //! (the oracle errors where the subset declines): `unannotated-param`
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
@@ -63,8 +72,8 @@ use pith_frontend::{
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_functions, CastInput, CastKind, DeclKind, FileReport, FunctionBody, FunctionDecl,
-    FunctionParam, FunctionReturn, InitKind, InnerDecl, JoinedReturns, ObjectInit,
+    check_functions, CastInput, CastKind, CountedForBody, DeclKind, FileReport, FunctionBody,
+    FunctionDecl, FunctionParam, FunctionReturn, InitKind, InnerDecl, JoinedReturns, ObjectInit,
     ObjectMemberInit, ObjectMemberKind, StraightBody, SwitchBody, TryCatchBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
@@ -326,6 +335,17 @@ fn map_switch(cases: &[FrontendReturn], default: Option<&FrontendReturn>) -> Swi
     }
 }
 
+/// Maps one frontend counted-`for` body to the solver's: the loop-body
+/// return plus the optional trailing return, each through
+/// [`map_function_return`] (same `init_array: None` seam as every other
+/// return position).
+fn map_counted_for(body: &FrontendReturn, tail: Option<&FrontendReturn>) -> CountedForBody {
+    CountedForBody {
+        body: map_function_return(body),
+        tail: tail.map(map_function_return),
+    }
+}
+
 /// Scope-sensitive span + identity for one function declarator, mirroring
 /// the check-const driver's fallback: `symbol` indexes
 /// `ParsedFile.symbols`, resolved through the binder from the fact's scope.
@@ -383,7 +403,13 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 FunctionBodyFact::Switch { cases, default } => {
                     FunctionBody::Switch(map_switch(cases, default.as_ref()))
                 }
+                FunctionBodyFact::CountedFor { body, tail } => {
+                    FunctionBody::CountedFor(map_counted_for(body, tail.as_ref()))
+                }
                 FunctionBodyFact::TryUnsupported { reason } => FunctionBody::TryUnsupported {
+                    reason: reason.clone(),
+                },
+                FunctionBodyFact::LoopUnsupported { reason } => FunctionBody::LoopUnsupported {
                     reason: reason.clone(),
                 },
                 FunctionBodyFact::SwitchUnsupported { reason } => FunctionBody::SwitchUnsupported {
@@ -658,6 +684,24 @@ fixture_test!(
     "switch-two-wrong.expected.txt",
     0
 );
+fixture_test!(
+    for_clean_is_silent,
+    "for-clean.ts",
+    "for-clean.expected.txt",
+    0
+);
+fixture_test!(
+    for_body_wrong_matches_ts2322,
+    "for-body-wrong.ts",
+    "for-body-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    for_zero_trip_matches_ts2322,
+    "for-zero-trip.ts",
+    "for-zero-trip.expected.txt",
+    0
+);
 
 #[test]
 fn straight_identifier_init_divergence_pins_ts2322() {
@@ -711,6 +755,185 @@ fn expect_clean_oracle_decline(name: &str, source: &str, expected: &str, reason:
         report.unsupported[0].reason, reason,
         "{name}: recorded reason"
     );
+}
+
+#[test]
+fn for_while_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: a `while`
+    // loop body is clean in tsc (only the counted `for` idiom admits —
+    // probed 7.0.2 P041) while the solver records one unsupported note with
+    // the frontend's recorded reason.
+    expect_clean_oracle_decline(
+        "for_while_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/for-while-declined.ts"),
+        include_str!("../../../corpus/check-functions/for-while-declined.expected.txt"),
+        "while loop is outside the subset",
+    );
+}
+
+#[test]
+fn for_complex_body_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: a
+    // multi-statement loop body is clean in tsc (probed 7.0.2 P041) while
+    // the solver records one unsupported note with the frontend's recorded
+    // reason.
+    expect_clean_oracle_decline(
+        "for_complex_body_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/for-complex-body-declined.ts"),
+        include_str!("../../../corpus/check-functions/for-complex-body-declined.expected.txt"),
+        "non-straight counted-for body is outside the subset",
+    );
+}
+
+#[test]
+fn for_nonliteral_bound_declines_where_oracle_errors() {
+    // By design the subset declines where the oracle errors: tsc checks the
+    // body return against the annotation (`TS2322`) while the solver rides
+    // the bound gate — whole-decl decline, zero diagnostics, no value-type
+    // facts.
+    let source = include_str!("../../../corpus/check-functions/for-nonliteral-bound-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-functions/for-nonliteral-bound-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason, "non-literal bound in for loop is outside the subset",
+        "recorded reason"
+    );
+}
+
+/// Asserts a pipeline-only loop decline (no oracle file): the pipeline
+/// stays silent with exactly one unsupported note carrying the recorded
+/// reason.
+fn expect_loop_decline(name: &str, source: &str, reason: &str) {
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "{name}: diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1, "{name}: one decline note");
+    assert_eq!(
+        report.unsupported[0].reason, reason,
+        "{name}: recorded reason"
+    );
+}
+
+#[test]
+fn for_break_body_declines_with_break_reason() {
+    // A bare `break` body is clean in tsc (probed 7.0.2 P041) while the
+    // subset declines with the break/continue reason — never the complex
+    // one.
+    expect_loop_decline(
+        "for_break_body_declines_with_break_reason",
+        "function stop(): number {\n  for (let i = 0; i < 3; i++) {\n\
+         break;\n  }\n  return 2;\n}\n",
+        "break/continue in counted-for body is outside the subset",
+    );
+}
+
+#[test]
+fn for_labelled_continue_declines_with_break_reason() {
+    // Labels are the only value `break`/`continue` carry: a labelled
+    // `continue` rides the same reason as the bare form.
+    expect_loop_decline(
+        "for_labelled_continue_declines_with_break_reason",
+        "function skip(): number {\n  for (let i = 0; i < 3; i++) {\n\
+         done: continue;\n  }\n  return 2;\n}\n",
+        "break/continue in counted-for body is outside the subset",
+    );
+}
+
+#[test]
+fn for_infinite_declines_with_infinite_reason() {
+    // `for(;;)` is clean in tsc with a clean body (probed 7.0.2 P041)
+    // while the subset declines with the infinite-loop reason.
+    expect_loop_decline(
+        "for_infinite_declines_with_infinite_reason",
+        "function spin(): number {\n  for (;;) {\n    return 1;\n  }\n}\n",
+        "infinite for loop is outside the subset",
+    );
+}
+
+#[test]
+fn for_non_numeric_bound_declines_with_numeric_reason() {
+    // A string init literal is outside the numeric-bound rule (const-eval
+    // the subset refuses) — distinct from the non-literal reason.
+    expect_loop_decline(
+        "for_non_numeric_bound_declines_with_numeric_reason",
+        "function text(): number {\n  for (let i = \"a\"; i < 3; i++) {\n\
+         return 1;\n  }\n  return 2;\n}\n",
+        "non-numeric bound in for loop is outside the subset",
+    );
+}
+
+#[test]
+fn for_stepped_update_declines_with_shape_reason() {
+    // `i += 2` is outside the simple `++` idiom — the header-shape reason.
+    expect_loop_decline(
+        "for_stepped_update_declines_with_shape_reason",
+        "function stepped(): number {\n  for (let i = 0; i < 10; i += 2) {\n\
+         return 1;\n  }\n  return 2;\n}\n",
+        "non-counted for loop shape is outside the subset",
+    );
+}
+
+#[test]
+fn for_loop_var_return_declines_through_non_literal_gate() {
+    // By design the subset declines where the oracle checks: `return i`
+    // over the loop variable classifies `NonLiteral` (the variable carries
+    // no value facts — the loop-carried pinned gap), so the whole
+    // declaration declines with the position-naming reason and zero
+    // diagnostics.
+    expect_loop_decline(
+        "for_loop_var_return_declines_through_non_literal_gate",
+        "function pick(): number {\n  for (let i = 0; i < 3; i++) {\n\
+         return i;\n  }\n  return 2;\n}\n",
+        "non-literal loop return in 'pick' is outside the subset",
+    );
+}
+
+#[test]
+fn for_tail_wrong_matches_ts2322() {
+    // A clean loop body plus a wrong tail reports once at the tail: the
+    // tail is another position (probed 7.0.2 P041 — probe `h`).
+    let (_, report) = run_pipeline(
+        "function total(): number {\n  for (let i = 0; i < 3; i++) {\n\
+         return 1;\n  }\n  return \"oops\";\n}\n",
+    );
+    let actual: Vec<(String, String)> = report
+        .diagnostics
+        .iter()
+        .map(|diag| {
+            let family = diag
+                .code
+                .strip_prefix("PITH")
+                .unwrap_or(diag.code.as_str())
+                .to_owned();
+            (format!("TS{family}"), diag.message.clone())
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned()
+        )],
+    );
+    assert!(report.unsupported.is_empty());
 }
 
 #[test]
