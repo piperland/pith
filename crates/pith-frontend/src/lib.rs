@@ -71,8 +71,14 @@
 //! position checks independently solver-side (probed tsc 7.0.2). Non-literal
 //! bounds, non-numeric bounds, non-idiom headers, non-`for` loops,
 //! infinite `for(;;)`, `break`/`continue` bodies, and complex bodies are
-//! [`FunctionBodyFact::LoopUnsupported`] with the recorded reason. Bodies
-//! without a node are
+//! [`FunctionBodyFact::LoopUnsupported`] with the recorded reason. P043
+//! throw bodies: an `if`-without-`else` guard `throw` plus a tail `return`
+//! ([`FunctionBodyFact::GuardThrow`], tail checks solver-side while the
+//! throw carries no facts — it emits no verdict, probed tsc 7.0.2), and
+//! straight bodies holding at least one `throw`
+//! ([`FunctionBodyFact::StraightThrow`], throws skipped while leading and
+//! tail positions check — a lone `throw` is the empty, tail-less form).
+//! Bodies without a node are
 //! [`FunctionBodyFact::NoBody`], statement-less bodies are
 //! [`FunctionBodyFact::Empty`], and everything else (longer/multi-path
 //! bodies, loops paired with non-return statements, bare or missing
@@ -685,9 +691,11 @@ pub struct InnerDeclFact {
 /// [`FunctionBodyFact::BranchReturns`]), the P031 straight bodies
 /// ([`FunctionBodyFact::StraightBody`]), the P039 try/catch bodies
 /// ([`FunctionBodyFact::TryCatch`]), the P040 switch bodies
-/// ([`FunctionBodyFact::Switch`]), and the P041 counted-`for` bodies
-/// ([`FunctionBodyFact::CountedFor`]) feed the solver; every other shape
-/// declines to a solver `UnsupportedDecl` with a distinct reason.
+/// ([`FunctionBodyFact::Switch`]), the P041 counted-`for` bodies
+/// ([`FunctionBodyFact::CountedFor`]), and the P043 throw bodies
+/// ([`FunctionBodyFact::GuardThrow`], [`FunctionBodyFact::StraightThrow`])
+/// feed the solver; every other shape declines to a solver `UnsupportedDecl`
+/// with a distinct reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBodyFact {
     /// Exactly one statement, `return <expr>;` with an argument.
@@ -811,14 +819,43 @@ pub enum FunctionBodyFact {
         /// `for(;;)`, `break`/`continue` body, or a complex body/tail).
         reason: String,
     },
+    /// Exactly two statements, `if (c) throw ...;` with no `else` plus a
+    /// trailing `return <expr>;`: tsc checks the tail return while the throw
+    /// accepts any value (probed 7.0.2 P043). The guard throw carries no
+    /// facts (it emits no verdict); any condition qualifies and the throw
+    /// unwraps from a single-statement block, mirroring the P023
+    /// guard-condition and block precedents. A throw tail after a guard
+    /// return, and `throw` branches of `if/else`, never reach facts: the
+    /// body is [`FunctionBodyFact::Complex`].
+    GuardThrow {
+        /// The trailing `return`'s expression facts.
+        tail: SingleReturnFact,
+    },
+    /// A straight-line body holding at least one `throw`: leading
+    /// `const`/`let` declarators (plus independently-checked nested
+    /// `function` declarations) with a terminal literal `return` or a
+    /// terminal `throw`, at most four items total. Throws contribute no
+    /// facts (they emit no verdict — probed 7.0.2 P043: any thrown value
+    /// is clean, unreachable positions after a throw still check); each
+    /// other position checks independently solver-side, exactly like
+    /// [`FunctionBodyFact::StraightBody`]. Throw-free bodies stay
+    /// [`FunctionBodyFact::StraightBody`]; a lone `throw` is the empty
+    /// leading, tail-less form.
+    StraightThrow {
+        /// Leading declarator facts in source order (blocks flattened).
+        leading: Vec<InnerDeclFact>,
+        /// The terminal `return`'s expression facts, when present (a
+        /// terminal `throw` leaves no tail to check).
+        tail: Option<SingleReturnFact>,
+    },
     /// A body with no statements (directives do not count).
     Empty,
     /// Anything else: longer/multi-path bodies (including a loop or `switch`
     /// statement paired with a non-return statement), `else-if` chains,
     /// `if/else` plus a tail return, non-terminal returns, `throw` or bare
-    /// branches outside `try` arms, `continue`, bare or missing `return`,
-    /// `var` declarators, spreads/methods/computed keys in a returned
-    /// literal.
+    /// branches outside the admitted throw positions, `continue`, bare or
+    /// missing `return`, `var` declarators, spreads/methods/computed keys
+    /// in a returned literal.
     Complex,
 }
 
@@ -2177,9 +2214,14 @@ fn return_members(
 /// divergent return plus a tail return, and a lone `if/else` with a return
 /// in each branch. P031 straight bodies (leading `const`/`let` declarators
 /// plus a terminal literal return, single-level blocks flattened) classify
-/// into [`FunctionBodyFact::StraightBody`]. P039 try/catch bodies (a lone
-/// `try` statement, or a `try` statement plus a trailing literal `return`)
-/// classify into [`FunctionBodyFact::TryCatch`] or
+/// into [`FunctionBodyFact::StraightBody`]. P043 throw bodies classify two
+/// ways: an `if`-without-`else` guard throw plus a tail return (the tail
+/// checks solver-side, the throw emits nothing) into
+/// [`FunctionBodyFact::GuardThrow`], and straight bodies holding at least
+/// one `throw` (throws skipped, other positions check — a lone `throw` is
+/// the empty, tail-less form) into [`FunctionBodyFact::StraightThrow`].
+/// P039 try/catch bodies (a lone `try` statement, or a `try` statement plus
+/// a trailing literal `return`) classify into [`FunctionBodyFact::TryCatch`] or
 /// [`FunctionBodyFact::TryUnsupported`]. P040 switch bodies (a lone
 /// `switch (x)` statement) classify into [`FunctionBodyFact::Switch`] or
 /// [`FunctionBodyFact::SwitchUnsupported`]. P041 counted-`for` bodies (a lone
@@ -2317,7 +2359,9 @@ const MAX_STRAIGHT_ITEMS: usize = 4;
 
 /// Accumulator for one straight-body classification: leading declarator
 /// facts in source order, the count of skipped nested `function`
-/// declarations (toward the item cap), and the terminal return once seen.
+/// declarations (toward the item cap) and skipped `throw` statements (same
+/// cap: throws are statements too, even though they emit no verdict), and
+/// the terminal return once seen.
 #[derive(Debug, Default)]
 struct StraightAcc {
     /// Leading declarator facts in source order (blocks flattened).
@@ -2325,14 +2369,23 @@ struct StraightAcc {
     /// Skipped nested `function` declarations (checked through their own
     /// facts, but still statements toward the cap).
     fns: u32,
+    /// Skipped `throw` statements (no verdict at any throw position, but
+    /// still statements toward the cap). Any nonzero count routes the body
+    /// to [`FunctionBodyFact::StraightThrow`].
+    throws: u32,
     /// The terminal `return`'s expression facts, once seen.
     tail: Option<SingleReturnFact>,
 }
 
 /// P031 straight bodies: leading `const`/`let` declarators (plus
 /// skipped nested `function` declarations) with a terminal literal
-/// `return`, at most [`MAX_STRAIGHT_ITEMS`] expanded items. Single-level
-/// blocks flatten one level when every inner statement is straight-line.
+/// `return`, at most [`MAX_STRAIGHT_ITEMS`] expanded items. P043 admits
+/// `throw` statements anywhere in the sequence (skipped: they emit no
+/// verdict — probed 7.0.2): any body holding at least one throw classifies
+/// [`FunctionBodyFact::StraightThrow`] (a lone `throw` is the empty,
+/// tail-less form; a terminal `throw` leaves no tail), while throw-free
+/// bodies keep [`FunctionBodyFact::StraightBody`]. Single-level blocks
+/// flatten one level when every inner statement is straight-line.
 /// Anything else yields `None` (the caller marks the body
 /// [`FunctionBodyFact::Complex`]).
 fn straight_body(
@@ -2346,18 +2399,25 @@ fn straight_body(
             return None;
         }
     }
-    let tail = acc.tail?;
     let items = acc
         .leading
         .len()
         .saturating_add(usize::try_from(acc.fns).unwrap_or(usize::MAX))
-        .saturating_add(1);
+        .saturating_add(usize::try_from(acc.throws).unwrap_or(usize::MAX))
+        .saturating_add(acc.tail.is_some().into());
     if items > MAX_STRAIGHT_ITEMS {
         return None;
     }
-    Some(FunctionBodyFact::StraightBody {
+    if acc.throws == 0 {
+        let tail = acc.tail?;
+        return Some(FunctionBodyFact::StraightBody {
+            leading: acc.leading,
+            tail,
+        });
+    }
+    Some(FunctionBodyFact::StraightThrow {
         leading: acc.leading,
-        tail,
+        tail: acc.tail,
     })
 }
 
@@ -2399,9 +2459,11 @@ fn expand_block(
 
 /// Expands one straight-line statement into the accumulator: `const`/`let`
 /// declarators append positions, named nested `function` declarations count
-/// toward the cap (they check through their own facts), and a terminal
-/// single `return <expr>;` parks the tail. Anything else — deeper blocks,
-/// `var`, control flow, non-terminal or bare returns — yields false.
+/// toward the cap (they check through their own facts), `throw` statements
+/// count toward the cap but append no position (they emit no verdict —
+/// probed 7.0.2 P043), and a terminal single `return <expr>;` parks the
+/// tail. Anything else — deeper blocks, `var`, control flow, non-terminal
+/// or bare returns — yields false.
 fn expand_inner(
     collector: &DeclCollector<'_>,
     acc: &mut StraightAcc,
@@ -2415,6 +2477,10 @@ fn expand_inner(
                 return false;
             }
             acc.fns = acc.fns.saturating_add(1);
+            true
+        }
+        Statement::ThrowStatement(_) => {
+            acc.throws = acc.throws.saturating_add(1);
             true
         }
         Statement::ReturnStatement(ret) => {
@@ -2517,8 +2583,8 @@ fn straight_declarator(
 }
 
 /// Two-statement bodies beyond straight-line single returns: two sequential
-/// returns, then guard-then-tail. Anything else yields `None` (the caller
-/// marks the body [`FunctionBodyFact::Complex`]).
+/// returns, then guard-then-tail, then guard-throw-then-tail. Anything else
+/// yields `None` (the caller marks the body [`FunctionBodyFact::Complex`]).
 #[must_use]
 fn joined_pair(
     collector: &DeclCollector<'_>,
@@ -2527,6 +2593,7 @@ fn joined_pair(
 ) -> Option<FunctionBodyFact> {
     sequence_returns(collector, first, second)
         .or_else(|| guard_tail_returns(collector, first, second))
+        .or_else(|| guard_throw_tail(collector, first, second))
 }
 
 /// Two top-level `return <expr>;` statements: tsc checks both, unreachable
@@ -2575,6 +2642,49 @@ fn guard_tail_returns(
     let tail_arg = tail.argument.as_ref()?;
     Some(FunctionBodyFact::GuardReturn {
         guard: single_return_fact(collector, guard_arg)?,
+        tail: single_return_fact(collector, tail_arg)?,
+    })
+}
+
+/// Whether one statement is a `throw`, directly or as the only statement
+/// of a block (mirroring [`divergent_return_arg`]'s block transparency).
+/// `return` statements never qualify here: the guard-throw join admits only
+/// the throw side fact-free, while guard returns ride
+/// [`guard_tail_returns`].
+#[must_use]
+fn is_throw(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::ThrowStatement(_) => true,
+        Statement::BlockStatement(block) if block.body.len() == 1 => is_throw(&block.body[0]),
+        _ => false,
+    }
+}
+
+/// `if (c) throw ...;` with no `else` plus a trailing `return <expr>;`:
+/// tsc checks the tail return while the throw accepts any value (probed
+/// 7.0.2 P043). Any condition qualifies (the P023 precedent); an `else`
+/// disqualifies — `if/else` with a throw branch is multi-path,
+/// [`FunctionBodyFact::Complex`].
+#[must_use]
+fn guard_throw_tail(
+    collector: &DeclCollector<'_>,
+    first: &Statement<'_>,
+    second: &Statement<'_>,
+) -> Option<FunctionBodyFact> {
+    let Statement::IfStatement(it) = first else {
+        return None;
+    };
+    if it.alternate.is_some() {
+        return None;
+    }
+    if !is_throw(&it.consequent) {
+        return None;
+    }
+    let Statement::ReturnStatement(tail) = second else {
+        return None;
+    };
+    let tail_arg = tail.argument.as_ref()?;
+    Some(FunctionBodyFact::GuardThrow {
         tail: single_return_fact(collector, tail_arg)?,
     })
 }
@@ -5975,6 +6085,70 @@ export function f(a: string): string { return a + b; }
         let pf = parse_module(FileId(0), "x.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
         assert_eq!(pf.functions.len(), 8);
+        for fact in &pf.functions {
+            assert_eq!(fact.body, FunctionBodyFact::Complex);
+        }
+    }
+
+    #[test]
+    fn function_facts_throw_bodies_classify() {
+        let src = "function guard(x: boolean): number {\n  if (x) throw new Error(\"x\");\n\
+                    return 1;\n}\n\
+                    function blocked(x: boolean): number {\n  if (x) {\n\
+                    throw new Error(\"x\");\n  }\n  return 2;\n}\n\
+                    function mid(): number {\n  const a: number = 1;\n\
+                    throw new Error(\"x\");\n  return 2;\n}\n\
+                    function only(): number {\n  throw new Error(\"x\");\n}\n\
+                    function terminal(): number {\n  const a: number = 1;\n\
+                    throw new Error(\"x\");\n}\n";
+        let pf = parse_module(FileId(0), "t.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 5);
+        // Unbraced and block-wrapped guard throws classify identically: the
+        // throw carries no facts, the tail parks its return expression.
+        for (index, want) in ["1", "2"].iter().enumerate() {
+            let FunctionBodyFact::GuardThrow { tail } = &pf.functions[index].body else {
+                panic!("expected guard throw, got {:?}", pf.functions[index].body);
+            };
+            assert_eq!(tail.kind, ReturnKind::Number);
+            assert_eq!(slice_of(src, tail.span), *want);
+        }
+        // Mid-body throws skip while leading and tail positions record.
+        let FunctionBodyFact::StraightThrow { leading, tail } = &pf.functions[2].body else {
+            panic!("expected straight throw, got {:?}", pf.functions[2].body);
+        };
+        assert_eq!(leading.len(), 1);
+        assert_eq!(leading[0].name, "a");
+        let tail = tail.as_ref().expect("terminal return");
+        assert_eq!(tail.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tail.span), "2");
+        // A lone throw is the empty, tail-less form.
+        let FunctionBodyFact::StraightThrow { leading, tail } = &pf.functions[3].body else {
+            panic!("expected straight throw, got {:?}", pf.functions[3].body);
+        };
+        assert!(leading.is_empty());
+        assert!(tail.is_none());
+        // A terminal throw leaves no tail while leadings still record.
+        let FunctionBodyFact::StraightThrow { leading, tail } = &pf.functions[4].body else {
+            panic!("expected straight throw, got {:?}", pf.functions[4].body);
+        };
+        assert_eq!(leading.len(), 1);
+        assert_eq!(leading[0].name, "a");
+        assert!(tail.is_none());
+    }
+
+    #[test]
+    fn function_facts_throw_outside_admitted_positions_stays_complex() {
+        // A throw tail after a guard return is no join (only guard throws
+        // admit), and throws still count toward the straight-item cap.
+        let src = "function tail_throw(x: number): number {\n  if (x > 0) return 1;\n\
+                    throw new Error(\"y\");\n}\n\
+                    function capped(): number {\n  const a: number = 1;\n\
+                    const b: number = 2;\n  const c: number = 3;\n  const d: number = 4;\n\
+                    throw new Error(\"x\");\n  return 5;\n}\n";
+        let pf = parse_module(FileId(0), "j.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
         for fact in &pf.functions {
             assert_eq!(fact.body, FunctionBodyFact::Complex);
         }
