@@ -93,11 +93,17 @@
 //!   `typeof` guards and plain conditions alike — returns check
 //!   independently of narrowing, so any condition qualifies.
 //! - A non-literal position declines the whole declaration with a
-//!   position-naming reason (never a partial verdict); loops, `switch`,
+//!   position-naming reason (never a partial verdict); loops,
 //!   `else-if` chains, `if/else` plus a tail return, `throw`/bare
 //!   branches outside `try` arms, `continue`, and bare returns stay
 //!   [`FunctionBody::Complex`]
-//!   with the control-flow reason. `try` bodies classify P039 (each arm
+//!   with the control-flow reason. `switch` bodies classify P040 (each
+//!   `case` plus the optional `default` exactly one `return <expr>;`):
+//!   fallthrough, complex cases, case-level declarations, non-literal
+//!   discriminants or labels, and duplicate defaults decline with distinct
+//!   recorded reasons instead. A missing `default` admits structurally
+//!   (tsc's `TS2366` exhaustiveness error is a pinned gap — the subset has
+//!   no declaration-completeness family). `try` bodies classify P039 (each arm
 //!   exactly one `return <expr>;`, optional trailing return): `finally`
 //!   clauses, destructured catch patterns, `throw` statements, and
 //!   non-straight arms decline with distinct recorded reasons instead.
@@ -150,6 +156,32 @@
 //!   exist for patterns), as do `throw` statements in either arm (clean
 //!   in tsc) and non-straight arms (multi-statement, bare returns). Each
 //!   declines with a distinct reason.
+//!
+//! Switch bodies (P040, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p040-probes/`):
+//!
+//! - `switch (n) { case 1: return 1; case 2: return 2; default: return 3; }`
+//!   against `: number` is clean; a wrong `case` return and a wrong
+//!   `default` return each report one `TS2322` at their own position, and
+//!   two wrong cases report twice — each position checks independently
+//!   through the same synthetic delegation as joins (no fixpoint, single
+//!   pass). String labels check the same way (`case "a":` positions
+//!   diagnose identically — probed `n-string-disc`); a `default` in the
+//!   middle and block-wrapped single returns (`case 1: { return 1; }`)
+//!   are clean in tsc and admit the same way.
+//! - Fallthrough (an empty `case` falling into the next clause), complex
+//!   cases (extra statements before the return), case-level declarations
+//!   (even with a literal tail return — `return x` over a case-local
+//!   binding needs value-type facts), non-literal discriminants
+//!   (`switch (tag())`), non-literal labels (`case tag():`), and duplicate
+//!   defaults each decline with a distinct reason (pinned divergences: the
+//!   oracle is clean on all but the duplicate, which spells `TS1113` — the
+//!   solver records one note, never a forced verdict).
+//! - A missing `default` admits structurally: all-clean cases stay silent
+//!   where tsc reports `TS2366` (pinned oracle-error divergence — the
+//!   subset has no declaration-completeness family). A `switch` paired with
+//!   any other statement (e.g. a trailing `return`) stays
+//!   [`FunctionBody::Complex`]: two paths, no join.
 //!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
@@ -1011,7 +1043,8 @@ pub struct StraightBody {
 /// lives in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002); the
 /// P031 [`FunctionBody::StraightBody`] delegates each leading declarator
 /// plus the terminal return the same way, as does the P039
-/// [`FunctionBody::TryCatch`] per arm (plus the optional tail); the rest
+/// [`FunctionBody::TryCatch`] per arm (plus the optional tail) and the P040
+/// [`FunctionBody::Switch`] per case (plus the optional default); the rest
 /// decline to [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
@@ -1034,6 +1067,13 @@ pub enum FunctionBody {
     /// synthetic [`ConstDecl`] with its own occurrence node, exactly like
     /// the P023 joins (no fixpoint, single pass).
     TryCatch(TryCatchBody),
+    /// Exactly one statement, `switch (x)` with literal case labels, each
+    /// case (plus the optional default) exactly one `return <expr>;`: tsc
+    /// checks each position independently (probed 7.0.2 P040). Each position
+    /// delegates through its own synthetic [`ConstDecl`] with its own
+    /// occurrence node, exactly like the P023 joins (no fixpoint, single
+    /// pass).
+    Switch(SwitchBody),
     /// Leading `const`/`let` declarators plus a terminal literal `return`
     /// (single-level blocks flattened): tsc checks each position
     /// independently (probed 7.0.2 P031). Each position delegates through
@@ -1055,7 +1095,17 @@ pub enum FunctionBody {
         /// Frontend-recorded decline reason.
         reason: String,
     },
-    /// Anything else: longer/multi-path bodies, loops, `switch`,
+    /// A `switch` body outside the checkable [`FunctionBody::Switch`]
+    /// shape: the frontend recorded why (fallthrough, complex case,
+    /// case-level declarations, non-literal discriminant or label, or a
+    /// duplicate default). Shaping declines with the reason verbatim —
+    /// never a partial verdict.
+    SwitchUnsupported {
+        /// Frontend-recorded decline reason.
+        reason: String,
+    },
+    /// Anything else: longer/multi-path bodies (including a `switch`
+    /// statement paired with any other statement), loops,
     /// `else-if` chains, `if/else` plus a tail return, `throw`/bare
     /// branches outside `try` arms, `continue`, bare or missing `return`.
     Complex,
@@ -1098,6 +1148,24 @@ pub struct TryCatchBody {
     pub tail: Option<FunctionReturn>,
 }
 
+/// A checkable `switch` body (P040): one return per `case` plus the
+/// optional `default` return, each checked independently.
+///
+/// Driver-mapped from the adapter's switch fact variant (mechanical field
+/// copies, each position exactly like [`FunctionReturn`]). Each position
+/// delegates through its own synthetic [`ConstDecl`] with its own
+/// occurrence node (see [`check_functions`]), so per-occurrence state stays
+/// in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002, and
+/// counts/messages match tsc's per-position verdicts (no fixpoint, single
+/// pass — the P023 join semantics).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchBody {
+    /// One `return` position per `case` clause, in source order.
+    pub cases: Vec<FunctionReturn>,
+    /// The `default` clause's `return` position, when present.
+    pub default: Option<FunctionReturn>,
+}
+
 /// One `function name(params): ret` declaration to check.
 ///
 /// `name`/`span`/`scope`/`symbol` locate the declaration exactly like
@@ -1130,7 +1198,7 @@ pub struct FunctionDecl {
     /// Raw return annotation text; `None` means unannotated.
     pub return_annotation: Option<String>,
     /// Body shape; single returns, the three P023 joins, P031 straight
-    /// bodies, and P039 try/catch bodies are checkable.
+    /// bodies, P039 try/catch bodies, and P040 switch bodies are checkable.
     pub body: FunctionBody,
 }
 
@@ -1794,7 +1862,8 @@ fn sort_report(report: &mut FileReport) {
 /// return annotation, then non-straight-line bodies all decline to
 /// [`UnsupportedDecl`]. Checkable declarations (identifier params all
 /// annotated, return annotated, single literal `return`, one of the three
-/// P023 joins, a P031 straight body, or a P039 try/catch) delegate to the same [`check_one`]
+/// P023 joins, a P031 straight body, a P039 try/catch, or a P040 switch)
+/// delegate to the same [`check_one`]
 /// path as [`check_file`]
 /// through synthetic [`ConstDecl`]s — one per return position, each with its
 /// own occurrence node, the return literal as initializer, always fresh — so
@@ -1914,7 +1983,8 @@ struct SynthReturn {
 
 /// A checkable function shape: one [`SynthReturn`] per checkable position
 /// (one for straight-line single returns, two for P023 joins, leading
-/// declarators plus the tail return for P031 straight bodies — all in
+/// declarators plus the tail return for P031 straight bodies, arms plus the
+/// tail for P039 try/catch, cases plus the default for P040 switch — all in
 /// source order).
 #[derive(Debug)]
 struct ShapedBody {
@@ -1993,6 +2063,32 @@ fn shape_try_catch(
     Ok(positions)
 }
 
+/// Shapes one `switch` body for [`function_shape`]: one [`SynthReturn`] per
+/// `case` in source order, then the optional `default` — like the P023
+/// join arms (no fixpoint, single pass; see the module-level switch rules).
+fn shape_switch(
+    decl: &FunctionDecl,
+    body: &SwitchBody,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    let mut positions = Vec::with_capacity(body.cases.len().saturating_add(1));
+    for case in &body.cases {
+        positions.push(shape_return(
+            case,
+            "case return",
+            return_site(decl, effective),
+        )?);
+    }
+    if let Some(default) = body.default.as_ref() {
+        positions.push(shape_return(
+            default,
+            "default return",
+            return_site(decl, effective),
+        )?);
+    }
+    Ok(positions)
+}
+
 /// Gates one function declaration: `Ok` carries the [`ShapedBody`] (one
 /// [`SynthReturn`] per checkable position, in source order);
 /// `Err` carries the unsupported reason.
@@ -2038,6 +2134,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
             )?,
         ],
         FunctionBody::TryCatch(body) => shape_try_catch(decl, body, &effective)?,
+        FunctionBody::Switch(body) => shape_switch(decl, body, &effective)?,
         FunctionBody::StraightBody(straight) => {
             let mut positions = Vec::with_capacity(straight.leading.len().saturating_add(1));
             for inner in &straight.leading {
@@ -2070,7 +2167,9 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
                 decl.name
             ));
         }
-        FunctionBody::TryUnsupported { reason } => return Err(reason.clone()),
+        FunctionBody::TryUnsupported { reason } | FunctionBody::SwitchUnsupported { reason } => {
+            return Err(reason.clone());
+        }
         FunctionBody::Complex => {
             return Err(format!(
                 "complex body on '{}': control flow is outside the subset",
@@ -3757,7 +3856,9 @@ fn check_generic_decl(
         | FunctionBody::BranchReturns(_)
         | FunctionBody::StraightBody(_)
         | FunctionBody::TryCatch(_)
-        | FunctionBody::TryUnsupported { .. } => {
+        | FunctionBody::TryUnsupported { .. }
+        | FunctionBody::Switch(_)
+        | FunctionBody::SwitchUnsupported { .. } => {
             // Joined and straight returns over a bare type parameter need
             // per-position instantiation the subset refuses: decline like
             // complex bodies.
@@ -10747,6 +10848,12 @@ mod tests {
         })
     }
 
+    /// A switch body for switch tests: one return per case plus an
+    /// optional default return.
+    fn switched(cases: Vec<FunctionReturn>, default: Option<FunctionReturn>) -> FunctionBody {
+        FunctionBody::Switch(SwitchBody { cases, default })
+    }
+
     #[test]
     fn function_correct_is_silent_and_memoized() {
         let binder = binder_with(&[("add", span(0, 10)), ("point", span(11, 21))]);
@@ -11323,6 +11430,105 @@ mod tests {
         assert_eq!(
             report.unsupported[0].reason,
             "finally clause is outside the subset"
+        );
+    }
+
+    #[test]
+    fn switch_diagnoses_per_case() {
+        // P040 switch rule (probed tsc 7.0.2): a wrong case and a wrong
+        // default each report once, at their own position through the
+        // synthetic delegation — two wrong cases report twice.
+        let binder = binder_with(&[("pick", span(0, 10))]);
+        let decls = [function(
+            "pick",
+            0,
+            10,
+            Vec::new(),
+            Some("number"),
+            switched(
+                vec![lit(InitKind::String), lit(InitKind::String)],
+                Some(lit(InitKind::Number)),
+            ),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+        for diag in &report.diagnostics {
+            assert_eq!(diag.code, CODE_MISMATCH);
+            assert_eq!(
+                diag.message,
+                "Type 'string' is not assignable to type 'number'."
+            );
+        }
+        assert_eq!(db.recompute_count(), 3);
+    }
+
+    #[test]
+    fn switch_non_literal_case_declines_whole_body() {
+        // No partial verdicts: one identifier (non-literal) case declines
+        // the whole declaration with a position-naming reason, even when
+        // the other positions are clean.
+        let binder = binder_with(&[("branched", span(0, 10))]);
+        let decls = [function(
+            "branched",
+            0,
+            10,
+            Vec::new(),
+            Some("number"),
+            switched(
+                vec![lit(InitKind::NonLiteral), lit(InitKind::Number)],
+                Some(lit(InitKind::Number)),
+            ),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("non-literal case return"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn switch_unsupported_declines_with_recorded_reason() {
+        // Frontend-recorded switch declines (fallthrough, complex case,
+        // declarations, non-literal discriminant or label, duplicate
+        // default) surface verbatim — never a verdict.
+        let binder = binder_with(&[("fallen", span(0, 10))]);
+        let decls = [function(
+            "fallen",
+            0,
+            10,
+            Vec::new(),
+            Some("number"),
+            FunctionBody::SwitchUnsupported {
+                reason: "fallthrough case is outside the subset".to_owned(),
+            },
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "fallthrough case is outside the subset"
         );
     }
 
