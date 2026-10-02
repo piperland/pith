@@ -52,11 +52,17 @@
 //! `const`/`let` declarators (per-declarator identity, annotation, and
 //! initializer facts, plus member facts for `{ ... }` initializers) with a
 //! terminal literal `return`, single-level blocks flattened — each position
-//! checks independently solver-side (probed tsc 7.0.2). Bodies without a
+//! checks independently solver-side (probed tsc 7.0.2). P039 try/catch
+//! bodies ([`FunctionBodyFact::TryCatch`]): `try { return A; } catch {
+//! return B; }` with an optional trailing literal `return C;`, each arm
+//! exactly one `return <expr>;` — each position checks independently
+//! solver-side (probed tsc 7.0.2). `finally` clauses, destructured catch
+//! bindings, `throw` statements, and non-single-return arms or tails are
+//! [`FunctionBodyFact::TryUnsupported`] with the recorded reason. Bodies without a
 //! node are
 //! [`FunctionBodyFact::NoBody`], statement-less bodies are
 //! [`FunctionBodyFact::Empty`], and everything else (longer/multi-path
-//! bodies, loops, `switch`, `try`, bare or missing `return`) is
+//! bodies, loops, `switch`, bare or missing `return`) is
 //! [`FunctionBodyFact::Complex`] for the solver to decline. Out of scope, no
 //! facts: function expressions, arrow functions, object methods (class methods,
 //! accessors, and constructors feed class facts instead — see the class
@@ -295,7 +301,7 @@ use oxc_ast::ast::{
     PropertyDefinitionType, PropertyKey, PropertyKind, ReturnStatement, SimpleAssignmentTarget,
     Statement, StaticBlock, TSEnumDeclaration, TSEnumMemberName, TSInterfaceDeclaration,
     TSNamespaceDeclaration, TSPropertySignature, TSSignature, TSType, TSTypeAliasDeclaration,
-    TSTypeAnnotation, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
+    TSTypeAnnotation, TryStatement, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
     VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
@@ -662,8 +668,9 @@ pub struct InnerDeclFact {
 ///
 /// Only [`FunctionBodyFact::SingleReturn`], the P023 joins
 /// ([`FunctionBodyFact::SequenceReturns`], [`FunctionBodyFact::GuardReturn`],
-/// [`FunctionBodyFact::BranchReturns`]), and the P031 straight bodies
-/// ([`FunctionBodyFact::StraightBody`]) feed the solver; every other shape
+/// [`FunctionBodyFact::BranchReturns`]), the P031 straight bodies
+/// ([`FunctionBodyFact::StraightBody`]), and the P039 try/catch bodies
+/// ([`FunctionBodyFact::TryCatch`]) feed the solver; every other shape
 /// declines to a solver `UnsupportedDecl` with a distinct reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBodyFact {
@@ -716,13 +723,38 @@ pub enum FunctionBodyFact {
         /// The terminal `return`'s expression facts.
         tail: SingleReturnFact,
     },
+    /// Exactly one statement, `try { return A; } catch { return B; }`
+    /// (each arm exactly one `return <expr>;`), plus an optional trailing
+    /// literal `return C;`: tsc checks each position independently (probed
+    /// 7.0.2 P039). Any `finally` clause, any destructured catch binding,
+    /// any `throw` statement, and any non-single-return arm or tail never
+    /// reach facts: the body is [`FunctionBodyFact::TryUnsupported`] with
+    /// the reason. A plain `catch (e)` admits structurally (the binding
+    /// carries no facts; a used `return e` classifies `NonLiteral`).
+    TryCatch {
+        /// The `try` block's `return` expression facts.
+        try_branch: SingleReturnFact,
+        /// The `catch` block's `return` expression facts.
+        catch_branch: SingleReturnFact,
+        /// The trailing `return`'s expression facts, when present.
+        tail: Option<SingleReturnFact>,
+    },
+    /// A `try` body outside the checkable [`FunctionBodyFact::TryCatch`]
+    /// shape. The solver declines with `reason` verbatim — never a partial
+    /// verdict over the remaining positions.
+    TryUnsupported {
+        /// Why the `try` body is outside the subset (`finally` clause,
+        /// destructured catch binding, `throw` statement, or a non-straight
+        /// arm/tail).
+        reason: String,
+    },
     /// A body with no statements (directives do not count).
     Empty,
-    /// Anything else: longer/multi-path bodies, loops, `switch`, `try`,
+    /// Anything else: longer/multi-path bodies, loops, `switch`,
     /// `else-if` chains, `if/else` plus a tail return, non-terminal returns,
-    /// `throw` or bare branches, `continue`, bare or missing `return`,
-    /// `var` declarators, spreads/methods/computed keys in a returned
-    /// literal.
+    /// `throw` or bare branches outside `try` arms, `continue`, bare or
+    /// missing `return`, `var` declarators, spreads/methods/computed keys
+    /// in a returned literal.
     Complex,
 }
 
@@ -2081,7 +2113,10 @@ fn return_members(
 /// divergent return plus a tail return, and a lone `if/else` with a return
 /// in each branch. P031 straight bodies (leading `const`/`let` declarators
 /// plus a terminal literal return, single-level blocks flattened) classify
-/// into [`FunctionBodyFact::StraightBody`]. Anything else is
+/// into [`FunctionBodyFact::StraightBody`]. P039 try/catch bodies (a lone
+/// `try` statement, or a `try` statement plus a trailing literal `return`)
+/// classify into [`FunctionBodyFact::TryCatch`] or
+/// [`FunctionBodyFact::TryUnsupported`]. Anything else is
 /// [`FunctionBodyFact::Complex`].
 fn function_body_fact(
     collector: &DeclCollector<'_>,
@@ -2097,7 +2132,9 @@ fn function_body_fact(
         [Statement::IfStatement(it)] => {
             branch_returns(collector, it).unwrap_or(FunctionBodyFact::Complex)
         }
+        [Statement::TryStatement(candidate)] => try_catch_body(collector, candidate, None),
         [first, second] => joined_pair(collector, first, second)
+            .or_else(|| try_tail_pair(collector, first, second))
             .or_else(|| straight_body(collector, body.statements.as_slice()))
             .unwrap_or(FunctionBodyFact::Complex),
         statements => straight_body(collector, statements).unwrap_or(FunctionBodyFact::Complex),
@@ -2479,6 +2516,106 @@ fn branch_returns(collector: &DeclCollector<'_>, it: &IfStatement<'_>) -> Option
         then_branch: single_return_fact(collector, then_arg)?,
         else_branch: single_return_fact(collector, else_arg)?,
     })
+}
+
+/// A `try` statement plus a trailing `return <expr>;`: the tail checks as
+/// another position solver-side (probed 7.0.2 P039). Anything else in
+/// second position yields `None` (the caller falls through to the straight
+/// body, then [`FunctionBodyFact::Complex`]).
+#[must_use]
+fn try_tail_pair(
+    collector: &DeclCollector<'_>,
+    first: &Statement<'_>,
+    second: &Statement<'_>,
+) -> Option<FunctionBodyFact> {
+    let Statement::TryStatement(candidate) = first else {
+        return None;
+    };
+    let Statement::ReturnStatement(tail) = second else {
+        return None;
+    };
+    let argument = tail.argument.as_ref()?;
+    Some(try_catch_body(collector, candidate, Some(argument)))
+}
+
+/// One `try` statement (plus an optional trailing return expression) into
+/// its [`FunctionBodyFact`]: the checkable `try { return A; } catch {
+/// return B; }` shape admits (a plain `catch (e)` binding admits too — it
+/// carries no facts), while `finally` clauses, destructured catch
+/// patterns, `throw` statements, and non-single-return arms or tails
+/// decline with distinct reasons (never a partial verdict).
+fn try_catch_body(
+    collector: &DeclCollector<'_>,
+    candidate: &TryStatement<'_>,
+    tail: Option<&Expression<'_>>,
+) -> FunctionBodyFact {
+    let unsupported = |reason: String| FunctionBodyFact::TryUnsupported { reason };
+    if candidate.finalizer.is_some() {
+        return unsupported("finally clause is outside the subset".to_owned());
+    }
+    let Some(handler) = candidate.handler.as_ref() else {
+        return unsupported("try without catch is outside the subset".to_owned());
+    };
+    if let Some(param) = handler.param.as_ref() {
+        // A plain `catch (e)` admits structurally: the binding carries no
+        // facts, so an unused `e` changes no verdict, while a used
+        // `return e` classifies `NonLiteral` and rides the existing
+        // position-naming decline solver-side. Only destructured patterns
+        // decline (no binding facts exist for patterns).
+        let BindingPattern::BindingIdentifier(_) = &param.pattern else {
+            return unsupported("catch binding is outside the subset".to_owned());
+        };
+    }
+    let try_branch = match try_arm_return(collector, &candidate.block.body, "try") {
+        Ok(fact) => fact,
+        Err(reason) => return unsupported(reason),
+    };
+    let catch_branch = match try_arm_return(collector, &handler.body.body, "catch") {
+        Ok(fact) => fact,
+        Err(reason) => return unsupported(reason),
+    };
+    let tail = match tail {
+        None => None,
+        Some(argument) => match single_return_fact(collector, argument) {
+            Some(fact) => Some(fact),
+            None => {
+                return unsupported(
+                    "non-straight tail return after try/catch is outside the subset".to_owned(),
+                );
+            }
+        },
+    };
+    FunctionBodyFact::TryCatch {
+        try_branch,
+        catch_branch,
+        tail,
+    }
+}
+
+/// The `return <expr>;` of one `try`/`catch` arm: the arm block must hold
+/// exactly one `return` with an argument. `throw` statements decline with
+/// their own reason (the oracle checks `throw` arms, which need control-flow
+/// facts the subset refuses — probed tsc 7.0.2 P039); every other
+/// non-single-return shape declines as a non-straight arm.
+fn try_arm_return(
+    collector: &DeclCollector<'_>,
+    statements: &[Statement<'_>],
+    arm: &str,
+) -> Result<SingleReturnFact, String> {
+    let decline = |detail: &str| format!("{detail} {arm} arm is outside the subset");
+    let [only] = statements else {
+        return Err(decline("non-straight"));
+    };
+    match only {
+        Statement::ReturnStatement(ret) => {
+            let Some(argument) = ret.argument.as_ref() else {
+                return Err(decline("non-straight"));
+            };
+            single_return_fact(collector, argument).ok_or_else(|| decline("non-straight"))
+        }
+        Statement::ThrowStatement(_) => Err(decline("throw statement in")),
+        _ => Err(decline("non-straight")),
+    }
 }
 
 /// Pushes one narrowing decline region onto the collector.
@@ -5028,15 +5165,126 @@ export function f(a: string): string { return a + b; }
                    function looped(n: number): number {\n  for (;;) {\n    return 1;\n  }\n}\n\
                    function switched(n: number): number {\n  switch (n) {\n    case 1:\n      return 1;\n\
                    default:\n      return 2;\n  }\n}\n\
-                   function tried(n: number): number {\n  try {\n    return 1;\n  } catch {\n    return 2;\n  }\n}\n\
                    function continued(n: number): number {\n  while (n > 0) {\n    n = n - 1;\n\
                    continue;\n  }\n  return n;\n}\n";
         let pf = parse_module(FileId(0), "u.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
-        assert_eq!(pf.functions.len(), 8);
+        assert_eq!(pf.functions.len(), 7);
         for fact in &pf.functions {
             assert_eq!(fact.body, FunctionBodyFact::Complex);
         }
+    }
+
+    #[test]
+    fn function_facts_try_catch_admits_per_arm() {
+        let src = "function plain(n: number): number {\n  try {\n    return 1;\n  } catch {\n\
+                    return 2;\n  }\n}\n\
+                    function tailed(n: number): number {\n  try {\n    return 1;\n  } catch {\n\
+                    return 2;\n  }\n  return 3;\n}\n";
+        let pf = parse_module(FileId(0), "t.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let FunctionBodyFact::TryCatch {
+            try_branch,
+            catch_branch,
+            tail,
+        } = &pf.functions[0].body
+        else {
+            panic!("expected try/catch, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(try_branch.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, try_branch.span), "1");
+        assert_eq!(catch_branch.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, catch_branch.span), "2");
+        assert!(tail.is_none());
+        let FunctionBodyFact::TryCatch {
+            try_branch,
+            catch_branch,
+            tail,
+        } = &pf.functions[1].body
+        else {
+            panic!("expected try/catch, got {:?}", pf.functions[1].body);
+        };
+        assert_eq!(try_branch.kind, ReturnKind::Number);
+        assert_eq!(catch_branch.kind, ReturnKind::Number);
+        let tail = tail.as_ref().expect("trailing return");
+        assert_eq!(tail.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tail.span), "3");
+    }
+
+    #[test]
+    fn function_facts_try_unsupported_reasons_are_distinct() {
+        let src = "function fin(n: number): number {\n  try {\n    return 1;\n  } catch {\n\
+                    return 2;\n  } finally {\n    return 3;\n  }\n}\n\
+                    function destr(n: number): number {\n  try {\n    return 1;\n  } catch ({ m }) {\n\
+                    return 2;\n  }\n}\n\
+                    function thrown(n: number): number {\n  try {\n    throw new Error(\"x\");\n\
+                    } catch {\n    return 2;\n  }\n}\n\
+                    function caught(n: number): number {\n  try {\n    return 1;\n  } catch {\n\
+                    throw new Error(\"x\");\n  }\n}\n\
+                    function multi(n: number): number {\n  try {\n    return 1;\n    return 2;\n\
+                    } catch {\n    return 3;\n  }\n}\n\
+                    function bare(n: number): number {\n  try {\n    return;\n  } catch {\n\
+                    return 2;\n  }\n}\n";
+        let pf = parse_module(FileId(0), "d.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 6);
+        let reasons: Vec<&str> = pf
+            .functions
+            .iter()
+            .map(|fact| {
+                let FunctionBodyFact::TryUnsupported { reason } = &fact.body else {
+                    panic!("expected try-unsupported, got {:?}", fact.body);
+                };
+                reason.as_str()
+            })
+            .collect();
+        assert_eq!(reasons[0], "finally clause is outside the subset");
+        assert_eq!(reasons[1], "catch binding is outside the subset");
+        assert_eq!(
+            reasons[2],
+            "throw statement in try arm is outside the subset"
+        );
+        assert_eq!(
+            reasons[3],
+            "throw statement in catch arm is outside the subset"
+        );
+        assert_eq!(reasons[4], "non-straight try arm is outside the subset");
+        assert_eq!(reasons[5], "non-straight try arm is outside the subset");
+    }
+
+    #[test]
+    fn function_facts_try_plain_binding_admits_per_use() {
+        // A plain `catch (e)` admits structurally either way: an unused
+        // `e` leaves literal arms (solver-silent), while a used `return e`
+        // classifies `NonLiteral` (the solver's position-naming gate owns
+        // the decline — no new facts here).
+        let src = "function unused(n: number): number {\n  try {\n    return 1;\n  } catch (e) {\n\
+                    return 2;\n  }\n}\n\
+                    function used(n: number): number {\n  try {\n    return 1;\n  } catch (e) {\n\
+                    return e;\n  }\n}\n";
+        let pf = parse_module(FileId(0), "b.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let FunctionBodyFact::TryCatch { catch_branch, .. } = &pf.functions[0].body else {
+            panic!("expected try/catch, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(catch_branch.kind, ReturnKind::Number);
+        let FunctionBodyFact::TryCatch { catch_branch, .. } = &pf.functions[1].body else {
+            panic!("expected try/catch, got {:?}", pf.functions[1].body);
+        };
+        assert_eq!(catch_branch.kind, ReturnKind::NonLiteral);
+        assert_eq!(slice_of(src, catch_branch.span), "e");
+    }
+
+    #[test]
+    fn function_facts_try_with_non_return_second_stays_complex() {
+        let src = "function leaked(n: number): number {\n  try {\n    return 1;\n  } catch {\n\
+                    return 2;\n  }\n  const x: number = 1;\n}\n";
+        let pf = parse_module(FileId(0), "c.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        assert_eq!(pf.functions[0].body, FunctionBodyFact::Complex);
     }
 
     #[test]
