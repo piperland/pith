@@ -41,6 +41,13 @@
 //! unsupported note) and `try-binding-used` (the oracle errors `TS2322`
 //! on `unknown` where the subset rides the non-literal arm gate — silent
 //! plus one unsupported note).
+//! Switch bodies check per case plus the optional default (P040):
+//! `switch-clean` is silent with zero notes; `switch-case-wrong` and
+//! `switch-default-wrong` match their oracle `TS2322`s; `switch-two-wrong`
+//! matches twice. Two more fixtures diverge by design (the oracle is clean
+//! where the subset declines — each pins the clean baseline plus one
+//! unsupported note): `switch-fallthrough-declined` and
+//! `switch-complex-case-declined`.
 //! One fixture still diverges by design
 //! (the oracle errors where the subset declines): `unannotated-param`
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
@@ -58,7 +65,7 @@ use pith_queries::QueryDb;
 use pith_solver::{
     check_functions, CastInput, CastKind, DeclKind, FileReport, FunctionBody, FunctionDecl,
     FunctionParam, FunctionReturn, InitKind, InnerDecl, JoinedReturns, ObjectInit,
-    ObjectMemberInit, ObjectMemberKind, StraightBody, TryCatchBody,
+    ObjectMemberInit, ObjectMemberKind, StraightBody, SwitchBody, TryCatchBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -308,6 +315,17 @@ fn map_try_catch(
     }
 }
 
+/// Maps one frontend switch body to the solver's: one return per case in
+/// source order plus the optional default return, each through
+/// [`map_function_return`] (same `init_array: None` seam as every other
+/// return position).
+fn map_switch(cases: &[FrontendReturn], default: Option<&FrontendReturn>) -> SwitchBody {
+    SwitchBody {
+        cases: cases.iter().map(map_function_return).collect(),
+        default: default.map(map_function_return),
+    }
+}
+
 /// Scope-sensitive span + identity for one function declarator, mirroring
 /// the check-const driver's fallback: `symbol` indexes
 /// `ParsedFile.symbols`, resolved through the binder from the fact's scope.
@@ -362,7 +380,13 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                     catch_branch,
                     tail,
                 } => FunctionBody::TryCatch(map_try_catch(try_branch, catch_branch, tail.as_ref())),
+                FunctionBodyFact::Switch { cases, default } => {
+                    FunctionBody::Switch(map_switch(cases, default.as_ref()))
+                }
                 FunctionBodyFact::TryUnsupported { reason } => FunctionBody::TryUnsupported {
+                    reason: reason.clone(),
+                },
+                FunctionBodyFact::SwitchUnsupported { reason } => FunctionBody::SwitchUnsupported {
                     reason: reason.clone(),
                 },
                 FunctionBodyFact::NoBody { declared } => FunctionBody::NoBody {
@@ -610,6 +634,30 @@ fixture_test!(
     "try-binding-unused.expected.txt",
     0
 );
+fixture_test!(
+    switch_clean_is_silent,
+    "switch-clean.ts",
+    "switch-clean.expected.txt",
+    0
+);
+fixture_test!(
+    switch_case_wrong_matches_ts2322,
+    "switch-case-wrong.ts",
+    "switch-case-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    switch_default_wrong_matches_ts2322,
+    "switch-default-wrong.ts",
+    "switch-default-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    switch_two_wrong_matches_ts2322_twice,
+    "switch-two-wrong.ts",
+    "switch-two-wrong.expected.txt",
+    0
+);
 
 #[test]
 fn straight_identifier_init_divergence_pins_ts2322() {
@@ -650,7 +698,7 @@ fn straight_identifier_init_divergence_pins_ts2322() {
 fn expect_clean_oracle_decline(name: &str, source: &str, expected: &str, reason: &str) {
     assert!(
         parse_baseline(expected).is_empty(),
-        "{name}: oracle is clean on this try/catch decline"
+        "{name}: oracle is clean on this decline"
     );
     let (_, report) = run_pipeline(source);
     assert!(
@@ -662,6 +710,33 @@ fn expect_clean_oracle_decline(name: &str, source: &str, expected: &str, reason:
     assert_eq!(
         report.unsupported[0].reason, reason,
         "{name}: recorded reason"
+    );
+}
+
+#[test]
+fn switch_fallthrough_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: an empty
+    // `case` falls through in tsc (probed 7.0.2 P040) while the solver
+    // records one unsupported note with the frontend's recorded reason.
+    expect_clean_oracle_decline(
+        "switch_fallthrough_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/switch-fallthrough-declined.ts"),
+        include_str!("../../../corpus/check-functions/switch-fallthrough-declined.expected.txt"),
+        "fallthrough case is outside the subset",
+    );
+}
+
+#[test]
+fn switch_complex_case_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: extra
+    // statements before a case return need flow facts (probed 7.0.2 P040)
+    // while the solver records one unsupported note with the frontend's
+    // recorded reason.
+    expect_clean_oracle_decline(
+        "switch_complex_case_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/switch-complex-case-declined.ts"),
+        include_str!("../../../corpus/check-functions/switch-complex-case-declined.expected.txt"),
+        "complex case is outside the subset",
     );
 }
 

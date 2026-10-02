@@ -214,6 +214,8 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 FunctionBodyFact::StraightBody { .. }
                 | FunctionBodyFact::TryCatch { .. }
                 | FunctionBodyFact::TryUnsupported { .. }
+                | FunctionBodyFact::Switch { .. }
+                | FunctionBodyFact::SwitchUnsupported { .. }
                 | FunctionBodyFact::Complex => FunctionBody::Complex,
             };
             FunctionDecl {
