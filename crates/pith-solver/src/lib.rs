@@ -95,8 +95,8 @@
 //! - A non-literal position declines the whole declaration with a
 //!   position-naming reason (never a partial verdict); loops,
 //!   `else-if` chains, `if/else` plus a tail return, `throw`/bare
-//!   branches outside `try` arms, `continue`, and bare returns stay
-//!   [`FunctionBody::Complex`]
+//!   branches outside admitted throw positions (P043), `continue`, and bare
+//!   returns stay [`FunctionBody::Complex`]
 //!   with the control-flow reason. `switch` bodies classify P040 (each
 //!   `case` plus the optional `default` exactly one `return <expr>;`):
 //!   fallthrough, complex cases, case-level declarations, non-literal
@@ -204,6 +204,32 @@
 //!   positions check as if each runs once, so a `return i` over the loop
 //!   variable rides the existing non-literal position gate (whole-decl
 //!   decline, 0 diagnostics, where tsc types the value).
+//!
+//! Throw positions (P043, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p043-probes/`):
+//!
+//! - `throw` accepts any value: `throw new Error("x")` and `throw "s"` are
+//!   both clean, so a throw position emits no verdict and carries no facts.
+//!   A throw-only body is clean in tsc (no missing-return family under
+//!   `--strict`), so it admits silently with zero positions.
+//! - `if (c) throw ...; return <t>;` checks the tail exactly like the P023
+//!   guard tail it mirrors (a wrong tail reports one `TS2322`; block-wrapped
+//!   throws classify identically; any condition qualifies). The mirror
+//!   (`if (c) return ...; throw ...;`) and `if/else` with a throw branch
+//!   stay [`FunctionBody::Complex`] (both clean in tsc — pinned
+//!   oracle-clean divergences, like the P039 `finally` decline).
+//! - Straight bodies admit `throw` statements anywhere in the sequence:
+//!   leading declarators and the terminal return check independently (a
+//!   wrong inner and a wrong tail each report once), unreachable returns
+//!   after a throw still check (the P023 precedent), and a terminal `throw`
+//!   leaves no tail while leadings still check. Throws count toward the
+//!   four-item cap (they are statements too).
+//! - Throw inside otherwise-complex surroundings still declines whole-decl
+//!   with a distinct reason: `throw` arms in `try`/`catch` (P039
+//!   `TryUnsupported`), `throw` cases or defaults in `switch` (P040
+//!   `SwitchUnsupported`), and any other multi-path body
+//!   ([`FunctionBody::Complex`]) — never a partial verdict over the
+//!   remaining positions.
 //!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
@@ -1066,10 +1092,11 @@ pub struct StraightBody {
 /// P031 [`FunctionBody::StraightBody`] delegates each leading declarator
 /// plus the terminal return the same way, as does the P039
 /// [`FunctionBody::TryCatch`] per arm (plus the optional tail), the P040
-/// [`FunctionBody::Switch`] per case (plus the optional default), and the
-/// P041 [`FunctionBody::CountedFor`] per position (loop body plus the
-/// optional tail); the rest decline to [`UnsupportedDecl`] with distinct
-/// reasons.
+/// [`FunctionBody::Switch`] per case (plus the optional default), the P041
+/// [`FunctionBody::CountedFor`] per position (loop body plus the optional
+/// tail), the P043 [`FunctionBody::GuardThrow`] tail, and the P043
+/// [`FunctionBody::StraightThrow`] leadings (plus the optional tail); the
+/// rest decline to [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
     /// Exactly one statement, `return <expr>;` with an argument.
@@ -1111,6 +1138,19 @@ pub enum FunctionBody {
     /// independently (probed 7.0.2 P031). Each position delegates through
     /// its own synthetic [`ConstDecl`].
     StraightBody(StraightBody),
+    /// Exactly two statements, `if (c) throw ...;` with no `else` plus a
+    /// trailing `return <expr>;`: tsc checks the tail return while the throw
+    /// accepts any value (probed 7.0.2 P043). The throw emits no verdict and
+    /// carries no facts; the tail delegates through its synthetic
+    /// [`ConstDecl`] exactly like the P023 guard tail.
+    GuardThrow(GuardThrowBody),
+    /// A straight-line body holding at least one `throw`: leading
+    /// `const`/`let` declarators (blocks flattened) with a terminal literal
+    /// `return` or a terminal `throw`. Throws emit no verdict and carry no
+    /// facts; each other position delegates through its own synthetic
+    /// [`ConstDecl`] exactly like [`FunctionBody::StraightBody`] (a lone
+    /// `throw` is the empty, tail-less form and checks silently).
+    StraightThrow(StraightThrowBody),
     /// No body node: `declared` tells `declare function` apart from an
     /// overload signature.
     NoBody {
@@ -1147,8 +1187,8 @@ pub enum FunctionBody {
     },
     /// Anything else: longer/multi-path bodies (including a loop or `switch`
     /// statement paired with a non-return statement), `else-if` chains,
-    /// `if/else` plus a tail return, `throw`/bare branches outside `try`
-    /// arms, `continue`, bare or missing `return`.
+    /// `if/else` plus a tail return, `throw`/bare branches outside admitted
+    /// throw positions, `continue`, bare or missing `return`.
     Complex,
 }
 
@@ -1226,6 +1266,35 @@ pub struct CountedForBody {
     pub tail: Option<FunctionReturn>,
 }
 
+/// A checkable guard-throw body (P043): the trailing `return` after an
+/// `if`-without-`else` guard `throw`, checked through the same synthetic
+/// delegation as the P023 guard tail (no fixpoint, single pass).
+///
+/// Driver-mapped from the adapter's guard-throw fact variant (mechanical
+/// field copies, each position exactly like [`FunctionReturn`]). The guard
+/// throw carries no facts: `throw` accepts any value in tsc (probed 7.0.2),
+/// so the position emits no verdict and needs no span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardThrowBody {
+    /// The trailing `return`'s expression facts.
+    pub tail: FunctionReturn,
+}
+
+/// A checkable straight-with-throw body (P043): leading declarators plus an
+/// optional terminal return, with at least one `throw` skipped
+/// classification-side (throws emit no verdict and carry no facts — probed
+/// 7.0.2). Each recorded position delegates through its own synthetic
+/// [`ConstDecl`] with its own occurrence node, exactly like [`StraightBody`]
+/// (no fixpoint, single pass).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StraightThrowBody {
+    /// Leading declarator positions in source order (blocks flattened).
+    pub leading: Vec<InnerDecl>,
+    /// The terminal `return` position, when present (a terminal `throw`
+    /// leaves no tail to check).
+    pub tail: Option<FunctionReturn>,
+}
+
 /// One `function name(params): ret` declaration to check.
 ///
 /// `name`/`span`/`scope`/`symbol` locate the declaration exactly like
@@ -1258,7 +1327,8 @@ pub struct FunctionDecl {
     /// Raw return annotation text; `None` means unannotated.
     pub return_annotation: Option<String>,
     /// Body shape; single returns, the three P023 joins, P031 straight
-    /// bodies, P039 try/catch bodies, and P040 switch bodies are checkable.
+    /// bodies, P039 try/catch bodies, P040 switch bodies, P041 counted-`for`
+    /// bodies, and P043 throw bodies are checkable.
     pub body: FunctionBody,
 }
 
@@ -1922,8 +1992,8 @@ fn sort_report(report: &mut FileReport) {
 /// return annotation, then non-straight-line bodies all decline to
 /// [`UnsupportedDecl`]. Checkable declarations (identifier params all
 /// annotated, return annotated, single literal `return`, one of the three
-/// P023 joins, a P031 straight body, a P039 try/catch, a P040 switch, or a
-/// P041 counted-`for`)
+/// P023 joins, a P031 straight body, a P039 try/catch, a P040 switch, a
+/// P041 counted-`for`, or a P043 guard-throw or straight-with-throw)
 /// delegate to the same [`check_one`]
 /// path as [`check_file`]
 /// through synthetic [`ConstDecl`]s — one per return position, each with its
@@ -2176,6 +2246,48 @@ fn shape_counted_for(
     Ok(positions)
 }
 
+/// Shapes one guard-throw body for [`function_shape`]: the tail return —
+/// one [`SynthReturn`] through the same synthetic delegation as the P023
+/// guard tail (the guard throw emits no verdict and carries no facts — see
+/// the module-level throw rules).
+fn shape_guard_throw(
+    decl: &FunctionDecl,
+    body: &GuardThrowBody,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    Ok(vec![shape_return(
+        &body.tail,
+        "tail return",
+        return_site(decl, effective),
+    )?])
+}
+
+/// Shapes one straight-with-throw body for [`function_shape`]: leading
+/// declarators (unannotated cast-less ones skipped, exactly like
+/// [`FunctionBody::StraightBody`]) plus the terminal return when present —
+/// one [`SynthReturn`] per recorded position in source order (throws emit
+/// no verdict and carry no facts — see the module-level throw rules).
+fn shape_straight_throw(
+    decl: &FunctionDecl,
+    body: &StraightThrowBody,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    let mut positions = Vec::with_capacity(body.leading.len().saturating_add(1));
+    for inner in &body.leading {
+        if let Some(position) = shape_leading(inner) {
+            positions.push(position);
+        }
+    }
+    if let Some(tail) = body.tail.as_ref() {
+        positions.push(shape_return(
+            tail,
+            "tail return",
+            return_site(decl, effective),
+        )?);
+    }
+    Ok(positions)
+}
+
 /// Gates one function declaration: `Ok` carries the [`ShapedBody`] (one
 /// [`SynthReturn`] per checkable position, in source order);
 /// `Err` carries the unsupported reason.
@@ -2223,6 +2335,8 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         FunctionBody::TryCatch(body) => shape_try_catch(decl, body, &effective)?,
         FunctionBody::Switch(body) => shape_switch(decl, body, &effective)?,
         FunctionBody::CountedFor(body) => shape_counted_for(decl, body, &effective)?,
+        FunctionBody::GuardThrow(body) => shape_guard_throw(decl, body, &effective)?,
+        FunctionBody::StraightThrow(body) => shape_straight_throw(decl, body, &effective)?,
         FunctionBody::StraightBody(straight) => {
             let mut positions = Vec::with_capacity(straight.leading.len().saturating_add(1));
             for inner in &straight.leading {
@@ -3950,7 +4064,9 @@ fn check_generic_decl(
         | FunctionBody::Switch(_)
         | FunctionBody::SwitchUnsupported { .. }
         | FunctionBody::CountedFor(_)
-        | FunctionBody::LoopUnsupported { .. } => {
+        | FunctionBody::LoopUnsupported { .. }
+        | FunctionBody::GuardThrow(_)
+        | FunctionBody::StraightThrow(_) => {
             // Joined and straight returns over a bare type parameter need
             // per-position instantiation the subset refuses: decline like
             // complex bodies.
