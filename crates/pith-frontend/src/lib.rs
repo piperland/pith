@@ -2600,7 +2600,10 @@ impl DeclCollector<'_> {
     }
 
     /// Records one declarator when it is a `const` identifier binding.
-    /// Destructured patterns bind many symbols and are skipped.
+    /// Destructured patterns bind many symbols and are skipped. Same-name
+    /// same-scope redeclarations oxc merges into the first symbol (type
+    /// alias + const, like overloads) fall back to
+    /// [`nearest_preceding_symbol`], mirroring [`record_function`].
     fn record_declarator(&mut self, declarator: &VariableDeclarator<'_>) {
         let BindingPattern::BindingIdentifier(binding) = &declarator.id else {
             return;
@@ -2608,7 +2611,12 @@ impl DeclCollector<'_> {
         let name = slice_at(self.source, binding.span);
         let Some(name) = name else { return };
         self.note_exported(name);
-        let Some(&symbol) = self.symbols.get(&(name.to_owned(), binding.span.start)) else {
+        let Some(symbol) = self
+            .symbols
+            .get(&(name.to_owned(), binding.span.start))
+            .copied()
+            .or_else(|| nearest_preceding_symbol(&self.symbols, name, binding.span.start))
+        else {
             // No matching symbol (only possible with recovery from parse
             // errors): skip rather than invent a key.
             return;
@@ -5787,8 +5795,11 @@ export function f(a: string): string { return a + b; }
     #[test]
     fn interface_facts_merged_value_links_one_symbol() {
         // `interface Foo` plus `const Foo` pre-merge in oxc (see the
-        // module-level merge note): one symbol at the first declaration, no
-        // decl fact for the const (exact `(name, start)` miss).
+        // module-level merge note): one symbol at the first declaration.
+        // The const links that merged symbol via
+        // `nearest_preceding_symbol` (P038: mirrors `record_function`) so
+        // the solver sees the value instead of dropping the fact — the
+        // merged span anchors at the first declaration, like overloads.
         let src = "interface Foo { a: string; }\nconst Foo = 42;\n";
         let pf = parse_module(FileId(0), "m.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
@@ -5805,7 +5816,10 @@ export function f(a: string): string { return a + b; }
         assert_eq!(fact.members.len(), 1);
         assert_eq!(fact.members[0].name, "a");
         assert!(fact.members[0].complex_reason.is_none());
-        assert!(pf.decls.is_empty(), "merged const emits no decl fact");
+        assert_eq!(pf.decls.len(), 1, "merged const links the merged symbol");
+        let decl = &pf.decls[0];
+        assert_eq!(decl.symbol, fact.symbol);
+        assert!(decl.annotation.is_none(), "const Foo is unannotated");
     }
 
     #[test]
