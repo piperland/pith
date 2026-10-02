@@ -31,6 +31,16 @@
 //! oracle errors where the subset declines): `straight-identifier-init`
 //! (oracle `TS2322` on an identifier-initialized inner declarator —
 //! pinned explicitly like `unannotated-param` below).
+//! Try/catch bodies check per arm plus the optional tail (P039):
+//! `try-clean` (incl. the clean tail) and `try-binding-unused` (plain
+//! `catch (e)`, `e` unused) are silent with zero notes; `try-try-wrong`,
+//! `try-catch-wrong`, and `try-tail-wrong` match their oracle `TS2322`s;
+//! `try-both-wrong` matches twice. Three more fixtures diverge by design:
+//! `try-finally-declined` and `try-throw-declined` (the oracle is clean
+//! where the subset declines — each pins the clean baseline plus one
+//! unsupported note) and `try-binding-used` (the oracle errors `TS2322`
+//! on `unknown` where the subset rides the non-literal arm gate — silent
+//! plus one unsupported note).
 //! One fixture still diverges by design
 //! (the oracle errors where the subset declines): `unannotated-param`
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
@@ -48,7 +58,7 @@ use pith_queries::QueryDb;
 use pith_solver::{
     check_functions, CastInput, CastKind, DeclKind, FileReport, FunctionBody, FunctionDecl,
     FunctionParam, FunctionReturn, InitKind, InnerDecl, JoinedReturns, ObjectInit,
-    ObjectMemberInit, ObjectMemberKind, StraightBody,
+    ObjectMemberInit, ObjectMemberKind, StraightBody, TryCatchBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -282,6 +292,22 @@ fn map_straight(
     }
 }
 
+/// Maps one frontend try/catch body to the solver's: one return per arm
+/// plus the optional trailing return, each through [`map_function_return`]
+/// (array returns keep the shared `init_array: None` seam, so they ride
+/// the same non-literal decline as every other return position).
+fn map_try_catch(
+    try_branch: &FrontendReturn,
+    catch_branch: &FrontendReturn,
+    tail: Option<&FrontendReturn>,
+) -> TryCatchBody {
+    TryCatchBody {
+        try_branch: map_function_return(try_branch),
+        catch_branch: map_function_return(catch_branch),
+        tail: tail.map(map_function_return),
+    }
+}
+
 /// Scope-sensitive span + identity for one function declarator, mirroring
 /// the check-const driver's fallback: `symbol` indexes
 /// `ParsedFile.symbols`, resolved through the binder from the fact's scope.
@@ -331,6 +357,14 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 FunctionBodyFact::StraightBody { leading, tail } => {
                     FunctionBody::StraightBody(map_straight(parsed, binder, leading, tail))
                 }
+                FunctionBodyFact::TryCatch {
+                    try_branch,
+                    catch_branch,
+                    tail,
+                } => FunctionBody::TryCatch(map_try_catch(try_branch, catch_branch, tail.as_ref())),
+                FunctionBodyFact::TryUnsupported { reason } => FunctionBody::TryUnsupported {
+                    reason: reason.clone(),
+                },
                 FunctionBodyFact::NoBody { declared } => FunctionBody::NoBody {
                     declared: *declared,
                 },
@@ -540,6 +574,42 @@ fixture_test!(
     "straight-unannotated-cast.expected.txt",
     0
 );
+fixture_test!(
+    try_clean_is_silent,
+    "try-clean.ts",
+    "try-clean.expected.txt",
+    0
+);
+fixture_test!(
+    try_try_wrong_matches_ts2322,
+    "try-try-wrong.ts",
+    "try-try-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    try_catch_wrong_matches_ts2322,
+    "try-catch-wrong.ts",
+    "try-catch-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    try_both_wrong_matches_ts2322_twice,
+    "try-both-wrong.ts",
+    "try-both-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    try_tail_wrong_matches_ts2322,
+    "try-tail-wrong.ts",
+    "try-tail-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    try_binding_unused_is_silent,
+    "try-binding-unused.ts",
+    "try-binding-unused.expected.txt",
+    0
+);
 
 #[test]
 fn straight_identifier_init_divergence_pins_ts2322() {
@@ -569,6 +639,86 @@ fn straight_identifier_init_divergence_pins_ts2322() {
         report.unsupported[0]
             .reason
             .contains("non-literal initializer"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+/// Asserts a clean-oracle try/catch decline: the recorded baseline pins
+/// the oracle side (no diagnostics), while the pipeline stays silent with
+/// exactly one unsupported note carrying the recorded reason.
+fn expect_clean_oracle_decline(name: &str, source: &str, expected: &str, reason: &str) {
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "{name}: oracle is clean on this try/catch decline"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "{name}: diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1, "{name}: one decline note");
+    assert_eq!(
+        report.unsupported[0].reason, reason,
+        "{name}: recorded reason"
+    );
+}
+
+#[test]
+fn try_finally_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: tsc checks
+    // `finally` returns (probed 7.0.2 P039) while the solver records one
+    // unsupported note with the frontend's recorded reason.
+    expect_clean_oracle_decline(
+        "try_finally_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/try-finally-declined.ts"),
+        include_str!("../../../corpus/check-functions/try-finally-declined.expected.txt"),
+        "finally clause is outside the subset",
+    );
+}
+
+#[test]
+fn try_throw_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: a `throw`
+    // arm is clean in tsc (probed 7.0.2 P039) while the solver records one
+    // unsupported note with the frontend's recorded reason.
+    expect_clean_oracle_decline(
+        "try_throw_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/try-throw-declined.ts"),
+        include_str!("../../../corpus/check-functions/try-throw-declined.expected.txt"),
+        "throw statement in try arm is outside the subset",
+    );
+}
+
+#[test]
+fn try_binding_used_declines_through_non_literal_gate() {
+    // By design the subset declines where the oracle errors: tsc types the
+    // caught binding as `unknown` and reports `TS2322` on `return e`,
+    // while the solver classifies the arm `NonLiteral` and rides the
+    // existing position-naming gate — whole-decl decline, zero
+    // diagnostics, no new facts.
+    let source = include_str!("../../../corpus/check-functions/try-binding-used.ts");
+    let expected = include_str!("../../../corpus/check-functions/try-binding-used.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'unknown' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("non-literal catch return"),
         "reason: {}",
         report.unsupported[0].reason
     );

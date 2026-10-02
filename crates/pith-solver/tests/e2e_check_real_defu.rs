@@ -286,10 +286,12 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 FunctionBodyFact::Empty => FunctionBody::Empty,
                 // P031 straight bodies decline here: no fixture in this
                 // suite holds one, so outcomes are unchanged; faithful
-                // mapping lives in e2e_check_functions.
-                FunctionBodyFact::StraightBody { .. } | FunctionBodyFact::Complex => {
-                    FunctionBody::Complex
-                }
+                // mapping lives in e2e_check_functions. P039 try/catch
+                // bodies decline the same way.
+                FunctionBodyFact::StraightBody { .. }
+                | FunctionBodyFact::TryCatch { .. }
+                | FunctionBodyFact::TryUnsupported { .. }
+                | FunctionBodyFact::Complex => FunctionBody::Complex,
             };
             FunctionDecl {
                 name,
