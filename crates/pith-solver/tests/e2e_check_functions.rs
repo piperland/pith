@@ -57,6 +57,15 @@
 //! note) and `for-while-declined` plus `for-complex-body-declined` (the
 //! oracle is clean where the subset declines — each pins the clean baseline
 //! plus one unsupported note).
+//! Throw bodies check their non-throw positions while throws emit no
+//! verdict (P043): `throw-guard-clean` (guard throw plus tail),
+//! `throw-straight-clean` (mid-sequence throw), and `throw-only` are silent
+//! with zero notes; `throw-guard-tail-wrong`, `throw-straight-inner-wrong`,
+//! `throw-straight-tail-wrong`, and `throw-terminal-inner-wrong` (terminal
+//! throw, no tail return) match their oracle `TS2322`s. One more fixture
+//! diverges by design: `throw-complex-declined` (the oracle is clean where
+//! the subset declines — pins the clean baseline plus one unsupported
+//! note).
 //! One fixture still diverges by design
 //! (the oracle errors where the subset declines): `unannotated-param`
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
@@ -73,8 +82,9 @@ use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
     check_functions, CastInput, CastKind, CountedForBody, DeclKind, FileReport, FunctionBody,
-    FunctionDecl, FunctionParam, FunctionReturn, InitKind, InnerDecl, JoinedReturns, ObjectInit,
-    ObjectMemberInit, ObjectMemberKind, StraightBody, SwitchBody, TryCatchBody,
+    FunctionDecl, FunctionParam, FunctionReturn, GuardThrowBody, InitKind, InnerDecl,
+    JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind, StraightBody, StraightThrowBody,
+    SwitchBody, TryCatchBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -346,6 +356,25 @@ fn map_counted_for(body: &FrontendReturn, tail: Option<&FrontendReturn>) -> Coun
     }
 }
 
+/// Maps one frontend straight-with-throw body to the solver's: leading
+/// declarators in source order plus the optional terminal return (throws
+/// carry no facts — see the module-level P043 throw rules). The lone
+/// `throw` is the empty, tail-less form.
+fn map_straight_throw(
+    parsed: &ParsedFile,
+    binder: &Binder,
+    leading: &[FrontendInnerDecl],
+    tail: Option<&FrontendReturn>,
+) -> StraightThrowBody {
+    StraightThrowBody {
+        leading: leading
+            .iter()
+            .map(|inner| map_inner_decl(parsed, binder, inner))
+            .collect(),
+        tail: tail.map(map_function_return),
+    }
+}
+
 /// Scope-sensitive span + identity for one function declarator, mirroring
 /// the check-const driver's fallback: `symbol` indexes
 /// `ParsedFile.symbols`, resolved through the binder from the fact's scope.
@@ -406,6 +435,12 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 FunctionBodyFact::CountedFor { body, tail } => {
                     FunctionBody::CountedFor(map_counted_for(body, tail.as_ref()))
                 }
+                FunctionBodyFact::GuardThrow { tail } => FunctionBody::GuardThrow(GuardThrowBody {
+                    tail: map_function_return(tail),
+                }),
+                FunctionBodyFact::StraightThrow { leading, tail } => FunctionBody::StraightThrow(
+                    map_straight_throw(parsed, binder, leading, tail.as_ref()),
+                ),
                 FunctionBodyFact::TryUnsupported { reason } => FunctionBody::TryUnsupported {
                     reason: reason.clone(),
                 },
@@ -702,6 +737,48 @@ fixture_test!(
     "for-zero-trip.expected.txt",
     0
 );
+fixture_test!(
+    throw_guard_clean_is_silent,
+    "throw-guard-clean.ts",
+    "throw-guard-clean.expected.txt",
+    0
+);
+fixture_test!(
+    throw_guard_tail_wrong_matches_ts2322,
+    "throw-guard-tail-wrong.ts",
+    "throw-guard-tail-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    throw_straight_clean_is_silent,
+    "throw-straight-clean.ts",
+    "throw-straight-clean.expected.txt",
+    0
+);
+fixture_test!(
+    throw_straight_inner_wrong_matches_ts2322,
+    "throw-straight-inner-wrong.ts",
+    "throw-straight-inner-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    throw_straight_tail_wrong_matches_ts2322,
+    "throw-straight-tail-wrong.ts",
+    "throw-straight-tail-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    throw_terminal_inner_wrong_matches_ts2322,
+    "throw-terminal-inner-wrong.ts",
+    "throw-terminal-inner-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    throw_only_is_silent,
+    "throw-only.ts",
+    "throw-only.expected.txt",
+    0
+);
 
 #[test]
 fn straight_identifier_init_divergence_pins_ts2322() {
@@ -934,6 +1011,21 @@ fn for_tail_wrong_matches_ts2322() {
         )],
     );
     assert!(report.unsupported.is_empty());
+}
+
+#[test]
+fn throw_complex_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: an `if/else`
+    // with a throw branch is clean in tsc (probed 7.0.2 P043) while the
+    // solver records one unsupported note with the complex-body reason —
+    // throw positions outside guard-throw/straight shapes never verdict
+    // partially.
+    expect_clean_oracle_decline(
+        "throw_complex_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/throw-complex-declined.ts"),
+        include_str!("../../../corpus/check-functions/throw-complex-declined.expected.txt"),
+        "complex body on 'branchThrow': control flow is outside the subset",
+    );
 }
 
 #[test]
