@@ -100,3 +100,26 @@ declarations, non-literal discriminants or labels, duplicate defaults.
 A missing `default` admits (tsc's `TS2366` exhaustiveness error is a
 pinned gap — no corpus fixture). Probes in
 `.agent/scratch/p040-probes/`.
+
+## P041 counted-`for` bodies
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| for-clean.ts | clean | silent, 0 notes (body + tail per position) |
+| for-body-wrong.ts | 1x TS2322 (loop body) | 1x PITH2322 |
+| for-zero-trip.ts | 1x TS2322 (zero-trip body still reports) | 1x PITH2322 (trips unmodeled) |
+| for-nonliteral-bound-declined.ts | 1x TS2322 (`i < n`) | silent + 1 UNSUPPORTED (pinned divergence) |
+| for-while-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| for-complex-body-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+
+Differential: 6/6 match-or-pin (3 diagnostic/silent pairs + 2 pinned
+oracle-clean divergences — `while` loops and multi-statement bodies need
+flow facts the subset refuses — + 1 pinned oracle-error divergence: a
+non-literal bound needs value-type facts). The loop body plus the
+optional tail checks independently through the same synthetic delegation
+as joins (no fixpoint, single pass — loop-carried verdicts are an
+explicit pinned gap). Still declining by design with distinct recorded
+reasons: non-literal bounds, non-numeric bounds, non-idiom headers,
+non-`for` loops, infinite `for(;;)`, `break`/`continue` bodies, complex
+bodies/tails (unit-pinned). Probes in
+`.agent/scratch/p041-probes/`.
