@@ -1,0 +1,1 @@
+try-binding-used.ts:TS2322: Type 'unknown' is not assignable to type 'number'.

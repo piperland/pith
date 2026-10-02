@@ -23,8 +23,9 @@ Differential: 9/9 match on the straight-line-plus-joins subset (4 silent/clean +
 divergence pinned explicitly (oracle errors, solver silent + 1 UNSUPPORTED) —
 the implicit-any rule is an acknowledged non-goal, never a silent gap.
 Unreachable returns still check (probed tsc 7.0.2: a wrong unreachable return
-still reports); loops, `switch`, `try`, `else-if` chains, `if/else` plus a tail
-return, `throw`/bare branches, and `continue` still decline (unit-pinned).
+still reports); loops, `switch`, `else-if` chains, `if/else` plus a tail
+return, `throw`/bare branches outside `try` arms, and `continue` still decline
+(unit-pinned).
 
 Out of scope (no facts, solver never sees them): function expressions,
 arrow functions, object/class methods, accessors, constructors,
@@ -51,4 +52,29 @@ Differential: 8/8 match-or-pin on the straight subset (7 diagnostic/silent
 pairs + 1 pinned oracle-error divergence — identifier initializers need
 value-type facts). Still declining by design: `var`, destructured
 bindings, deeper nesting, non-terminal returns, bodies past the four-item
-cap, and every P023-era exclusion (loops, `switch`, `try`, joins-plus-tail).
+cap, and every P023-era exclusion (loops, `switch`, joins-plus-tail).
+
+## P039 try/catch bodies
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| try-clean.ts | clean (incl. clean tail) | silent, 0 notes (arms + tail per position) |
+| try-try-wrong.ts | 1x TS2322 (try arm) | 1x PITH2322 |
+| try-catch-wrong.ts | 1x TS2322 (catch arm) | 1x PITH2322 |
+| try-both-wrong.ts | 2x TS2322 | 2x PITH2322 (arms independent) |
+| try-tail-wrong.ts | 1x TS2322 (tail) | 1x PITH2322 (tail is another position) |
+| try-finally-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| try-throw-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| try-binding-unused.ts | clean | silent, 0 notes (plain binding admits; `e` unused) |
+| try-binding-used.ts | 1x TS2322 (`unknown`) | silent + 1 UNSUPPORTED (non-literal arm gate) |
+
+Differential: 9/9 match-or-pin (6 diagnostic/silent pairs + 2 pinned
+oracle-clean divergences — `finally` clauses and `throw` arms need
+control-flow facts the subset refuses — + 1 pinned oracle-error
+divergence: a used catch binding types `unknown` in tsc while the subset
+has no binding value-type facts). Each arm checks independently
+through the same synthetic delegation as joins (no fixpoint, single
+pass). Still declining by design with distinct recorded reasons:
+`finally` clauses, destructured catch patterns, and non-straight
+arms or tails (multi-statement, bare returns). Probes in
+`.agent/scratch/p039-probes/`.
