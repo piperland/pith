@@ -2,7 +2,7 @@
 //!
 //! Pipeline per fixture: `parse_module` -> [`Binder::build_file`] (real
 //! scopes + symbols) -> [`decls_from_handfed`] + [`functions_from_handfed`]
-//! -> [`check_file`]/[`check_functions`] -> [`FileReport`], then a
+//! -> [`check_file_with_aliases`]/[`check_functions`] -> [`FileReport`], then a
 //! differential against the recorded tsc `.expected.txt` baselines.
 //!
 //! Division of labor: names, scopes, and spans come from adapter facts (each
@@ -27,8 +27,8 @@ use pith_frontend::parse_module;
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_file, check_functions, ArrayInit, ArrayMemberKind, ConstDecl, DeclKind, FileReport,
-    FunctionBody, FunctionDecl, FunctionReturn, InitKind,
+    check_file_with_aliases, check_functions, ArrayInit, ArrayMemberKind, ConstDecl, DeclKind,
+    FileReport, FunctionBody, FunctionDecl, FunctionReturn, InitKind, TypeAliasShape,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -175,6 +175,22 @@ fn functions_from_handfed(
         .collect()
 }
 
+/// Maps every alias fact onto a [`TypeAliasShape`] (mechanical name +
+/// target copy; no lib fixture declares one, so this rides empty — the
+/// mapping exists so alias-annotated fixtures check like their targets the
+/// day one lands here).
+fn aliases_from_facts(parsed: &pith_frontend::ParsedFile) -> Vec<TypeAliasShape> {
+    parsed
+        .aliases
+        .iter()
+        .map(|fact| TypeAliasShape {
+            name: fact.name.clone(),
+            target: fact.target_text.clone(),
+            has_type_params: fact.has_type_params,
+        })
+        .collect()
+}
+
 /// Runs the const pipeline on one fixture source with its hand-fed table.
 fn run_consts(source: &str, specs: &[HandFed<'_>]) -> FileReport {
     let parsed = parse_module(FILE, "fixture.ts", source);
@@ -185,8 +201,9 @@ fn run_consts(source: &str, specs: &[HandFed<'_>]) -> FileReport {
     );
     let binder = build_binder(&parsed);
     let decls = decls_from_handfed(&parsed, &binder, specs);
+    let aliases = aliases_from_facts(&parsed);
     let mut db = QueryDb::new();
-    check_file(FILE, &decls, &binder, &mut db)
+    check_file_with_aliases(FILE, &decls, &binder, &mut db, &aliases)
 }
 
 /// Runs the function pipeline on one fixture source with its hand-fed table.

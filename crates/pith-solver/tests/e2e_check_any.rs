@@ -3,7 +3,8 @@
 //!
 //! Pipeline per fixture: `parse_module` -> [`Binder::build_file`] ->
 //! [`decls_from_facts`] / [`functions_from_facts`] + [`calls_from_facts`]
-//! (the drivers, zero hand-feeding) -> [`check_file`] / [`check_functions`]
+//! (the drivers, zero hand-feeding) -> [`check_file_with_aliases`] /
+//! [`check_functions`]
 //! / [`check_calls`] -> [`FileReport`], then a differential against the
 //! recorded tsc `.expected.txt` baselines.
 //!
@@ -29,7 +30,8 @@
 //!
 //! - `init_object` is always `None`: no check-any fixture holds an object
 //!   literal, so member facts never enter this pipeline.
-//! - Which checker runs is per fixture: const fixtures run [`check_file`],
+//! - Which checker runs is per fixture: const fixtures run
+//!   [`check_file_with_aliases`],
 //!   return fixtures run [`check_functions`], call fixtures run
 //!   [`check_calls`], and `as-cast-decline` merges [`check_file`] plus
 //!   [`check_calls`] (sorted concat — both reports are already sorted, and
@@ -47,9 +49,9 @@ use pith_frontend::{
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_calls, check_file, check_functions, CallArg, CallSite, CastInput, CastKind, ConstDecl,
-    DeclKind, FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, InitKind,
-    JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    check_calls, check_file_with_aliases, check_functions, CallArg, CallSite, CastInput, CastKind,
+    ConstDecl, DeclKind, FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn,
+    InitKind, JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind, TypeAliasShape,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -381,12 +383,28 @@ fn parse_fixture(source: &str) -> (ParsedFile, Binder) {
     (parsed, binder)
 }
 
+/// Maps every alias fact onto a [`TypeAliasShape`] (mechanical name +
+/// target copy; no check-any fixture declares one, so this rides empty —
+/// see the check-object driver note).
+fn aliases_from_facts(parsed: &ParsedFile) -> Vec<TypeAliasShape> {
+    parsed
+        .aliases
+        .iter()
+        .map(|fact| TypeAliasShape {
+            name: fact.name.clone(),
+            target: fact.target_text.clone(),
+            has_type_params: fact.has_type_params,
+        })
+        .collect()
+}
+
 /// Runs the const pipeline on one source text with a fresh binder and db.
 fn run_const(source: &str) -> (ParsedFile, FileReport) {
     let (parsed, binder) = parse_fixture(source);
     let decls = decls_from_facts(&parsed, &binder);
+    let aliases = aliases_from_facts(&parsed);
     let mut db = QueryDb::new();
-    let report = check_file(FILE, &decls, &binder, &mut db);
+    let report = check_file_with_aliases(FILE, &decls, &binder, &mut db, &aliases);
     (parsed, report)
 }
 

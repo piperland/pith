@@ -1,7 +1,7 @@
 //! Fact-anchored, shape-hand-fed solver end-to-end (PITH-P012): object subset.
 //!
 //! Pipeline per fixture: `parse_module` -> [`Binder::build_file`] (real
-//! scopes + symbols) -> [`decls_from_handfed`] -> [`check_file`] ->
+//! scopes + symbols) -> [`decls_from_handfed`] -> [`check_file_with_aliases`] ->
 //! [`FileReport`], then a differential against the recorded tsc
 //! `.expected.txt` baselines.
 //!
@@ -23,8 +23,8 @@ use pith_frontend::{parse_module, ParsedFile};
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_file, ConstDecl, DeclKind, FileReport, InitKind, ObjectInit, ObjectMemberInit,
-    ObjectMemberKind,
+    check_file_with_aliases, ConstDecl, DeclKind, FileReport, InitKind, ObjectInit,
+    ObjectMemberInit, ObjectMemberKind, TypeAliasShape,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -123,6 +123,22 @@ fn decls_from_handfed(
         .collect()
 }
 
+/// Maps every [`ParsedFile::aliases`] fact onto a [`TypeAliasShape`]
+/// (mechanical name + target copy; no object fixture declares one, so this
+/// rides empty — the mapping exists so alias-annotated fixtures check like
+/// their targets the day one lands here).
+fn aliases_from_facts(parsed: &ParsedFile) -> Vec<TypeAliasShape> {
+    parsed
+        .aliases
+        .iter()
+        .map(|fact| TypeAliasShape {
+            name: fact.name.clone(),
+            target: fact.target_text.clone(),
+            has_type_params: fact.has_type_params,
+        })
+        .collect()
+}
+
 /// Runs the pipeline on one fixture source with its hand-fed shape table.
 fn run_pipeline(source: &str, specs: &[HandFed<'_>]) -> FileReport {
     let parsed = parse_module(FILE, "fixture.ts", source);
@@ -133,8 +149,9 @@ fn run_pipeline(source: &str, specs: &[HandFed<'_>]) -> FileReport {
     );
     let binder = build_binder(&parsed);
     let decls = decls_from_handfed(&parsed, &binder, specs);
+    let aliases = aliases_from_facts(&parsed);
     let mut db = QueryDb::new();
-    check_file(FILE, &decls, &binder, &mut db)
+    check_file_with_aliases(FILE, &decls, &binder, &mut db, &aliases)
 }
 
 /// Parses normalized oracle lines (`file:TSNNNN: message`) into sorted

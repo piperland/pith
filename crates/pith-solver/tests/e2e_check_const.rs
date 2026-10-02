@@ -2,7 +2,8 @@
 //!
 //! Pipeline per fixture: `parse_module` -> [`Binder::build_file`] ->
 //! [`decls_from_facts`] (the driver: [`DeclFact`](pith_frontend::DeclFact)
-//! to [`ConstDecl`], zero hand-feeding) -> [`check_file`] -> [`FileReport`],
+//! to [`ConstDecl`], zero hand-feeding) -> [`check_file_with_aliases`] ->
+//! [`FileReport`],
 //! then a differential against the recorded tsc `.expected.txt` baselines.
 //!
 //! Driver placement rationale: this integration test IS the driver. A
@@ -29,7 +30,9 @@
 use pith_frontend::{parse_module, InitKind as FrontendInitKind, ParsedFile};
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
-use pith_solver::{check_file, ConstDecl, DeclKind, FileReport, InitKind};
+use pith_solver::{
+    check_file_with_aliases, ConstDecl, DeclKind, FileReport, InitKind, TypeAliasShape,
+};
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
 const FILE: FileId = FileId(0);
@@ -134,6 +137,21 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<ConstDecl> {
         .collect()
 }
 
+/// Maps every [`ParsedFile::aliases`] fact onto a [`TypeAliasShape`]
+/// (mechanical name + target copy; binding spans stay frontend-side —
+/// decline reasons anchor at use sites).
+fn aliases_from_facts(parsed: &ParsedFile) -> Vec<TypeAliasShape> {
+    parsed
+        .aliases
+        .iter()
+        .map(|fact| TypeAliasShape {
+            name: fact.name.clone(),
+            target: fact.target_text.clone(),
+            has_type_params: fact.has_type_params,
+        })
+        .collect()
+}
+
 /// Runs the full real pipeline on one source text with a fresh binder and db.
 fn run_pipeline(source: &str) -> FileReport {
     let parsed = parse_module(FILE, "fixture.ts", source);
@@ -144,8 +162,9 @@ fn run_pipeline(source: &str) -> FileReport {
     );
     let binder = build_binder(&parsed);
     let decls = decls_from_facts(&parsed, &binder);
+    let aliases = aliases_from_facts(&parsed);
     let mut db = QueryDb::new();
-    check_file(FILE, &decls, &binder, &mut db)
+    check_file_with_aliases(FILE, &decls, &binder, &mut db, &aliases)
 }
 
 /// Parses normalized oracle lines (`file:TSNNNN: message`) into sorted
@@ -265,6 +284,42 @@ fixture_test!(
     no_annotation_is_unsupported,
     "no-annotation.ts",
     "no-annotation.expected.txt",
+    1
+);
+fixture_test!(
+    alias_primitive_correct_is_silent,
+    "alias-primitive-correct.ts",
+    "alias-primitive-correct.expected.txt",
+    0
+);
+fixture_test!(
+    alias_primitive_wrong_matches_ts2322,
+    "alias-primitive-wrong.ts",
+    "alias-primitive-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    alias_chained_is_unsupported,
+    "alias-chained-declined.ts",
+    "alias-chained-declined.expected.txt",
+    1
+);
+fixture_test!(
+    alias_shadowed_is_unsupported,
+    "alias-shadowed-declined.ts",
+    "alias-shadowed-declined.expected.txt",
+    1
+);
+fixture_test!(
+    alias_generic_is_unsupported,
+    "alias-generic-declined.ts",
+    "alias-generic-declined.expected.txt",
+    1
+);
+fixture_test!(
+    alias_interface_declines_in_const_entry,
+    "alias-interface-declined.ts",
+    "alias-interface-declined.expected.txt",
     1
 );
 

@@ -2,8 +2,8 @@
 //! namespaces.
 //!
 //! Pipeline per fixture: `parse_module` -> [`Binder::build_file`] ->
-//! [`decls_from_handfed`] + [`shapes_from_facts`] -> [`check_enums`] ->
-//! [`FileReport`], then a differential against the recorded tsc
+//! [`decls_from_handfed`] + [`shapes_from_facts`] -> [`check_enums_with_aliases`]
+//! -> [`FileReport`], then a differential against the recorded tsc
 //! `.expected.txt` baselines.
 //!
 //! Division of labor: names, scopes, and spans come from adapter facts
@@ -29,9 +29,9 @@ use pith_frontend::{parse_module, EnumValueKind, ParsedFile};
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_enums, ConstDecl, DeclKind, EnumDecl, EnumInput, EnumMember, EnumMemberValue, EnumShape,
-    FileReport, InitKind, InterfaceHeritage, InterfaceMember, InterfaceShape, NamespaceShape,
-    ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    check_enums_with_aliases, ConstDecl, DeclKind, EnumDecl, EnumInput, EnumMember,
+    EnumMemberValue, EnumShape, FileReport, InitKind, InterfaceHeritage, InterfaceMember,
+    InterfaceShape, NamespaceShape, ObjectInit, ObjectMemberInit, ObjectMemberKind, TypeAliasShape,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -280,6 +280,21 @@ fn interfaces_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<InterfaceS
         .collect()
 }
 
+/// The adapter-fed driver: every [`ParsedFile::aliases`] fact maps
+/// mechanically onto a [`TypeAliasShape`] (name + target copy; binding
+/// spans stay frontend-side — decline reasons anchor at use sites).
+fn aliases_from_facts(parsed: &ParsedFile) -> Vec<TypeAliasShape> {
+    parsed
+        .aliases
+        .iter()
+        .map(|fact| TypeAliasShape {
+            name: fact.name.clone(),
+            target: fact.target_text.clone(),
+            has_type_params: fact.has_type_params,
+        })
+        .collect()
+}
+
 /// Runs the pipeline on one fixture source with its hand-fed shape table.
 fn run_pipeline(source: &str, specs: &[HandFed<'_>]) -> FileReport {
     let parsed = parse_module(FILE, "fixture.ts", source);
@@ -293,13 +308,14 @@ fn run_pipeline(source: &str, specs: &[HandFed<'_>]) -> FileReport {
     let enums = enums_from_facts(&parsed, &binder);
     let interfaces = interfaces_from_facts(&parsed, &binder);
     let namespaces = namespaces_from_facts(&parsed, &binder);
+    let aliases = aliases_from_facts(&parsed);
     let input = EnumInput {
         enums: &enums,
         interfaces: &interfaces,
         namespaces: &namespaces,
     };
     let mut db = QueryDb::new();
-    check_enums(FILE, &decls, &input, &binder, &mut db)
+    check_enums_with_aliases(FILE, &decls, &input, &aliases, &binder, &mut db)
 }
 
 /// Parses normalized oracle lines (`file:TSNNNN: message`) into sorted
@@ -771,13 +787,14 @@ fn unresolved_qualification_head_skips_silently() {
     let enums = enums_from_facts(&parsed, &binder);
     let interfaces = interfaces_from_facts(&parsed, &binder);
     let namespaces = namespaces_from_facts(&parsed, &binder);
+    let aliases = aliases_from_facts(&parsed);
     let input = EnumInput {
         enums: &enums,
         interfaces: &interfaces,
         namespaces: &namespaces,
     };
     let mut db = QueryDb::new();
-    let report = check_enums(FILE, &decls, &input, &binder, &mut db);
+    let report = check_enums_with_aliases(FILE, &decls, &input, &aliases, &binder, &mut db);
     assert!(report.diagnostics.is_empty());
     assert!(report.unsupported.is_empty());
 }
@@ -842,4 +859,157 @@ fn driver_anchors_every_name_and_links_shapes() {
     assert!(decls[0].decl.span.lo < decls[0].decl.span.hi);
     assert!(decls[0].decl.symbol.is_some());
     assert_eq!(decls[0].init_text.as_deref(), Some("9"));
+}
+
+// Local type aliases (PITH-P038): the full pipeline with the adapter-fed
+// alias mapping. Sources are inline (no new corpus dir is in scope) and the
+// expected texts replay the probed tsc 7.0.2 messages from
+// `.agent/scratch/p038-probes/`.
+
+#[test]
+fn local_alias_interface_checks_through_underlying_shape() {
+    // Wrong members diagnose per member; missing members spell the
+    // UNDERLYING interface (alias transparency — probed tsc 7.0.2).
+    expect_differential(
+        "local_alias_interface_checks_through_underlying_shape",
+        "interface Point { x: number; y: number; }\n\
+         type Alias = Point;\n\
+         const good: Alias = { x: 1, y: 2 };\n\
+         const wrong: Alias = { x: 1, y: \"oops\" };\n\
+         const missing: Alias = { x: 1 };\n",
+        &[
+            HandFed {
+                name: "good",
+                kind: DeclKind::Const,
+                annotation: Some("Alias"),
+                init: None,
+                members: Some(&[("x", Number), ("y", Number)]),
+                init_text: None,
+            },
+            HandFed {
+                name: "wrong",
+                kind: DeclKind::Const,
+                annotation: Some("Alias"),
+                init: None,
+                members: Some(&[("x", Number), ("y", ObjectMemberKind::String)]),
+                init_text: None,
+            },
+            HandFed {
+                name: "missing",
+                kind: DeclKind::Const,
+                annotation: Some("Alias"),
+                init: None,
+                members: Some(&[("x", Number)]),
+                init_text: None,
+            },
+        ],
+        "alias-local.ts:TS2322: Type 'string' is not assignable to type 'number'.\n\
+         alias-local.ts:TS2741: Property 'y' is missing in type '{ x: number; }' \
+         but required in type 'Point'.\n",
+        0,
+    );
+}
+
+#[test]
+fn local_alias_enum_and_primitive_check_like_targets() {
+    // Enum aliases spell the underlying enum; primitive aliases behave
+    // exactly like their target spelling (probed tsc 7.0.2).
+    expect_differential(
+        "local_alias_enum_checks_like_target",
+        "enum Color { Red = 0, Blue = 1 }\n\
+         type C = Color;\n\
+         const a: C = 0;\n\
+         const b: C = 5;\n",
+        &[
+            HandFed {
+                name: "a",
+                kind: DeclKind::Const,
+                annotation: Some("C"),
+                init: Some(InitKind::Number),
+                members: None,
+                init_text: Some("0"),
+            },
+            HandFed {
+                name: "b",
+                kind: DeclKind::Const,
+                annotation: Some("C"),
+                init: Some(InitKind::Number),
+                members: None,
+                init_text: Some("5"),
+            },
+        ],
+        "alias-enum.ts:TS2322: Type '5' is not assignable to type 'Color'.\n",
+        0,
+    );
+    expect_differential(
+        "local_alias_primitive_checks_like_target",
+        "type Num = number;\nconst ok: Num = 1;\nconst bad: Num = \"oops\";\n",
+        &[
+            HandFed {
+                name: "ok",
+                kind: DeclKind::Const,
+                annotation: Some("Num"),
+                init: Some(InitKind::Number),
+                members: None,
+                init_text: Some("1"),
+            },
+            HandFed {
+                name: "bad",
+                kind: DeclKind::Const,
+                annotation: Some("Num"),
+                init: Some(InitKind::String),
+                members: None,
+                init_text: Some("\"oops\""),
+            },
+        ],
+        "alias-primitive.ts:TS2322: Type 'string' is not assignable to type 'number'.\n",
+        0,
+    );
+}
+
+#[test]
+fn local_alias_chained_and_shadowed_decline() {
+    // tsc resolves chains transitively and reads shadowed type meanings
+    // (both clean in tsc 7.0.2); the solver declines with reasons instead
+    // of forcing verdicts (pinned divergences).
+    expect_differential(
+        "local_alias_chained_declines",
+        "type A = number;\ntype B = A;\nconst b: B = 1;\n",
+        &[HandFed {
+            name: "b",
+            kind: DeclKind::Const,
+            annotation: Some("B"),
+            init: Some(InitKind::Number),
+            members: None,
+            init_text: Some("1"),
+        }],
+        "",
+        1,
+    );
+    expect_differential(
+        "local_alias_shadowed_declines",
+        "type Alias = number;\n\
+         const Alias: string = \"hello\";\n\
+         const n: Alias = 1;\n",
+        &[
+            HandFed {
+                name: "Alias",
+                kind: DeclKind::Const,
+                annotation: Some("string"),
+                init: Some(InitKind::String),
+                members: None,
+                init_text: Some("\"hello\""),
+            },
+            HandFed {
+                name: "n",
+                kind: DeclKind::Const,
+                annotation: Some("Alias"),
+                init: Some(InitKind::Number),
+                members: None,
+                init_text: Some("1"),
+            },
+        ],
+        "",
+        1,
+    );
 }
