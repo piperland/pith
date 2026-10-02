@@ -14,7 +14,21 @@ annotations. Oracle baselines are tsc 7.0.2 via
 | union-annotation.ts | clean | UNSUPPORTED (union outside subset) |
 | no-annotation.ts | clean | UNSUPPORTED (inference outside subset) |
 | multi-declarator.ts | 1x TS2322 | 1x PITH2322 on `third` |
+| alias-primitive-correct.ts | clean | silent (primitive aliases check like targets) |
+| alias-primitive-wrong.ts | 1x TS2322 | 1x PITH2322 spelling the target |
+| alias-chained-declined.ts | clean | UNSUPPORTED (single-level expansion only) |
+| alias-shadowed-declined.ts | clean | UNSUPPORTED (local values shadow aliases) |
+| alias-generic-declined.ts | clean | UNSUPPORTED (generic aliases never instantiate) |
+| alias-interface-declined.ts | clean | UNSUPPORTED (named shapes need the enum entry) |
 
-Differential: 6/6 match on the primitives subset (5 silent/clean + 5
-diagnostic pairs across 4 fixtures, code family + message shape); 2/2
-out-of-subset recorded as UNSUPPORTED, never silent.
+Differential: 8/8 match (2 silent/clean + 6 diagnostic pairs across 6
+fixtures, code family + message shape); 6/6 out-of-subset recorded as
+UNSUPPORTED, never silent.
+
+Local aliases (PITH-P038): single-level expansion mirrors the P035
+imported-alias rules — alias-to-primitive/boundary rewrites the annotation
+spelling, chained/generic/circular/complex targets decline with distinct
+reasons, and local consts win over alias names (never hijack a value
+binding). Alias-to-interface/enum checks through the `check_enums` entry
+(see `crates/pith-solver/tests/e2e_check_enums_namespaces.rs`); the
+`check_file` entry used here declines those with an entry-point reason.
