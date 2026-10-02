@@ -58,11 +58,17 @@
 //! exactly one `return <expr>;` — each position checks independently
 //! solver-side (probed tsc 7.0.2). `finally` clauses, destructured catch
 //! bindings, `throw` statements, and non-single-return arms or tails are
-//! [`FunctionBodyFact::TryUnsupported`] with the recorded reason. Bodies without a
-//! node are
+//! [`FunctionBodyFact::TryUnsupported`] with the recorded reason. Switch
+//! bodies ([`FunctionBodyFact::Switch`]): `switch (x)` with literal labels,
+//! each case (plus the optional default) exactly one `return <expr>;` —
+//! each position checks independently solver-side (probed tsc 7.0.2 P040).
+//! Fallthrough, complex cases, case-level declarations, non-literal
+//! discriminants or labels, and duplicate defaults are
+//! [`FunctionBodyFact::SwitchUnsupported`] with the recorded reason. Bodies
+//! without a node are
 //! [`FunctionBodyFact::NoBody`], statement-less bodies are
 //! [`FunctionBodyFact::Empty`], and everything else (longer/multi-path
-//! bodies, loops, `switch`, bare or missing `return`) is
+//! bodies, loops, bare or missing `return`) is
 //! [`FunctionBodyFact::Complex`] for the solver to decline. Out of scope, no
 //! facts: function expressions, arrow functions, object methods (class methods,
 //! accessors, and constructors feed class facts instead — see the class
@@ -299,10 +305,10 @@ use oxc_ast::ast::{
     Expression, Function, FunctionBody, FunctionType, IfStatement, MethodDefinition,
     MethodDefinitionKind, NewExpression, ObjectPropertyKind, Program, PropertyDefinition,
     PropertyDefinitionType, PropertyKey, PropertyKind, ReturnStatement, SimpleAssignmentTarget,
-    Statement, StaticBlock, TSEnumDeclaration, TSEnumMemberName, TSInterfaceDeclaration,
-    TSNamespaceDeclaration, TSPropertySignature, TSSignature, TSType, TSTypeAliasDeclaration,
-    TSTypeAnnotation, TryStatement, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    Statement, StaticBlock, SwitchCase, SwitchStatement, TSEnumDeclaration, TSEnumMemberName,
+    TSInterfaceDeclaration, TSNamespaceDeclaration, TSPropertySignature, TSSignature, TSType,
+    TSTypeAliasDeclaration, TSTypeAnnotation, TryStatement, UpdateExpression, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -669,8 +675,9 @@ pub struct InnerDeclFact {
 /// Only [`FunctionBodyFact::SingleReturn`], the P023 joins
 /// ([`FunctionBodyFact::SequenceReturns`], [`FunctionBodyFact::GuardReturn`],
 /// [`FunctionBodyFact::BranchReturns`]), the P031 straight bodies
-/// ([`FunctionBodyFact::StraightBody`]), and the P039 try/catch bodies
-/// ([`FunctionBodyFact::TryCatch`]) feed the solver; every other shape
+/// ([`FunctionBodyFact::StraightBody`]), the P039 try/catch bodies
+/// ([`FunctionBodyFact::TryCatch`]), and the P040 switch bodies
+/// ([`FunctionBodyFact::Switch`]) feed the solver; every other shape
 /// declines to a solver `UnsupportedDecl` with a distinct reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBodyFact {
@@ -739,6 +746,30 @@ pub enum FunctionBodyFact {
         /// The trailing `return`'s expression facts, when present.
         tail: Option<SingleReturnFact>,
     },
+    /// Exactly one statement, `switch (x)` with literal case labels, each
+    /// case (plus the optional default) exactly one `return <expr>;`: tsc
+    /// checks each position independently (probed 7.0.2 P040). The
+    /// discriminant admits structurally as a plain identifier (returns check
+    /// independently of narrowing, so any identifier qualifies — the P023
+    /// guard-condition precedent); it carries no facts. A missing default
+    /// admits too (tsc's `TS2366` exhaustiveness error is a pinned gap: the
+    /// subset has no declaration-completeness family, so no-default bodies
+    /// stay silent where the oracle errors).
+    Switch {
+        /// One `return` fact per `case` clause, in source order.
+        cases: Vec<SingleReturnFact>,
+        /// The `default` clause's `return` facts, when present.
+        default: Option<SingleReturnFact>,
+    },
+    /// A `switch` body outside the checkable [`FunctionBodyFact::Switch`]
+    /// shape. The solver declines with `reason` verbatim — never a partial
+    /// verdict over the remaining positions.
+    SwitchUnsupported {
+        /// Why the `switch` body is outside the subset (fallthrough,
+        /// complex case, case-level declarations, non-literal discriminant
+        /// or label, or a duplicate default).
+        reason: String,
+    },
     /// A `try` body outside the checkable [`FunctionBodyFact::TryCatch`]
     /// shape. The solver declines with `reason` verbatim — never a partial
     /// verdict over the remaining positions.
@@ -750,11 +781,12 @@ pub enum FunctionBodyFact {
     },
     /// A body with no statements (directives do not count).
     Empty,
-    /// Anything else: longer/multi-path bodies, loops, `switch`,
-    /// `else-if` chains, `if/else` plus a tail return, non-terminal returns,
-    /// `throw` or bare branches outside `try` arms, `continue`, bare or
-    /// missing `return`, `var` declarators, spreads/methods/computed keys
-    /// in a returned literal.
+    /// Anything else: longer/multi-path bodies (including a `switch`
+    /// statement paired with any other statement), loops, `else-if` chains,
+    /// `if/else` plus a tail return, non-terminal returns, `throw` or bare
+    /// branches outside `try` arms, `continue`, bare or missing `return`,
+    /// `var` declarators, spreads/methods/computed keys in a returned
+    /// literal.
     Complex,
 }
 
@@ -2116,7 +2148,9 @@ fn return_members(
 /// into [`FunctionBodyFact::StraightBody`]. P039 try/catch bodies (a lone
 /// `try` statement, or a `try` statement plus a trailing literal `return`)
 /// classify into [`FunctionBodyFact::TryCatch`] or
-/// [`FunctionBodyFact::TryUnsupported`]. Anything else is
+/// [`FunctionBodyFact::TryUnsupported`]. P040 switch bodies (a lone
+/// `switch (x)` statement) classify into [`FunctionBodyFact::Switch`] or
+/// [`FunctionBodyFact::SwitchUnsupported`]. Anything else is
 /// [`FunctionBodyFact::Complex`].
 fn function_body_fact(
     collector: &DeclCollector<'_>,
@@ -2133,6 +2167,7 @@ fn function_body_fact(
             branch_returns(collector, it).unwrap_or(FunctionBodyFact::Complex)
         }
         [Statement::TryStatement(candidate)] => try_catch_body(collector, candidate, None),
+        [Statement::SwitchStatement(candidate)] => switch_body(collector, candidate),
         [first, second] => joined_pair(collector, first, second)
             .or_else(|| try_tail_pair(collector, first, second))
             .or_else(|| straight_body(collector, body.statements.as_slice()))
@@ -2616,6 +2651,116 @@ fn try_arm_return(
         Statement::ThrowStatement(_) => Err(decline("throw statement in")),
         _ => Err(decline("non-straight")),
     }
+}
+
+/// One `switch (x)` statement into its [`FunctionBodyFact`]: the checkable
+/// shape admits (a plain-identifier discriminant, literal case labels, each
+/// case plus the optional default exactly one `return <expr>;`), while
+/// non-identifier discriminants, non-literal labels, fallthrough, complex
+/// cases, case-level declarations, and duplicate defaults decline with
+/// distinct reasons (never a partial verdict).
+fn switch_body(collector: &DeclCollector<'_>, candidate: &SwitchStatement<'_>) -> FunctionBodyFact {
+    let unsupported = |reason: String| FunctionBodyFact::SwitchUnsupported { reason };
+    if !matches!(candidate.discriminant, Expression::Identifier(_)) {
+        return unsupported("non-literal switch discriminant is outside the subset".to_owned());
+    }
+    let mut cases = Vec::with_capacity(candidate.cases.len());
+    let mut default: Option<SingleReturnFact> = None;
+    for case in &candidate.cases {
+        if case.test.is_none() && default.is_some() {
+            return unsupported("duplicate default clause is outside the subset".to_owned());
+        }
+        match switch_case_return(collector, case) {
+            Ok(SwitchPosition::Case(fact)) => cases.push(fact),
+            Ok(SwitchPosition::Default(fact)) => default = Some(fact),
+            Err(reason) => return unsupported(reason),
+        }
+    }
+    FunctionBodyFact::Switch { cases, default }
+}
+
+/// Which clause one classified [`SwitchCase`] feeds: a `case` position or
+/// the `default` position.
+enum SwitchPosition {
+    /// A `case <lit>:` clause's `return` expression facts.
+    Case(SingleReturnFact),
+    /// The `default:` clause's `return` expression facts.
+    Default(SingleReturnFact),
+}
+
+/// One `case`/`default` clause into its [`SingleReturnFact`]: the label must
+/// be a literal (`default` needs none) and the consequent exactly one
+/// `return <expr>;` (a single block wrapping that return unwraps, mirroring
+/// [`divergent_return_arg`]). Empty consequents are fallthrough (clean in
+/// tsc — probed 7.0.2 P040 — but control flow the subset refuses);
+/// consequents holding declarations decline distinctly (a `return <ident>`
+/// over a case-local binding needs value-type facts); every other
+/// non-single-return shape declines as a complex case.
+fn switch_case_return(
+    collector: &DeclCollector<'_>,
+    case: &SwitchCase<'_>,
+) -> Result<SwitchPosition, String> {
+    if let Some(test) = case.test.as_ref() {
+        if !is_literal_case_label(test) {
+            return Err("non-literal case label is outside the subset".to_owned());
+        }
+    }
+    let is_default = case.test.is_none();
+    if case.consequent.is_empty() {
+        return Err("fallthrough case is outside the subset".to_owned());
+    }
+    if case_consequent_has_decl(&case.consequent) {
+        return Err("case with declarations is outside the subset".to_owned());
+    }
+    let [only] = case.consequent.as_slice() else {
+        return Err("complex case is outside the subset".to_owned());
+    };
+    let Some(argument) = divergent_return_arg(only) else {
+        return Err("complex case is outside the subset".to_owned());
+    };
+    let Some(fact) = single_return_fact(collector, argument) else {
+        return Err("complex case is outside the subset".to_owned());
+    };
+    if is_default {
+        Ok(SwitchPosition::Default(fact))
+    } else {
+        Ok(SwitchPosition::Case(fact))
+    }
+}
+
+/// Whether one `case` label is a plain literal: numeric, string, or boolean.
+/// Identifiers, calls, unary expressions (`-1`), templates, and every other
+/// shape need const-eval or value facts the subset refuses.
+fn is_literal_case_label(test: &Expression<'_>) -> bool {
+    matches!(
+        test,
+        Expression::NumericLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+    )
+}
+
+/// Whether one clause consequent holds a `const`/`let`/`var` declarator —
+/// directly, or as the statements of a single wrapping block. Checked
+/// before the single-return gate so declarations decline with their own
+/// reason instead of the complex-case one.
+fn case_consequent_has_decl(consequent: &[Statement<'_>]) -> bool {
+    has_direct_decl(consequent) || has_block_decl(consequent)
+}
+
+/// Whether any statement of the slice is a variable declaration.
+fn has_direct_decl(consequent: &[Statement<'_>]) -> bool {
+    consequent
+        .iter()
+        .any(|statement| matches!(statement, Statement::VariableDeclaration(_)))
+}
+
+/// Whether the slice is a single block holding a variable declaration.
+fn has_block_decl(consequent: &[Statement<'_>]) -> bool {
+    let [Statement::BlockStatement(block)] = consequent else {
+        return false;
+    };
+    has_direct_decl(&block.body)
 }
 
 /// Pushes one narrowing decline region onto the collector.
@@ -5163,8 +5308,8 @@ export function f(a: string): string { return a + b; }
                    } else {\n    return 2;\n  }\n}\n\
                    function bare_branch(flag: boolean): number {\n  if (flag) {\n    return;\n  }\n  return 2;\n}\n\
                    function looped(n: number): number {\n  for (;;) {\n    return 1;\n  }\n}\n\
-                   function switched(n: number): number {\n  switch (n) {\n    case 1:\n      return 1;\n\
-                   default:\n      return 2;\n  }\n}\n\
+                   function paired(n: number): number {\n  switch (n) {\n    case 1:\n      return 1;\n\
+                   }\n  return 2;\n}\n\
                    function continued(n: number): number {\n  while (n > 0) {\n    n = n - 1;\n\
                    continue;\n  }\n  return n;\n}\n";
         let pf = parse_module(FileId(0), "u.ts", src);
@@ -5173,6 +5318,69 @@ export function f(a: string): string { return a + b; }
         for fact in &pf.functions {
             assert_eq!(fact.body, FunctionBodyFact::Complex);
         }
+    }
+
+    #[test]
+    fn function_facts_switch_admits_per_case() {
+        let src = "function pick(n: number): number {\n  switch (n) {\n    case 1:\n      return 1;\n\
+                   case 2:\n      return \"oops\";\n    default:\n      return 3;\n  }\n}\n\
+                   function bare(n: number): number {\n  switch (n) {\n    case 1:\n      return 1;\n\
+                   case 2:\n      return 2;\n  }\n}\n";
+        let pf = parse_module(FileId(0), "s.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let FunctionBodyFact::Switch { cases, default } = &pf.functions[0].body else {
+            panic!("expected switch, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, cases[0].span), "1");
+        assert_eq!(cases[1].kind, ReturnKind::String);
+        assert_eq!(slice_of(src, cases[1].span), "\"oops\"");
+        let default = default.as_ref().expect("default clause");
+        assert_eq!(default.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, default.span), "3");
+        // A missing default still admits: exhaustiveness is solver-declined.
+        let FunctionBodyFact::Switch { cases, default } = &pf.functions[1].body else {
+            panic!("expected switch, got {:?}", pf.functions[1].body);
+        };
+        assert_eq!(cases.len(), 2);
+        assert!(default.is_none());
+    }
+
+    #[test]
+    fn function_facts_switch_unsupported_reasons_are_distinct() {
+        let src = "function fall(n: number): number {\n  switch (n) {\n    case 1:\n      return 1;\n\
+                   case 2:\n    default:\n      return 3;\n  }\n}\n\
+                   function decl(n: number): number {\n  switch (n) {\n    case 1: {\n\
+                   const x: number = 1;\n      return x;\n    }\n    default:\n      return 2;\n  }\n}\n\
+                   function multi(n: number): number {\n  switch (n) {\n    case 1:\n      n = 2;\n\
+                   return 1;\n    default:\n      return 2;\n  }\n}\n\
+                   function disc(n: number): number {\n  switch (n + 1) {\n    case 1:\n\
+                   return 1;\n    default:\n      return 2;\n  }\n}\n\
+                   function label(n: number): number {\n  switch (n) {\n    case n:\n\
+                   return 1;\n    default:\n      return 2;\n  }\n}\n";
+        let pf = parse_module(FileId(0), "w.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 5);
+        let reasons: Vec<&str> = pf
+            .functions
+            .iter()
+            .map(|fact| {
+                let FunctionBodyFact::SwitchUnsupported { reason } = &fact.body else {
+                    panic!("expected switch-unsupported, got {:?}", fact.body);
+                };
+                reason.as_str()
+            })
+            .collect();
+        assert_eq!(reasons[0], "fallthrough case is outside the subset");
+        assert_eq!(reasons[1], "case with declarations is outside the subset");
+        assert_eq!(reasons[2], "complex case is outside the subset");
+        assert_eq!(
+            reasons[3],
+            "non-literal switch discriminant is outside the subset"
+        );
+        assert_eq!(reasons[4], "non-literal case label is outside the subset");
     }
 
     #[test]
