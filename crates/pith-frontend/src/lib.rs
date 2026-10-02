@@ -64,11 +64,19 @@
 //! each position checks independently solver-side (probed tsc 7.0.2 P040).
 //! Fallthrough, complex cases, case-level declarations, non-literal
 //! discriminants or labels, and duplicate defaults are
-//! [`FunctionBodyFact::SwitchUnsupported`] with the recorded reason. Bodies
+//! [`FunctionBodyFact::SwitchUnsupported`] with the recorded reason. P041
+//! counted-`for` bodies ([`FunctionBodyFact::CountedFor`]): `for (let i = 0;
+//! i < N; i++)` with literal numeric bounds whose body is exactly one
+//! `return <expr>;`, plus an optional trailing literal `return` — each
+//! position checks independently solver-side (probed tsc 7.0.2). Non-literal
+//! bounds, non-numeric bounds, non-idiom headers, non-`for` loops,
+//! infinite `for(;;)`, `break`/`continue` bodies, and complex bodies are
+//! [`FunctionBodyFact::LoopUnsupported`] with the recorded reason. Bodies
 //! without a node are
 //! [`FunctionBodyFact::NoBody`], statement-less bodies are
 //! [`FunctionBodyFact::Empty`], and everything else (longer/multi-path
-//! bodies, loops, bare or missing `return`) is
+//! bodies, loops paired with non-return statements, bare or missing
+//! `return`) is
 //! [`FunctionBodyFact::Complex`] for the solver to decline. Out of scope, no
 //! facts: function expressions, arrow functions, object methods (class methods,
 //! accessors, and constructors feed class facts instead — see the class
@@ -302,13 +310,13 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingPattern,
     CallExpression, Class, ClassElement, ClassType, ExportDeclaration, ExportDefaultDeclaration,
-    Expression, Function, FunctionBody, FunctionType, IfStatement, MethodDefinition,
-    MethodDefinitionKind, NewExpression, ObjectPropertyKind, Program, PropertyDefinition,
-    PropertyDefinitionType, PropertyKey, PropertyKind, ReturnStatement, SimpleAssignmentTarget,
-    Statement, StaticBlock, SwitchCase, SwitchStatement, TSEnumDeclaration, TSEnumMemberName,
-    TSInterfaceDeclaration, TSNamespaceDeclaration, TSPropertySignature, TSSignature, TSType,
-    TSTypeAliasDeclaration, TSTypeAnnotation, TryStatement, UpdateExpression, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    Expression, ForStatement, ForStatementInit, Function, FunctionBody, FunctionType, IfStatement,
+    MethodDefinition, MethodDefinitionKind, NewExpression, ObjectPropertyKind, Program,
+    PropertyDefinition, PropertyDefinitionType, PropertyKey, PropertyKind, ReturnStatement,
+    SimpleAssignmentTarget, Statement, StaticBlock, SwitchCase, SwitchStatement, TSEnumDeclaration,
+    TSEnumMemberName, TSInterfaceDeclaration, TSNamespaceDeclaration, TSPropertySignature,
+    TSSignature, TSType, TSTypeAliasDeclaration, TSTypeAnnotation, TryStatement, UpdateExpression,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -317,7 +325,7 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::module_record::{
     ExportExportName, ExportImportName, ExportLocalName, ImportImportName, ModuleRecord,
 };
-use oxc_syntax::operator::{BinaryOperator, UnaryOperator};
+use oxc_syntax::operator::{BinaryOperator, UnaryOperator, UpdateOperator};
 use pith_ids::{FileId, Span};
 
 /// Saturating `usize` -> `u32` for per-file fact indices (files never approach
@@ -676,8 +684,9 @@ pub struct InnerDeclFact {
 /// ([`FunctionBodyFact::SequenceReturns`], [`FunctionBodyFact::GuardReturn`],
 /// [`FunctionBodyFact::BranchReturns`]), the P031 straight bodies
 /// ([`FunctionBodyFact::StraightBody`]), the P039 try/catch bodies
-/// ([`FunctionBodyFact::TryCatch`]), and the P040 switch bodies
-/// ([`FunctionBodyFact::Switch`]) feed the solver; every other shape
+/// ([`FunctionBodyFact::TryCatch`]), the P040 switch bodies
+/// ([`FunctionBodyFact::Switch`]), and the P041 counted-`for` bodies
+/// ([`FunctionBodyFact::CountedFor`]) feed the solver; every other shape
 /// declines to a solver `UnsupportedDecl` with a distinct reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBodyFact {
@@ -779,10 +788,33 @@ pub enum FunctionBodyFact {
         /// arm/tail).
         reason: String,
     },
+    /// Exactly one statement, a counted `for (let i = 0; i < N; i++)` with
+    /// literal numeric bounds whose body is exactly one `return <expr>;`,
+    /// plus an optional trailing literal `return`: tsc checks each position
+    /// independently (probed 7.0.2 P041). The loop variable carries no
+    /// facts — a `return i` over it classifies [`ReturnKind::NonLiteral`]
+    /// and the solver declines the whole declaration. A missing tail
+    /// admits structurally (like the missing `default` and the missing tail
+    /// after `try/catch`: the subset has no path-completeness family).
+    CountedFor {
+        /// The loop body's `return` expression facts.
+        body: SingleReturnFact,
+        /// The trailing `return`'s expression facts, when present.
+        tail: Option<SingleReturnFact>,
+    },
+    /// A loop body outside the checkable [`FunctionBodyFact::CountedFor`]
+    /// shape. The solver declines with `reason` verbatim — never a partial
+    /// verdict over the remaining positions.
+    LoopUnsupported {
+        /// Why the loop body is outside the subset (non-literal or
+        /// non-numeric bound, non-idiom header, non-`for` loop, infinite
+        /// `for(;;)`, `break`/`continue` body, or a complex body/tail).
+        reason: String,
+    },
     /// A body with no statements (directives do not count).
     Empty,
-    /// Anything else: longer/multi-path bodies (including a `switch`
-    /// statement paired with any other statement), loops, `else-if` chains,
+    /// Anything else: longer/multi-path bodies (including a loop or `switch`
+    /// statement paired with a non-return statement), `else-if` chains,
     /// `if/else` plus a tail return, non-terminal returns, `throw` or bare
     /// branches outside `try` arms, `continue`, bare or missing `return`,
     /// `var` declarators, spreads/methods/computed keys in a returned
@@ -2150,7 +2182,12 @@ fn return_members(
 /// classify into [`FunctionBodyFact::TryCatch`] or
 /// [`FunctionBodyFact::TryUnsupported`]. P040 switch bodies (a lone
 /// `switch (x)` statement) classify into [`FunctionBodyFact::Switch`] or
-/// [`FunctionBodyFact::SwitchUnsupported`]. Anything else is
+/// [`FunctionBodyFact::SwitchUnsupported`]. P041 counted-`for` bodies (a lone
+/// counted `for` statement, or one plus a trailing literal `return`)
+/// classify into [`FunctionBodyFact::CountedFor`] or
+/// [`FunctionBodyFact::LoopUnsupported`]; every other loop statement (lone
+/// or plus a trailing `return`) is [`FunctionBodyFact::LoopUnsupported`]
+/// with its kind reason. Anything else is
 /// [`FunctionBodyFact::Complex`].
 fn function_body_fact(
     collector: &DeclCollector<'_>,
@@ -2168,8 +2205,15 @@ fn function_body_fact(
         }
         [Statement::TryStatement(candidate)] => try_catch_body(collector, candidate, None),
         [Statement::SwitchStatement(candidate)] => switch_body(collector, candidate),
+        [Statement::ForStatement(candidate)] => counted_for_body(collector, candidate, None),
+        [Statement::WhileStatement(_)] => loop_unsupported("while"),
+        [Statement::DoWhileStatement(_)] => loop_unsupported("do"),
+        [Statement::ForInStatement(_)] => loop_unsupported("for-in"),
+        [Statement::ForOfStatement(_)] => loop_unsupported("for-of"),
         [first, second] => joined_pair(collector, first, second)
             .or_else(|| try_tail_pair(collector, first, second))
+            .or_else(|| for_tail_pair(collector, first, second))
+            .or_else(|| loop_tail_pair(first, second))
             .or_else(|| straight_body(collector, body.statements.as_slice()))
             .unwrap_or(FunctionBodyFact::Complex),
         statements => straight_body(collector, statements).unwrap_or(FunctionBodyFact::Complex),
@@ -2651,6 +2695,254 @@ fn try_arm_return(
         Statement::ThrowStatement(_) => Err(decline("throw statement in")),
         _ => Err(decline("non-straight")),
     }
+}
+
+/// One non-`for` loop kind into its decline: `while`, `do`, `for-in`,
+/// and `for-of` loops stay outside the subset (explicitly out of scope —
+/// only the counted `for` idiom admits), each with its own reason.
+fn loop_unsupported(kind: &str) -> FunctionBodyFact {
+    FunctionBodyFact::LoopUnsupported {
+        reason: format!("{kind} loop is outside the subset"),
+    }
+}
+
+/// A `for` statement plus a trailing `return <expr>;`: the tail checks as
+/// another position solver-side when the loop is counted (the P039
+/// `try`-tail precedent). A non-counted loop still declines with its kind
+/// reason (never a partial verdict over the tail). Anything else in either
+/// position yields `None` (the caller falls through to the straight body,
+/// then [`FunctionBodyFact::Complex`]).
+#[must_use]
+fn for_tail_pair(
+    collector: &DeclCollector<'_>,
+    first: &Statement<'_>,
+    second: &Statement<'_>,
+) -> Option<FunctionBodyFact> {
+    let Statement::ForStatement(candidate) = first else {
+        return None;
+    };
+    let Statement::ReturnStatement(tail) = second else {
+        return None;
+    };
+    let argument = tail.argument.as_ref()?;
+    Some(counted_for_body(collector, candidate, Some(argument)))
+}
+
+/// A non-`for` loop statement plus a trailing `return <expr>;`: the subset
+/// checks no position here (unlike `try`/`for` tails, loop-carried flow
+/// needs a fixpoint the subset refuses), so the whole body declines with
+/// the loop kind's reason — never a partial verdict over the tail.
+/// Anything else in either position yields `None` (the caller falls through
+/// to the straight body, then [`FunctionBodyFact::Complex`]).
+#[must_use]
+fn loop_tail_pair(first: &Statement<'_>, second: &Statement<'_>) -> Option<FunctionBodyFact> {
+    let kind = match first {
+        Statement::WhileStatement(_) => "while",
+        Statement::DoWhileStatement(_) => "do",
+        Statement::ForInStatement(_) => "for-in",
+        Statement::ForOfStatement(_) => "for-of",
+        _ => return None,
+    };
+    if !matches!(second, Statement::ReturnStatement(_)) {
+        return None;
+    }
+    Some(loop_unsupported(kind))
+}
+
+/// One `for` statement (plus an optional trailing return expression) into
+/// its [`FunctionBodyFact`]: the counted `for (let i = 0; i < N; i++)`
+/// shape with literal numeric bounds and a single-`return` body admits (a
+/// plain loop variable carries no facts — a `return i` over it classifies
+/// `NonLiteral` and the solver declines the whole declaration), while
+/// non-literal bounds, non-numeric bounds, non-idiom headers, infinite
+/// loops, `break`/`continue` bodies, and non-straight bodies or tails
+/// decline with distinct reasons (never a partial verdict).
+fn counted_for_body(
+    collector: &DeclCollector<'_>,
+    candidate: &ForStatement<'_>,
+    tail: Option<&Expression<'_>>,
+) -> FunctionBodyFact {
+    let unsupported = |reason: String| FunctionBodyFact::LoopUnsupported { reason };
+    if let Err(reason) = counted_header(collector.source, candidate) {
+        return unsupported(reason);
+    }
+    let body = match counted_body_return(collector, &candidate.body) {
+        Ok(fact) => fact,
+        Err(reason) => return unsupported(reason),
+    };
+    let tail = match tail {
+        None => None,
+        Some(argument) => match single_return_fact(collector, argument) {
+            Some(fact) => Some(fact),
+            None => {
+                return unsupported(
+                    "non-straight tail return after for loop is outside the subset".to_owned(),
+                );
+            }
+        },
+    };
+    FunctionBodyFact::CountedFor { body, tail }
+}
+
+/// Whether one `for` header is the counted `let ID = NUM; ID < NUM; ID++`
+/// idiom (`<` or `<=`, prefix or postfix increment): literal numeric bounds
+/// only, all three positions naming one identifier. A missing test is the
+/// infinite loop (probed tsc 7.0.2 P041: the body still checks per
+/// position); a non-literal init or bound needs value facts; a non-numeric
+/// literal needs const-eval; every other header shape (`var`,
+/// multi-declarator, non-identifier patterns, non-comparison tests,
+/// mismatched identifiers, non-`++` updates) is outside the simple idiom —
+/// each with its own reason.
+fn counted_header(source: &str, candidate: &ForStatement<'_>) -> Result<(), String> {
+    let shape = || "non-counted for loop shape is outside the subset".to_owned();
+    // A missing test is the infinite loop, whatever the init shape
+    // (`for(;;)` included): it precedes the init gates so the reason
+    // names the loop, not the header shape.
+    if candidate.test.is_none() {
+        return Err("infinite for loop is outside the subset".to_owned());
+    }
+    let Some(ForStatementInit::VariableDeclaration(init)) = candidate.init.as_ref() else {
+        return Err(shape());
+    };
+    if !matches!(init.kind, VariableDeclarationKind::Let) || init.declarations.len() != 1 {
+        return Err(shape());
+    }
+    let declarator = &init.declarations[0];
+    let BindingPattern::BindingIdentifier(binding) = &declarator.id else {
+        return Err(shape());
+    };
+    let Some(name) = slice_at(source, binding.span) else {
+        return Err(shape());
+    };
+    let Some(value) = declarator.init.as_ref() else {
+        return Err(shape());
+    };
+    check_bound(source, value)?;
+    let Some(test) = candidate.test.as_ref() else {
+        // Unreachable: missing tests return above as infinite loops.
+        return Err("infinite for loop is outside the subset".to_owned());
+    };
+    let Expression::BinaryExpression(comparison) = test else {
+        return Err(shape());
+    };
+    if !matches!(
+        comparison.operator,
+        BinaryOperator::LessThan | BinaryOperator::LessEqualThan
+    ) {
+        return Err(shape());
+    }
+    let Expression::Identifier(left) = &comparison.left else {
+        return Err(shape());
+    };
+    if slice_at(source, left.span) != Some(name) {
+        return Err(shape());
+    }
+    check_bound(source, &comparison.right)?;
+    let Some(update) = candidate.update.as_ref() else {
+        return Err(shape());
+    };
+    let Expression::UpdateExpression(increment) = update else {
+        return Err(shape());
+    };
+    if increment.operator != UpdateOperator::Increment {
+        return Err(shape());
+    }
+    let SimpleAssignmentTarget::AssignmentTargetIdentifier(target) = &increment.argument else {
+        return Err(shape());
+    };
+    if slice_at(source, target.span) != Some(name) {
+        return Err(shape());
+    }
+    Ok(())
+}
+
+/// Which literal family one counted-`for` bound belongs to: numeric
+/// literals admit; other literal spellings (strings, booleans, `null`,
+/// `undefined`) need const-eval the subset refuses; every other expression
+/// (identifiers like `n`, calls, unary `-1`, ...) needs value facts the
+/// subset refuses.
+enum BoundClass {
+    /// A numeric literal bound (`0`, `3`, ...).
+    Numeric,
+    /// A non-numeric literal bound (`"a"`, `true`, `null`, `undefined`).
+    NonNumeric,
+    /// Any non-literal bound (identifier, call, unary, ...).
+    NonLiteral,
+}
+
+/// Classifies one counted-`for` bound (the init value or the test bound)
+/// into its literal family, mirroring [`return_kind`] (only plain literals
+/// classify; the `undefined` identifier reads as its literal spelling).
+fn bound_class(source: &str, expression: &Expression<'_>) -> BoundClass {
+    match expression {
+        Expression::NumericLiteral(_) => BoundClass::Numeric,
+        Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_) => BoundClass::NonNumeric,
+        Expression::Identifier(ident)
+            if slice_at(source, ident.span).is_some_and(|text| text == "undefined") =>
+        {
+            BoundClass::NonNumeric
+        }
+        _ => BoundClass::NonLiteral,
+    }
+}
+
+/// Gates one counted-`for` bound into the numeric-literal rule: `Ok`
+/// admits, `Err` carries the family reason (never a forced verdict).
+fn check_bound(source: &str, expression: &Expression<'_>) -> Result<(), String> {
+    match bound_class(source, expression) {
+        BoundClass::Numeric => Ok(()),
+        BoundClass::NonNumeric => {
+            Err("non-numeric bound in for loop is outside the subset".to_owned())
+        }
+        BoundClass::NonLiteral => {
+            Err("non-literal bound in for loop is outside the subset".to_owned())
+        }
+    }
+}
+
+/// The single `return <expr>;` of one counted-`for` body: blocks peel while
+/// each holds exactly one statement (so `{{ return 1; }}` admits, mirroring
+/// [`divergent_return_arg`]'s block transparency and the switch block-wrap
+/// precedent). `break`/`continue` — bare or labelled (labels are the only
+/// value either statement carries) — decline with their own reason (both
+/// are clean in tsc, probed 7.0.2 P041: a pinned oracle-clean divergence,
+/// like fallthrough); every other non-single-return shape declines as
+/// non-straight.
+fn counted_body_return(
+    collector: &DeclCollector<'_>,
+    body: &Statement<'_>,
+) -> Result<SingleReturnFact, String> {
+    let mut single = body;
+    while let Statement::BlockStatement(block) = single {
+        let [only] = block.body.as_slice() else {
+            return Err("non-straight counted-for body is outside the subset".to_owned());
+        };
+        single = only;
+    }
+    let fact = match peel_labels(single) {
+        Statement::BreakStatement(_) | Statement::ContinueStatement(_) => {
+            return Err("break/continue in counted-for body is outside the subset".to_owned());
+        }
+        Statement::ReturnStatement(ret) => ret
+            .argument
+            .as_ref()
+            .and_then(|argument| single_return_fact(collector, argument)),
+        _ => None,
+    };
+    fact.ok_or_else(|| "non-straight counted-for body is outside the subset".to_owned())
+}
+
+/// Peels `label: ...` wrappers off one loop-body statement: labels change
+/// no checking meaning here (a labelled `return` still returns; a labelled
+/// `break` still breaks), so the caller classifies the inner statement —
+/// labelled `break`/`continue` ride the break/continue reason.
+fn peel_labels<'a>(mut statement: &'a Statement<'a>) -> &'a Statement<'a> {
+    while let Statement::LabeledStatement(labeled) = statement {
+        statement = &labeled.body;
+    }
+    statement
 }
 
 /// One `switch (x)` statement into its [`FunctionBodyFact`]: the checkable
@@ -5299,7 +5591,7 @@ export function f(a: string): string { return a + b; }
     }
 
     #[test]
-    fn function_facts_unadmitted_bodies_stay_complex() {
+    fn function_facts_unadmitted_bodies_decline() {
         let src = "function chain(flag: boolean): number {\n  if (flag) {\n    return 1;\n\
                    } else if (!flag) {\n    return 2;\n  } else {\n    return 3;\n  }\n}\n\
                    function tail(flag: boolean): number {\n  if (flag) {\n    return 1;\n  } else {\n\
@@ -5315,9 +5607,25 @@ export function f(a: string): string { return a + b; }
         let pf = parse_module(FileId(0), "u.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
         assert_eq!(pf.functions.len(), 7);
-        for fact in &pf.functions {
+        // Non-loop shapes stay complex, as does a `switch` paired with a
+        // tail return; loops decline with their kind reason (a lone
+        // infinite `for(;;)`, a `while` plus a tail return).
+        for fact in pf.functions.iter().take(4) {
             assert_eq!(fact.body, FunctionBodyFact::Complex);
         }
+        assert_eq!(pf.functions[5].body, FunctionBodyFact::Complex);
+        assert_eq!(
+            pf.functions[4].body,
+            FunctionBodyFact::LoopUnsupported {
+                reason: "infinite for loop is outside the subset".to_owned(),
+            }
+        );
+        assert_eq!(
+            pf.functions[6].body,
+            FunctionBodyFact::LoopUnsupported {
+                reason: "while loop is outside the subset".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -5381,6 +5689,83 @@ export function f(a: string): string { return a + b; }
             "non-literal switch discriminant is outside the subset"
         );
         assert_eq!(reasons[4], "non-literal case label is outside the subset");
+    }
+
+    #[test]
+    fn function_facts_counted_for_admits_body_and_tail() {
+        let src = "function total(): number {\n  for (let i = 0; i < 3; i++) {\n\
+                    return 1;\n  }\n  return 2;\n}\n\
+                    function lone(): number {\n  for (let i = 0; i <= 3; ++i) return \"oops\";\n}\n";
+        let pf = parse_module(FileId(0), "f.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let FunctionBodyFact::CountedFor { body, tail } = &pf.functions[0].body else {
+            panic!("expected counted-for, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(body.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, body.span), "1");
+        let tail = tail.as_ref().expect("trailing return");
+        assert_eq!(tail.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, tail.span), "2");
+        // A lone loop (no tail) admits too: `<=` bounds, prefix increments,
+        // and braceless single returns are the same idiom.
+        let FunctionBodyFact::CountedFor { body, tail } = &pf.functions[1].body else {
+            panic!("expected counted-for, got {:?}", pf.functions[1].body);
+        };
+        assert_eq!(body.kind, ReturnKind::String);
+        assert_eq!(slice_of(src, body.span), "\"oops\"");
+        assert!(tail.is_none());
+    }
+
+    #[test]
+    fn function_facts_loop_unsupported_reasons_are_distinct() {
+        let src = "function bound(n: number): number {\n  for (let i = 0; i < n; i++) {\n\
+                    return 1;\n  }\n  return 2;\n}\n\
+                    function text(): number {\n  for (let i = \"a\"; i < 3; i++) {\n\
+                    return 1;\n  }\n  return 2;\n}\n\
+                    function step(): number {\n  for (let i = 0; i < 3; i += 2) {\n\
+                    return 1;\n  }\n  return 2;\n}\n\
+                    function endless(): number {\n  for (;;) {\n    return 1;\n  }\n}\n\
+                    function stopped(): number {\n  for (let i = 0; i < 3; i++) {\n\
+                    break;\n  }\n  return 2;\n}\n\
+                    function heavy(): number {\n  for (let i = 0; i < 3; i++) {\n\
+                    i = i + 1;\n    return 1;\n  }\n  return 2;\n}\n\
+                    function whily(n: number): number {\n  while (n > 0) {\n    return 1;\n  }\n}\n";
+        let pf = parse_module(FileId(0), "v.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 7);
+        let reasons: Vec<&str> = pf
+            .functions
+            .iter()
+            .map(|fact| {
+                let FunctionBodyFact::LoopUnsupported { reason } = &fact.body else {
+                    panic!("expected loop-unsupported, got {:?}", fact.body);
+                };
+                reason.as_str()
+            })
+            .collect();
+        assert_eq!(
+            reasons[0],
+            "non-literal bound in for loop is outside the subset"
+        );
+        assert_eq!(
+            reasons[1],
+            "non-numeric bound in for loop is outside the subset"
+        );
+        assert_eq!(
+            reasons[2],
+            "non-counted for loop shape is outside the subset"
+        );
+        assert_eq!(reasons[3], "infinite for loop is outside the subset");
+        assert_eq!(
+            reasons[4],
+            "break/continue in counted-for body is outside the subset"
+        );
+        assert_eq!(
+            reasons[5],
+            "non-straight counted-for body is outside the subset"
+        );
+        assert_eq!(reasons[6], "while loop is outside the subset");
     }
 
     #[test]
