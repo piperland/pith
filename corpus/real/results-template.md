@@ -86,3 +86,64 @@ Counts are textual occurrences across each case's files; see
 | defu | import-from=2, export-kw=16, function-decl=3, arrow-fn=6, class-decl=0, interface-decl=1, type-alias=9, generic-arity=17, any-kw=12, unknown-kw=1, as-cast=5, try-kw=0, switch-kw=0, for-of=1, promise-kw=2, regex-lit=0 |
 | destr | import-from=0, export-kw=4, function-decl=4, arrow-fn=0, class-decl=0, interface-decl=0, type-alias=1, generic-arity=3, any-kw=4, unknown-kw=2, as-cast=10, try-kw=1, switch-kw=1, for-of=0, promise-kw=0, regex-lit=3 |
 | plimit-stress | import-from=3, export-kw=4, function-decl=2, arrow-fn=11, class-decl=0, interface-decl=0, type-alias=2, generic-arity=10, any-kw=1, unknown-kw=2, as-cast=0, try-kw=0, switch-kw=0, for-of=0, promise-kw=14, regex-lit=0 |
+
+## P042 M4 re-trial (EXECUTED 2026-10-02, E2B Linux — 1/33 HOLDS)
+
+Method (P026 prescan method, same): per-case parse+bind wall times (no win
+claims) + EVERY executable file through `check_program` via the unchanged
+P027–P029 drivers in `crates/pith-solver/tests/e2e_check_real_defu.rs` (no
+driver edits — counts and verdicts below match the P027–P029 pins exactly,
+so no pinning was needed). Engine: P031–P041 at `de621c7` (clean tree).
+Box `i3v5zh3e1u82fhul7wvdd` (4vCPU/8GB), rustc/cargo 1.98.1, clippy/rustfmt
+present. Tree identity: 5/5 corpus sha256 match `SOURCES.md` pins.
+`cargo test --test e2e_check_real_defu -- --nocapture` ×3 runs: 3 passed,
+0 failed each, EXIT=0 ×3. Oracle baselines carried from P026 (files
+byte-identical to pins; no oracle re-run). Zero diagnostics in all 5 files
+across all 3 runs; note/diag line count 30/30/30 (all notes, deterministic).
+
+Per-case walls (parse_bind / check ms; medians of 3 runs, raw in parens):
+defu 3/0 (3,2,3), destr 1/0 (1,1,1), plimit-stress 0/0 (0,1,0). Pith measures
+parse+bind+subset-check vs tsc full check (P026 medians 416/404/438): NO
+comparison claims, different work.
+
+Per-file executed verdicts (identical 3/3 runs):
+- `defu/src/_utils.ts` — decline: complex body on `isPlainObject`
+  (control flow outside the subset). 0 diag, 2 unsupported.
+- `defu/src/types.ts` — decline by design: type-only file, 0 diag,
+  0 unsupported (aliases/interface emit no checkable facts; nothing fed).
+- `defu/src/defu.ts` — CONFIRM: `DEFU_IMPORT_VERDICT: CONFIRM silent
+  (1/33 holds)` 3/3; other 8 constructs decline. 0 diag, 17 unsupported.
+- `destr/src/index.ts` — decline, CONFIRMS projection: complex bodies ×3
+  (`jsonParseTransform`, `warnKeyDropped`, `destr`), non-literal return
+  (`safeDestr`), 4 unannotated consts, 1 `Options`-param call note.
+  0 diag, 9 unsupported.
+- `plimit-stress/index.d.ts` — decline, CONFIRMS projection: ambient
+  overload signatures with no body (`pLimit`, `limitFunction`).
+  0 diag, 2 unsupported.
+
+Coverage: **1/33 EXECUTED** (M3 baseline holds — no M4 admission flips any
+of the 32 declines; every decline still hits an established reason).
+
+v3 reason refinements (decline stands, reason refined by M4 machinery):
+- defu #4 `createDefu`: optional/rest params now range-admit (P037), so the
+  decline moved from arity to named-type `Merger` (×3 call notes).
+- destr #8 call site: the options-range note now names parameter type
+  `Options` (P037 optional-member machinery resolves one step further).
+All other 30 constructs confirm their v2 reasons verbatim.
+
+Ranked gaps (executed unsupported-note frequency, n=30):
+1. Unannotated decls, no inference — 11 notes, 3 files (defu.ts ×6,
+   destr ×4, _utils ×1). Ex: `const suspectProtoRx = /…/`.
+2. Named/generic param types — 7 notes, 2 files (`T` ×3, `Merger` ×3,
+   `Options` ×1). Ex: `_defu<T>(baseObject: T, …)`.
+3. Complex bodies — 4 notes, 2 files (`isPlainObject`,
+   `jsonParseTransform`, `warnKeyDropped`, `destr`). Ex: destr's
+   switch+try/throw body.
+4. Undeclared callback names — 3 notes, 1 file (`merger` ×1,
+   `currentValue` ×2 in the `defuFn`/`defuArrayFn` arrows).
+5. Ambient overloads without bodies — 2 notes, 1 file (`pLimit`,
+   `limitFunction`).
+6. Non-literal return — 1 (`safeDestr` spread call); cross-file named
+   return + unannotated param — 2 (`DefuFunction` return, `namespace`).
+Module boilerplate (default exports, type-only import/re-export) declines
+by design with no attached notes (prescan-counted, not executed-noted).
