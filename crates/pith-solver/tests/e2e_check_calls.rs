@@ -171,6 +171,9 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     };
     FunctionReturn {
         kind,
+        // Bare-identifier tails stay `None` here (see the check-functions
+        // driver): only guard-effect tails resolve through P048.
+        init_ident: None,
         init_object,
         // No array-member facts yet (see the check-functions driver).
         init_array: None,
@@ -224,7 +227,8 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 // suite holds one, so outcomes are unchanged; faithful
                 // mapping lives in e2e_check_functions. P039 try/catch
                 // bodies, P041 counted-`for` bodies, P043 throw bodies,
-                // and P045 else-if chains decline the same way.
+                // P045 else-if chains, and P050 guard chains decline the
+                // same way.
                 FunctionBodyFact::StraightBody { .. }
                 | FunctionBodyFact::TryCatch { .. }
                 | FunctionBodyFact::TryUnsupported { .. }
@@ -236,6 +240,8 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 | FunctionBodyFact::StraightThrow { .. }
                 | FunctionBodyFact::ElseIfChain { .. }
                 | FunctionBodyFact::ElseIfUnsupported { .. }
+                | FunctionBodyFact::GuardChain { .. }
+                | FunctionBodyFact::GuardChainUnsupported { .. }
                 | FunctionBodyFact::EffectOnly { .. }
                 | FunctionBodyFact::GuardEffect { .. }
                 | FunctionBodyFact::EffectUnsupported { .. }

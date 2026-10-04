@@ -166,6 +166,9 @@ fn functions_from_handfed(
                 return_annotation: Some(spec.return_annotation.to_owned()),
                 body: FunctionBody::SingleReturn(FunctionReturn {
                     kind: spec.kind,
+                    // Hand-fed lib returns are literal kinds (see the
+                    // check-functions driver): no identifier seam.
+                    init_ident: None,
                     init_object: None,
                     init_array: spec.members.map(|members| ArrayInit {
                         members: members.to_vec(),

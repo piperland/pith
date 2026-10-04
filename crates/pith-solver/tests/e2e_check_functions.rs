@@ -81,6 +81,19 @@
 //! its distinct reason): `void-effect-guard-two-calls`,
 //! `void-effect-guard-nonallowlist`, and
 //! `void-effect-guard-valued-return`.
+//! Sequential guard-return chains check per guard plus the tail (P050):
+//! `guard-chain-clean` is silent with zero notes; `guard-chain-wrong-guard`
+//! and `guard-chain-wrong-tail` match their oracle `TS2322`s (positions
+//! check independently — a wrong guard and a wrong tail each report once).
+//! Two more fixtures diverge by design: `guard-chain-missing-tail` (the
+//! oracle errors `TS2366` where the subset rides the missing-tail gate —
+//! silent plus one unsupported note) and
+//! `guard-chain-interleaved-declined` (the oracle is clean where the subset
+//! declines on the mid-run `const` — pins the clean baseline plus one
+//! unsupported note with its distinct reason). Guard-effect ident tails
+//! compose with P048 (the V049 gap): `void-effect-guard-ident-tail`
+//! matches its oracle `TS2322` (the bare-identifier tail resolves one level
+//! to the string parameter, then checks like a literal).
 //! Else-if chain bodies check per branch in source order (P045):
 //! `elseif-clean` is silent with zero notes; `elseif-branch-wrong` matches
 //! its oracle `TS2322`; `elseif-two-wrong` matches twice. Three more
@@ -108,16 +121,17 @@
 use pith_frontend::{
     parse_module, CastFact as FrontendCastFact, CastKind as FrontendCastKind,
     CastOperandKind as FrontendCastOperandKind, EffectCallFact as FrontendEffectCall,
-    FunctionBodyFact, InitKind as FrontendInitKind, InnerDeclFact as FrontendInnerDecl, ParsedFile,
-    ReturnKind as FrontendReturnKind, SingleReturnFact as FrontendReturn,
+    FunctionBodyFact, FunctionFact as FrontendFunction, InitKind as FrontendInitKind,
+    InnerDeclFact as FrontendInnerDecl, ParsedFile, ReturnKind as FrontendReturnKind,
+    SingleReturnFact as FrontendReturn,
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
     check_functions, CastInput, CastKind, CountedForBody, DeclKind, EffectCall, ElseIfChainBody,
-    FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardEffectBody,
-    GuardThrowBody, InitKind, InnerDecl, JoinedReturns, ObjectInit, ObjectMemberInit,
-    ObjectMemberKind, StraightBody, StraightThrowBody, SwitchBody, TryCatchBody,
+    FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardChainBody,
+    GuardEffectBody, GuardThrowBody, InitKind, InnerDecl, JoinedReturns, ObjectInit,
+    ObjectMemberInit, ObjectMemberKind, StraightBody, StraightThrowBody, SwitchBody, TryCatchBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -212,12 +226,45 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     };
     FunctionReturn {
         kind,
+        // Bare-identifier tails stay `None` here: only guard-effect tails
+        // resolve through P048 (see `map_ident_tail`), so every other
+        // position keeps its historical non-literal path.
+        init_ident: None,
         init_object,
         // No array-member facts yet (adapter classifies `[ ... ]` as
         // non-literal): array returns decline in `shape_return` until the
         // adapter emits them.
         init_array: None,
         cast: ret.cast.as_ref().map(map_cast),
+    }
+}
+
+/// Maps one frontend guard-effect tail to the solver's: the literal shape
+/// through [`map_function_return`] plus the P048 seam for bare-identifier
+/// tails (mirrors [`map_inner_decl`]: the adapter emits no identifier facts
+/// for returns either, so the name slices from the return span — bare
+/// identifiers only, so parenthesized idents keep the historical decline).
+fn map_ident_tail(source: &str, ret: &FrontendReturn) -> FunctionReturn {
+    let mut mapped = map_function_return(ret);
+    let bare = mapped.kind == Some(InitKind::NonLiteral)
+        && mapped.init_object.is_none()
+        && mapped.cast.is_none();
+    if bare {
+        mapped.init_ident = slice_of(source, ret.span)
+            .filter(|text| is_bare_identifier(text))
+            .map(str::to_owned);
+    }
+    mapped
+}
+
+/// Maps one frontend guard chain body to the solver's: one return per guard
+/// in source order plus the terminal return, each through
+/// [`map_function_return`] (same `init_array: None` seam as every other
+/// return position).
+fn map_guard_chain(guards: &[FrontendReturn], tail: &FrontendReturn) -> GuardChainBody {
+    GuardChainBody {
+        guards: guards.iter().map(map_function_return).collect(),
+        tail: map_function_return(tail),
     }
 }
 
@@ -488,79 +535,94 @@ fn fallback_span(
 ///   (always fresh: only direct syntactic literals carry them), assertion
 ///   positions carry casts, and straight bodies map leading declarators
 ///   plus the tail return through [`map_straight`].
+///
+/// Maps one frontend body fact to the solver's, faithfully (every field
+/// from adapter facts; only the enum translation is driver-side). Split
+/// out so `functions_from_facts` stays within the line budget.
+fn map_body(
+    func: &FrontendFunction,
+    parsed: &ParsedFile,
+    binder: &Binder,
+    source: &str,
+) -> FunctionBody {
+    match &func.body {
+        FunctionBodyFact::SingleReturn(ret) => FunctionBody::SingleReturn(map_function_return(ret)),
+        FunctionBodyFact::SequenceReturns { first, second } => {
+            FunctionBody::SequenceReturns(map_joined(first, second))
+        }
+        FunctionBodyFact::GuardReturn { guard, tail } => {
+            FunctionBody::GuardReturn(map_joined(guard, tail))
+        }
+        FunctionBodyFact::GuardChain { guards, tail } => {
+            FunctionBody::GuardChain(map_guard_chain(guards, tail))
+        }
+        FunctionBodyFact::GuardChainUnsupported { reason } => FunctionBody::GuardChainUnsupported {
+            reason: reason.clone(),
+        },
+        FunctionBodyFact::BranchReturns {
+            then_branch,
+            else_branch,
+        } => FunctionBody::BranchReturns(map_joined(then_branch, else_branch)),
+        FunctionBodyFact::StraightBody { leading, tail } => {
+            FunctionBody::StraightBody(map_straight(parsed, binder, leading, tail, source))
+        }
+        FunctionBodyFact::TryCatch {
+            try_branch,
+            catch_branch,
+            tail,
+        } => FunctionBody::TryCatch(map_try_catch(try_branch, catch_branch, tail.as_ref())),
+        FunctionBodyFact::Switch { cases, default } => {
+            FunctionBody::Switch(map_switch(cases, default.as_ref()))
+        }
+        FunctionBodyFact::CountedFor { body, tail } => {
+            FunctionBody::CountedFor(map_counted_for(body, tail.as_ref()))
+        }
+        FunctionBodyFact::ElseIfChain { branches } => {
+            FunctionBody::ElseIfChain(map_else_if(branches))
+        }
+        FunctionBodyFact::ElseIfUnsupported { reason } => FunctionBody::ElseIfUnsupported {
+            reason: reason.clone(),
+        },
+        FunctionBodyFact::GuardThrow { tail } => FunctionBody::GuardThrow(GuardThrowBody {
+            tail: map_function_return(tail),
+        }),
+        FunctionBodyFact::EffectOnly { call } => FunctionBody::EffectOnly(map_effect_call(call)),
+        FunctionBodyFact::GuardEffect { call, tail } => {
+            FunctionBody::GuardEffect(GuardEffectBody {
+                call: map_effect_call(call),
+                tail: tail.as_ref().map(|ret| map_ident_tail(source, ret)),
+            })
+        }
+        FunctionBodyFact::EffectUnsupported { reason } => FunctionBody::EffectUnsupported {
+            reason: reason.clone(),
+        },
+        FunctionBodyFact::StraightThrow { leading, tail } => FunctionBody::StraightThrow(
+            map_straight_throw(parsed, binder, leading, tail.as_ref(), source),
+        ),
+        FunctionBodyFact::TryUnsupported { reason } => FunctionBody::TryUnsupported {
+            reason: reason.clone(),
+        },
+        FunctionBodyFact::LoopUnsupported { reason } => FunctionBody::LoopUnsupported {
+            reason: reason.clone(),
+        },
+        FunctionBodyFact::SwitchUnsupported { reason } => FunctionBody::SwitchUnsupported {
+            reason: reason.clone(),
+        },
+        FunctionBodyFact::NoBody { declared } => FunctionBody::NoBody {
+            declared: *declared,
+        },
+        FunctionBodyFact::Empty => FunctionBody::Empty,
+        FunctionBodyFact::Complex => FunctionBody::Complex,
+    }
+}
+
 fn functions_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<FunctionDecl> {
     parsed
         .functions
         .iter()
         .map(|func| {
             let (name, span, symbol) = fallback_span(parsed, binder, func.symbol, func.scope);
-            let body = match &func.body {
-                FunctionBodyFact::SingleReturn(ret) => {
-                    FunctionBody::SingleReturn(map_function_return(ret))
-                }
-                FunctionBodyFact::SequenceReturns { first, second } => {
-                    FunctionBody::SequenceReturns(map_joined(first, second))
-                }
-                FunctionBodyFact::GuardReturn { guard, tail } => {
-                    FunctionBody::GuardReturn(map_joined(guard, tail))
-                }
-                FunctionBodyFact::BranchReturns {
-                    then_branch,
-                    else_branch,
-                } => FunctionBody::BranchReturns(map_joined(then_branch, else_branch)),
-                FunctionBodyFact::StraightBody { leading, tail } => {
-                    FunctionBody::StraightBody(map_straight(parsed, binder, leading, tail, source))
-                }
-                FunctionBodyFact::TryCatch {
-                    try_branch,
-                    catch_branch,
-                    tail,
-                } => FunctionBody::TryCatch(map_try_catch(try_branch, catch_branch, tail.as_ref())),
-                FunctionBodyFact::Switch { cases, default } => {
-                    FunctionBody::Switch(map_switch(cases, default.as_ref()))
-                }
-                FunctionBodyFact::CountedFor { body, tail } => {
-                    FunctionBody::CountedFor(map_counted_for(body, tail.as_ref()))
-                }
-                FunctionBodyFact::ElseIfChain { branches } => {
-                    FunctionBody::ElseIfChain(map_else_if(branches))
-                }
-                FunctionBodyFact::ElseIfUnsupported { reason } => FunctionBody::ElseIfUnsupported {
-                    reason: reason.clone(),
-                },
-                FunctionBodyFact::GuardThrow { tail } => FunctionBody::GuardThrow(GuardThrowBody {
-                    tail: map_function_return(tail),
-                }),
-                FunctionBodyFact::EffectOnly { call } => {
-                    FunctionBody::EffectOnly(map_effect_call(call))
-                }
-                FunctionBodyFact::GuardEffect { call, tail } => {
-                    FunctionBody::GuardEffect(GuardEffectBody {
-                        call: map_effect_call(call),
-                        tail: tail.as_ref().map(map_function_return),
-                    })
-                }
-                FunctionBodyFact::EffectUnsupported { reason } => FunctionBody::EffectUnsupported {
-                    reason: reason.clone(),
-                },
-                FunctionBodyFact::StraightThrow { leading, tail } => FunctionBody::StraightThrow(
-                    map_straight_throw(parsed, binder, leading, tail.as_ref(), source),
-                ),
-                FunctionBodyFact::TryUnsupported { reason } => FunctionBody::TryUnsupported {
-                    reason: reason.clone(),
-                },
-                FunctionBodyFact::LoopUnsupported { reason } => FunctionBody::LoopUnsupported {
-                    reason: reason.clone(),
-                },
-                FunctionBodyFact::SwitchUnsupported { reason } => FunctionBody::SwitchUnsupported {
-                    reason: reason.clone(),
-                },
-                FunctionBodyFact::NoBody { declared } => FunctionBody::NoBody {
-                    declared: *declared,
-                },
-                FunctionBodyFact::Empty => FunctionBody::Empty,
-                FunctionBodyFact::Complex => FunctionBody::Complex,
-            };
+            let body = map_body(func, parsed, binder, source);
             FunctionDecl {
                 name,
                 span,
@@ -709,6 +771,30 @@ fixture_test!(
     guard_return_matches_ts2322,
     "guard-return.ts",
     "guard-return.expected.txt",
+    0
+);
+fixture_test!(
+    guard_chain_clean_is_silent,
+    "guard-chain-clean.ts",
+    "guard-chain-clean.expected.txt",
+    0
+);
+fixture_test!(
+    guard_chain_wrong_guard_matches_ts2322,
+    "guard-chain-wrong-guard.ts",
+    "guard-chain-wrong-guard.expected.txt",
+    0
+);
+fixture_test!(
+    guard_chain_wrong_tail_matches_ts2322,
+    "guard-chain-wrong-tail.ts",
+    "guard-chain-wrong-tail.expected.txt",
+    0
+);
+fixture_test!(
+    void_effect_guard_ident_tail_matches_ts2322,
+    "void-effect-guard-ident-tail.ts",
+    "void-effect-guard-ident-tail.expected.txt",
     0
 );
 fixture_test!(
@@ -1350,6 +1436,72 @@ fn throw_complex_decline_pins_clean_oracle() {
         include_str!("../../../corpus/check-functions/throw-complex-declined.ts"),
         include_str!("../../../corpus/check-functions/throw-complex-declined.expected.txt"),
         "complex body on 'branchThrow': control flow is outside the subset",
+    );
+}
+
+#[test]
+fn guard_chain_missing_tail_declines_where_oracle_errors_ts2366() {
+    // By design the subset declines where the oracle errors: tsc reports
+    // `TS2366` on the missing tail return (exhaustiveness needs a
+    // declaration-completeness family the subset refuses — probed 7.0.2
+    // P050) while the solver records one unsupported note and stays silent
+    // — never a forced verdict, never a partial one over the guards.
+    let source = include_str!("../../../corpus/check-functions/guard-chain-missing-tail.ts");
+    let expected =
+        include_str!("../../../corpus/check-functions/guard-chain-missing-tail.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2366".to_owned(),
+            "Function lacks ending return statement and return type does not include \
+            'undefined'."
+                .to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason,
+        "missing tail return after guard returns is outside the subset",
+        "recorded reason"
+    );
+}
+
+#[test]
+fn guard_chain_interleaved_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: a `const`
+    // between the guards is clean in tsc (probed 7.0.2 P050) while the
+    // solver records one unsupported note with the interleaved reason —
+    // never a partial verdict over the guards or the tail.
+    let src = include_str!("../../../corpus/check-functions/guard-chain-interleaved-declined.ts");
+    let expected = include_str!(
+        "../../../corpus/check-functions/guard-chain-interleaved-declined.expected.txt"
+    );
+    expect_clean_oracle_decline(
+        "guard_chain_interleaved_decline_pins_clean_oracle",
+        src,
+        expected,
+        "non-guard statement between guard returns is outside the subset",
+    );
+}
+
+#[test]
+fn guard_chain_two_wrong_reports_twice() {
+    // Positions check independently (probed 7.0.2 P050 probe `g`): a wrong
+    // guard plus a wrong tail report twice, once per position.
+    expect_differential(
+        "guard_chain_two_wrong_reports_twice",
+        "function chained(a: boolean, b: boolean): number {\n  if (a) return \"oops\";\n\
+        if (b) return 2;\n  return \"bad\";\n}\n",
+        "inline.ts:TS2322: Type 'string' is not assignable to type 'number'.\n\
+        inline.ts:TS2322: Type 'string' is not assignable to type 'number'.",
+        0,
     );
 }
 
