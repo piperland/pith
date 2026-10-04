@@ -486,6 +486,8 @@ fn calls_from_facts(
                         span: arg.span,
                         cast: None,
                         ident: call_arg_ident(source, arg),
+                        // Generic drivers never feed object members.
+                        arg_object: None,
                     })
                     .collect(),
             },

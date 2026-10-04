@@ -36,21 +36,35 @@
 //! still diagnoses; `generic-param-declined` pins the legacy `T` decline
 //! against a clean oracle. The named scope is driver-collected from the
 //! adapter's interface/alias facts (names only — opaque reads nothing
-//! else). Overload any-match, union arities, and the gap spelling
+//! else). Structural admission (P062) checks object-literal arguments
+//! member-wise against LOCAL interface shapes through the shared P017
+//! comparison: `named-structural-clean`/`wrong`/`excess`/`missing` match
+//! their oracle families with zero unsupported, while
+//! `named-structural-imported-declined` (no local shape — legacy decline),
+//! `named-structural-methoded-declined` (methoded shape — complex-member
+//! decline), `named-structural-nonliteral.ts` (identifier args
+//! decline distinctly, call results keep the opaque decline), and
+//! `named-alias-call-declined` (no alias tables — opaque decline) pin
+//! their divergences explicitly. Object-literal members ride per-fixture
+//! hand-fed tables ([`NamedArgShape`] — the adapter emits no call-argument
+//! member facts); identifier names slice from fact spans (the P061 seam);
+//! everything else keeps the zero-hand-feeding rule. Overload any-match,
+//! union arities, and the gap spelling
 //! all match (P044 converted the old `overloads-declined` divergence into
 //! a `TS2554` match). Ranges, rest minima, and rest-element checks all
 //! match (P037 converted the old `rest-param-declined` divergence into a
 //! silent match).
 
 use pith_frontend::{
-    parse_module, CallArgKind as FrontendCallArgKind, FunctionBodyFact, ParsedFile,
-    ReturnKind as FrontendReturnKind, SingleReturnFact as FrontendReturn,
+    parse_module, CallArgFact as FrontendCallArg, CallArgKind as FrontendCallArgKind,
+    FunctionBodyFact, ParsedFile, ReturnKind as FrontendReturnKind,
+    SingleReturnFact as FrontendReturn,
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_solver::{
     check_calls, check_calls_with_named_types, CallArg, CallSite, FileReport, FunctionBody,
-    FunctionDecl, FunctionParam, FunctionReturn, InitKind, JoinedReturns, NamedTypeScope,
-    ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    FunctionDecl, FunctionParam, FunctionReturn, InitKind, InterfaceHeritage, InterfaceMember,
+    InterfaceShape, JoinedReturns, NamedTypeScope, ObjectInit, ObjectMemberInit, ObjectMemberKind,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -298,8 +312,157 @@ fn calls_from_facts(parsed: &ParsedFile) -> Vec<CallSite> {
                     cast: None,
                     // Non-generic call drivers never feed identifier names.
                     ident: None,
+                    // Fact-only drivers never feed object members (see
+                    // `calls_from_facts_named` for the hand-fed seam).
+                    arg_object: None,
                 })
                 .collect(),
+        })
+        .collect()
+}
+
+/// Slices `source` at a fact span (`None` on skew — only possible with
+/// recovery from parse errors; mirrors the check-const driver's seam).
+fn slice_of(source: &str, span: Span) -> Option<&str> {
+    let lo = usize::try_from(span.lo).ok()?;
+    let hi = usize::try_from(span.hi).ok()?;
+    source.get(lo..hi)
+}
+
+/// Whether sliced text is a bare identifier (mirrors the check-const
+/// driver's check).
+fn is_bare_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_' || character == '$')
+}
+
+/// Slices one call argument's bare-identifier name (the P061 seam): `Some`
+/// only for `NonLiteral` arguments whose fact span slices to a bare
+/// identifier — literals and every other shape feed `None` and keep their
+/// historical paths.
+fn call_arg_ident(source: &str, arg: &FrontendCallArg) -> Option<String> {
+    if arg.kind != FrontendCallArgKind::NonLiteral {
+        return None;
+    }
+    slice_of(source, arg.span)
+        .filter(|text| is_bare_identifier(text))
+        .map(str::to_owned)
+}
+
+/// One hand-fed object-literal argument shape (P062): the `call`-th call in
+/// file order, its `arg`-th argument, and the member facts the adapter
+/// cannot emit yet. Drivers feed one entry per object-literal argument in
+/// the fixture; every other argument keeps `arg_object: None` (identifiers
+/// slice their name through the P061 seam above, everything else stays
+/// unshaped and keeps the opaque decline).
+struct NamedArgShape<'a> {
+    /// Index into [`ParsedFile::calls`] in file order.
+    call: usize,
+    /// Index into the call's arguments.
+    arg: usize,
+    /// Member facts in literal source order.
+    members: &'a [(&'a str, ObjectMemberKind)],
+}
+
+/// The named-type call-site driver: adapter facts plus two disclosed seams —
+/// sliced identifier names (P061) and hand-fed object-literal members
+/// (P062, asserted fresh literals below). Arity, spans, and shapes still
+/// come from facts; only the sliced names and member lists are hand-fed,
+/// and both vanish when the adapter emits the facts.
+fn calls_from_facts_named(
+    parsed: &ParsedFile,
+    source: &str,
+    shapes: &[NamedArgShape<'_>],
+) -> Vec<CallSite> {
+    parsed
+        .calls
+        .iter()
+        .enumerate()
+        .map(|(call_index, call)| CallSite {
+            callee: call.callee.clone(),
+            callee_span: call.callee_span,
+            span: call.span,
+            args: call
+                .args
+                .iter()
+                .enumerate()
+                .map(|(arg_index, arg)| {
+                    let arg_object = shapes
+                        .iter()
+                        .find(|shape| shape.call == call_index && shape.arg == arg_index)
+                        .map(|shape| {
+                            assert_eq!(
+                                arg.kind,
+                                FrontendCallArgKind::NonLiteral,
+                                "shaped args are object literals"
+                            );
+                            assert!(arg.cast.is_none(), "shaped args carry no assertions");
+                            ObjectInit {
+                                members: shape
+                                    .members
+                                    .iter()
+                                    .map(|(name, kind)| ObjectMemberInit {
+                                        name: (*name).to_owned(),
+                                        kind: *kind,
+                                    })
+                                    .collect(),
+                                fresh: true,
+                            }
+                        });
+                    CallArg {
+                        kind: map_call_arg_kind(arg.kind),
+                        span: arg.span,
+                        cast: None,
+                        ident: call_arg_ident(source, arg),
+                        arg_object,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Maps every [`ParsedFile::interfaces`] fact onto an [`InterfaceShape`]
+/// (mechanical copy of the check-interfaces driver, with the binder
+/// [`SymbolId`] resolved from the checking [`Binder`] — the linkage that
+/// tells a local shape from an imported name).
+fn shapes_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<InterfaceShape> {
+    parsed
+        .interfaces
+        .iter()
+        .map(|fact| {
+            let id = binder
+                .resolve(parsed.file, fact.scope, &fact.name)
+                .unwrap_or_else(|| panic!("interface '{}' links nothing", fact.name));
+            InterfaceShape {
+                name: fact.name.clone(),
+                scope: fact.scope,
+                symbol: Some(id),
+                span: fact.span,
+                members: fact
+                    .members
+                    .iter()
+                    .map(|member| InterfaceMember {
+                        name: member.name.clone(),
+                        annotation_text: member.annotation_text.clone(),
+                        optional: member.optional,
+                        span: member.span,
+                        complex_reason: member.complex_reason.clone(),
+                    })
+                    .collect(),
+                heritage: fact
+                    .heritage
+                    .iter()
+                    .map(|parent| InterfaceHeritage {
+                        name: parent.name.clone(),
+                        span: parent.span,
+                    })
+                    .collect(),
+                has_type_params: fact.has_type_params,
+                exported: fact.exported,
+            }
         })
         .collect()
 }
@@ -349,6 +512,17 @@ fn run_pipeline(source: &str) -> (ParsedFile, FileReport) {
 /// interface/alias facts (opaque means only names are ever read — no
 /// member or target facts flow, mirroring the zero-hand-feeding rule).
 fn run_pipeline_named(source: &str) -> (ParsedFile, FileReport) {
+    run_pipeline_named_shaped(source, &[])
+}
+
+/// Runs the named pipeline with hand-fed object-literal argument shapes
+/// (P062): `shapes` feeds one member list per object-literal argument (see
+/// [`NamedArgShape`]); interface shapes map from facts (see
+/// [`shapes_from_facts`]).
+fn run_pipeline_named_shaped(
+    source: &str,
+    arg_shapes: &[NamedArgShape<'_>],
+) -> (ParsedFile, FileReport) {
     let parsed = parse_module(FILE, "fixture.ts", source);
     let frontend_errors = &parsed.errors;
     assert!(
@@ -357,7 +531,7 @@ fn run_pipeline_named(source: &str) -> (ParsedFile, FileReport) {
     );
     let binder = build_binder(&parsed);
     let decls = functions_from_facts(&parsed, &binder);
-    let calls = calls_from_facts(&parsed);
+    let calls = calls_from_facts_named(&parsed, source, arg_shapes);
     let mut owned: Vec<String> = parsed
         .interfaces
         .iter()
@@ -365,7 +539,11 @@ fn run_pipeline_named(source: &str) -> (ParsedFile, FileReport) {
         .collect();
     owned.extend(parsed.aliases.iter().map(|alias| alias.name.clone()));
     let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let scope = NamedTypeScope { names: &refs };
+    let shapes = shapes_from_facts(&parsed, &binder);
+    let scope = NamedTypeScope {
+        names: &refs,
+        interfaces: &shapes,
+    };
     let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
     (parsed, report)
 }
@@ -735,6 +913,343 @@ fn generic_param_call_declines_as_before_and_pins_clean_oracle() {
     assert_eq!(
         report.unsupported[0].reason,
         "call to 'identity': parameter type 'T' for 'x' is outside the subset"
+    );
+}
+
+/// Asserts the named pipeline verdict differentially equals the recorded
+/// baseline with hand-fed object-literal argument shapes (P062): same
+/// `(code-family, message)` multiset (`TS`/`PITH` prefixes folded) and the
+/// expected unsupported count, with sane anchored spans throughout.
+fn expect_differential_named(
+    name: &str,
+    source: &str,
+    expected: &str,
+    unsupported: usize,
+    arg_shapes: &[NamedArgShape<'_>],
+) {
+    let (_, report) = run_pipeline_named_shaped(source, arg_shapes);
+    let mut actual: Vec<(String, String)> = report
+        .diagnostics
+        .iter()
+        .map(|diag| {
+            let family = diag
+                .code
+                .strip_prefix("PITH")
+                .unwrap_or(diag.code.as_str())
+                .to_owned();
+            (format!("TS{family}"), diag.message.clone())
+        })
+        .collect();
+    actual.sort();
+    let want = parse_baseline(expected);
+    assert_eq!(
+        actual, want,
+        "{name}: pipeline diagnostics diverge from oracle baseline"
+    );
+    let unsupported_notes = &report.unsupported;
+    assert_eq!(
+        report.unsupported.len(),
+        unsupported,
+        "{name}: unsupported count: {unsupported_notes:?}"
+    );
+    for diag in &report.diagnostics {
+        assert_eq!(diag.file, FILE, "{name}: diagnostic file");
+        assert!(diag.span.lo < diag.span.hi, "{name}: degenerate span");
+    }
+    for note in &report.unsupported {
+        assert_eq!(note.file, FILE, "{name}: unsupported file");
+        assert!(note.span.lo < note.span.hi, "{name}: degenerate span");
+    }
+}
+
+#[test]
+fn named_structural_clean_matches_oracle() {
+    // P062: a matching object arg checks member-wise against the local
+    // shape — silent on both sides.
+    let source = include_str!("../../../corpus/check-calls/named-structural-clean.ts");
+    let expected = include_str!("../../../corpus/check-calls/named-structural-clean.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on the matching call"
+    );
+    expect_differential_named(
+        "named_structural_clean_matches_oracle",
+        source,
+        expected,
+        0,
+        &[NamedArgShape {
+            call: 0,
+            arg: 0,
+            members: &[
+                ("x", ObjectMemberKind::Number),
+                ("y", ObjectMemberKind::String),
+            ],
+        }],
+    );
+}
+
+#[test]
+fn named_structural_wrong_matches_ts2322() {
+    // P062: one `TS2322` per wrong member, first-mismatch per call (probed
+    // 7.0.2 `b`/`i`).
+    let source = include_str!("../../../corpus/check-calls/named-structural-wrong.ts");
+    let expected = include_str!("../../../corpus/check-calls/named-structural-wrong.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            (
+                "TS2322".to_owned(),
+                "Type 'number' is not assignable to type 'string'.".to_owned()
+            ),
+            (
+                "TS2322".to_owned(),
+                "Type 'string' is not assignable to type 'number'.".to_owned()
+            ),
+            (
+                "TS2322".to_owned(),
+                "Type 'string' is not assignable to type 'number'.".to_owned()
+            ),
+        ],
+        "oracle baseline pins the per-member verdicts"
+    );
+    expect_differential_named(
+        "named_structural_wrong_matches_ts2322",
+        source,
+        expected,
+        0,
+        &[
+            NamedArgShape {
+                call: 0,
+                arg: 0,
+                members: &[
+                    ("x", ObjectMemberKind::String),
+                    ("y", ObjectMemberKind::String),
+                ],
+            },
+            NamedArgShape {
+                call: 1,
+                arg: 0,
+                members: &[
+                    ("x", ObjectMemberKind::String),
+                    ("y", ObjectMemberKind::Number),
+                ],
+            },
+        ],
+    );
+}
+
+#[test]
+fn named_structural_excess_matches_ts2353() {
+    // P062: first-excess `TS2353` spelling the interface name (probed 7.0.2
+    // `c`).
+    let source = include_str!("../../../corpus/check-calls/named-structural-excess.ts");
+    let expected = include_str!("../../../corpus/check-calls/named-structural-excess.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2353".to_owned(),
+            "Object literal may only specify known properties, and 'extra' does not exist in \
+            type 'Point'."
+                .to_owned()
+        )],
+        "oracle baseline pins the excess verdict"
+    );
+    expect_differential_named(
+        "named_structural_excess_matches_ts2353",
+        source,
+        expected,
+        0,
+        &[NamedArgShape {
+            call: 0,
+            arg: 0,
+            members: &[
+                ("x", ObjectMemberKind::Number),
+                ("extra", ObjectMemberKind::Number),
+            ],
+        }],
+    );
+}
+
+#[test]
+fn named_structural_missing_matches_ts2741_and_ts2739() {
+    // P062: one missing member spells `TS2741`, several collapse into one
+    // `TS2739` (probed 7.0.2 `d`/`e`).
+    let source = include_str!("../../../corpus/check-calls/named-structural-missing.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/named-structural-missing.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            (
+                "TS2739".to_owned(),
+                "Type '{ a: number; }' is missing the following properties from type 'Big': \
+                b, c"
+                    .to_owned()
+            ),
+            (
+                "TS2741".to_owned(),
+                "Property 'y' is missing in type '{ x: number; }' but required in type \
+                'Point'."
+                    .to_owned()
+            ),
+        ],
+        "oracle baseline pins the missing verdicts (parser sorts pairs)"
+    );
+    expect_differential_named(
+        "named_structural_missing_matches_ts2741_and_ts2739",
+        source,
+        expected,
+        0,
+        &[
+            NamedArgShape {
+                call: 0,
+                arg: 0,
+                members: &[("x", ObjectMemberKind::Number)],
+            },
+            NamedArgShape {
+                call: 1,
+                arg: 0,
+                members: &[("a", ObjectMemberKind::Number)],
+            },
+        ],
+    );
+}
+
+#[test]
+fn named_structural_imported_declines_and_pins_ts2322() {
+    // P062: the imported name claims no local shape, so the call keeps the
+    // legacy decline while tsc checks it (probed 7.0.2 `s-imp`) — a pinned
+    // oracle-error divergence, never a forced verdict.
+    let source = include_str!("../../../corpus/check-calls/named-structural-imported-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/named-structural-imported-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline_named(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason,
+        "call to 'show': parameter type 'Point' for 'p' is outside the subset"
+    );
+}
+
+#[test]
+fn named_structural_methoded_declines_and_pins_clean_oracle() {
+    // P062: method members carry no value-type facts, so the shape declines
+    // inside the shared comparison while tsc is clean (probed 7.0.2
+    // `g-methoded`) — a pinned oracle-clean divergence.
+    let source = include_str!("../../../corpus/check-calls/named-structural-methoded-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/named-structural-methoded-declined.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on the complete methoded call"
+    );
+    let (_, report) = run_pipeline_named_shaped(
+        source,
+        &[NamedArgShape {
+            call: 0,
+            arg: 0,
+            members: &[
+                ("x", ObjectMemberKind::Number),
+                ("run", ObjectMemberKind::NonLiteral),
+            ],
+        }],
+    );
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("member 'run'"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn named_structural_nonliteral_declines_and_pins_clean_oracle() {
+    // P062: the identifier arg declines with its own reason (no value-type
+    // facts) while the call-result arg keeps the opaque decline; tsc is
+    // clean on both (probed 7.0.2 `f-nonliteral`) — pinned divergences,
+    // never silent.
+    let source = include_str!("../../../corpus/check-calls/named-structural-nonliteral.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/named-structural-nonliteral.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on both non-literal calls"
+    );
+    let (parsed, report) = run_pipeline_named(source);
+    let shows = parsed
+        .calls
+        .iter()
+        .filter(|call| call.callee == "show")
+        .count();
+    assert_eq!(shows, 2, "both show calls emit facts");
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 2);
+    assert!(
+        report.unsupported[0].reason.contains("identifier argument"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+    assert!(
+        !report.unsupported[0].reason.contains("opaque"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+    assert!(
+        report.unsupported[1].reason.contains("opaque named type"),
+        "reason: {}",
+        report.unsupported[1].reason
+    );
+}
+
+#[test]
+fn named_alias_call_declines_and_pins_ts2322() {
+    // P062 follow-up pin: call sites thread no alias tables, so alias-named
+    // params keep the opaque decline while tsc checks them (probed 7.0.2
+    // `o-alias-iface`) — a pinned oracle-error divergence.
+    let source = include_str!("../../../corpus/check-calls/named-alias-call-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/named-alias-call-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline_named(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("opaque named type"),
+        "reason: {}",
+        report.unsupported[0].reason
     );
 }
 

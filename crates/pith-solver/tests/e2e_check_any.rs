@@ -393,6 +393,8 @@ fn calls_from_facts(parsed: &ParsedFile) -> Vec<CallSite> {
                     cast: arg.cast.as_ref().map(map_cast),
                     // Non-generic call drivers never feed identifier names.
                     ident: None,
+                    // Call drivers never feed object members.
+                    arg_object: None,
                 })
                 .collect(),
         })

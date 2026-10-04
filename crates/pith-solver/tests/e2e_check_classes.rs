@@ -260,6 +260,8 @@ fn news_from_facts(parsed: &ParsedFile) -> Vec<NewSite> {
                     cast: None,
                     // Constructor drivers never feed identifier names.
                     ident: None,
+                    // Constructor drivers never feed object members.
+                    arg_object: None,
                 })
                 .collect(),
         })
