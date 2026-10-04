@@ -2,7 +2,9 @@
 //!
 //! Pipeline per fixture: `parse_module` -> [`Binder::build_file`] ->
 //! [`decls_from_facts`] (the driver: [`DeclFact`](pith_frontend::DeclFact)
-//! to [`ConstDecl`], zero hand-feeding) -> [`check_file_with_aliases`] ->
+//! to [`ConstDecl`], plus the P048 seam — bare-identifier initializer names
+//! sliced mechanically from init fact spans, asserted in
+//! `driver_maps_facts_without_hand_feeding`) -> [`check_file_with_aliases`] ->
 //! [`FileReport`],
 //! then a differential against the recorded tsc `.expected.txt` baselines.
 //!
@@ -105,6 +107,23 @@ fn fallback_span(
     (symbol.name.clone(), span, id)
 }
 
+/// Slices `source` at a fact span (`None` on skew — only possible with
+/// recovery from parse errors; mirrors the multifile driver's seam).
+fn slice_of(source: &str, span: Span) -> Option<&str> {
+    let lo = usize::try_from(span.lo).ok()?;
+    let hi = usize::try_from(span.hi).ok()?;
+    source.get(lo..hi)
+}
+
+/// Whether sliced text is a bare identifier (mirrors the multifile
+/// driver's check).
+fn is_bare_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
 /// The fact-fed driver: every [`ConstDecl`] field comes from adapter facts.
 ///
 /// - `name` via `ParsedFile.symbols[decl.symbol]` (never re-typed);
@@ -112,14 +131,26 @@ fn fallback_span(
 /// - `kind` is `const` (the adapter emits no `let` facts yet);
 /// - `annotation` as the frontend's colon-stripped text verbatim;
 /// - `init` via the explicit [`map_init`] variant map;
+/// - `init_ident` is the P048 seam: bare-identifier initializer names are
+///   driver-sliced from the init fact span (the adapter emits no
+///   identifier-init facts — see the solver's module-level BLOCKER);
+///   anything else feeds `None` and keeps its historical gate;
 /// - `init_object` is `None` (no `ObjectMemberFact`s yet; check-const
 ///   fixtures hold no object literals anyway).
-fn decls_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<ConstDecl> {
+fn decls_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<ConstDecl> {
     parsed
         .decls
         .iter()
         .map(|decl| {
             let (name, span, symbol) = fallback_span(parsed, binder, decl.symbol, decl.scope);
+            let init_ident = match &decl.init {
+                Some(init) if init.kind == FrontendInitKind::NonLiteral => {
+                    slice_of(source, init.span)
+                        .filter(|text| is_bare_identifier(text))
+                        .map(str::to_owned)
+                }
+                _ => None,
+            };
             ConstDecl {
                 name,
                 span,
@@ -128,6 +159,7 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<ConstDecl> {
                 kind: DeclKind::Const,
                 annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
                 init: decl.init.as_ref().map(|init| map_init(init.kind)),
+                init_ident,
                 init_object: None,
                 // No array-member facts yet (see the check-functions driver).
                 init_array: None,
@@ -161,7 +193,7 @@ fn run_pipeline(source: &str) -> FileReport {
         "frontend errors: {frontend_errors:?}"
     );
     let binder = build_binder(&parsed);
-    let decls = decls_from_facts(&parsed, &binder);
+    let decls = decls_from_facts(&parsed, &binder, source);
     let aliases = aliases_from_facts(&parsed);
     let mut db = QueryDb::new();
     check_file_with_aliases(FILE, &decls, &binder, &mut db, &aliases)
@@ -322,6 +354,154 @@ fixture_test!(
     "alias-interface-declined.expected.txt",
     1
 );
+fixture_test!(
+    ident_chain_checks_like_literals,
+    "ident-chain.ts",
+    "ident-chain.expected.txt",
+    0
+);
+
+#[test]
+fn ident_cycle_declines_with_forward_then_cycle() {
+    // Pinned oracle-error divergence (P048): tsc spells TS2448 plus TS2454
+    // on the forward use while the solver declines twice — forward, then
+    // cycle — with no verdict.
+    let source = include_str!("../../../corpus/check-const/ident-cycle-declined.ts");
+    let expected = include_str!("../../../corpus/check-const/ident-cycle-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            (
+                "TS2448".to_owned(),
+                "Block-scoped variable 'b' used before its declaration.".to_owned()
+            ),
+            (
+                "TS2454".to_owned(),
+                "Variable 'b' is used before being assigned.".to_owned()
+            ),
+        ],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 2);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("used before its declaration"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+    assert!(
+        report.unsupported[1].reason.contains("names it back"),
+        "reason: {}",
+        report.unsupported[1].reason
+    );
+}
+
+#[test]
+fn ident_depth2_declines_at_second_hop() {
+    // Pinned oracle-error divergence (P048): tsc checks through the whole
+    // chain (TS2322 on `c`) while single-level propagation stops after
+    // `b` — silent plus one unsupported note.
+    let source = include_str!("../../../corpus/check-const/ident-depth2-declined.ts");
+    let expected = include_str!("../../../corpus/check-const/ident-depth2-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'number' is not assignable to type 'string'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("single-level"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn ident_let_declines() {
+    // Pinned oracle-error divergence (P048): tsc observes the literal
+    // through the mutable binding (TS2322) while the solver declines —
+    // top-level `let` emits no declarator facts, so the name claims no
+    // checkable const.
+    let source = include_str!("../../../corpus/check-const/ident-let-declined.ts");
+    let expected = include_str!("../../../corpus/check-const/ident-let-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'number' is not assignable to type 'string'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("no checkable const declarator"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn let_reassignment_still_declines() {
+    // Assignments emit no facts, so the single declaration-order pass never
+    // observes them: a reassigned `let` declines exactly like an untouched
+    // one (tsc errors the ASSIGNMENT itself — probe p07 — while the solver
+    // records one note and stays silent).
+    let report = run_pipeline("let a = 1;\na = \"s\";\nconst b: number = a;\n");
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("no checkable const declarator"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn undeclared_identifier_use_keeps_historical_decline() {
+    // Unresolvable names keep the exact historical gate — resolution adds
+    // checks, never new verdicts here.
+    let report = run_pipeline("const b: number = nope;\n");
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason,
+        "non-literal initializer is outside the subset"
+    );
+}
 
 #[test]
 fn pipeline_is_deterministic_across_runs() {
@@ -334,17 +514,20 @@ fn pipeline_is_deterministic_across_runs() {
 #[test]
 fn driver_maps_facts_without_hand_feeding() {
     // Guards the mapping itself: names come from symbol linkage, annotation
-    // text is verbatim, init kinds map per variant, spans anchor to the file.
-    let parsed = parse_module(FILE, "m.ts", "const a: number = 1, b = x;\n");
+    // text is verbatim, init kinds map per variant, identifier names slice
+    // from the init span, spans anchor to the file.
+    let source = "const a: number = 1, b = x;\n";
+    let parsed = parse_module(FILE, "m.ts", source);
     let errors = &parsed.errors;
     assert!(parsed.errors.is_empty(), "errors: {errors:?}");
     assert_eq!(parsed.decls.len(), 2);
     let binder = build_binder(&parsed);
-    let decls = decls_from_facts(&parsed, &binder);
+    let decls = decls_from_facts(&parsed, &binder, source);
     assert_eq!(decls.len(), 2);
     assert_eq!(decls[0].name, "a");
     assert_eq!(decls[0].annotation.as_deref(), Some("number"));
     assert_eq!(decls[0].init, Some(InitKind::Number));
+    assert_eq!(decls[0].init_ident, None);
     assert_eq!(decls[0].kind, DeclKind::Const);
     assert_eq!(decls[0].init_object, None);
     assert!(decls[0].symbol.is_some(), "driver resolves the SymbolId");
@@ -355,6 +538,7 @@ fn driver_maps_facts_without_hand_feeding() {
     assert_eq!(decls[1].name, "b");
     assert_eq!(decls[1].annotation, None);
     assert_eq!(decls[1].init, Some(InitKind::NonLiteral));
+    assert_eq!(decls[1].init_ident.as_deref(), Some("x"));
     for decl in &decls {
         assert_eq!(decl.span.file, FILE);
         assert!(decl.span.lo < decl.span.hi);

@@ -214,6 +214,7 @@ fn consts_from_facts(
             kind: DeclKind::Const,
             annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
             init,
+            init_ident: None,
             init_object,
             // No array-member facts yet (see the check-functions driver).
             init_array: None,

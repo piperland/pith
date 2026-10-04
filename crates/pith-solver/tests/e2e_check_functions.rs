@@ -8,10 +8,12 @@
 //!
 //! Division of labor: names, scopes, spans, parameter annotated-ness,
 //! return annotations, and body shapes (including return-object member
-//! facts) all come from adapter facts. The ONLY driver-side mapping is the
+//! facts) all come from adapter facts. Driver-side mapping is the
 //! literal-kind enum translation (frontend [`ReturnKind`](pith_frontend::ReturnKind)
 //! to solver [`InitKind`]/[`ObjectMemberKind`]), mechanical and exhaustive
-//! like check-const's `map_init`. Returned object literals are always fresh
+//! like check-const's `map_init`, plus the P048 seam (bare-identifier
+//! initializer names sliced from init fact spans — the adapter emits no
+//! identifier-init facts). Returned object literals are always fresh
 //! (only direct syntactic literals carry member facts), mirroring the
 //! check-object seam's `fresh: true`.
 //!
@@ -27,9 +29,12 @@
 //! multi-declarator shape), `straight-tail-wrong`, `straight-object-inner`,
 //! and `straight-nested-block` match their oracle `TS2322`s;
 //! `straight-both-wrong` matches twice; `straight-unannotated-cast`
-//! matches the oracle `TS2352`. One more fixture diverges by design (the
-//! oracle errors where the subset declines): `straight-identifier-init`
-//! (oracle `TS2322` on an identifier-initialized inner declarator —
+//! matches the oracle `TS2352`; `straight-identifier-init` matches its
+//! oracle `TS2322` through single-level propagation (P048: the parameter's
+//! declared type checks like a literal — first divergence-to-match flip).
+//! One more fixture diverges by design (the oracle errors where the subset
+//! declines): `straight-let-init-declined` (oracle `TS2322` on a
+//! `let`-initialized inner declarator — `let` bindings never propagate,
 //! pinned explicitly like `unannotated-param` below).
 //! Try/catch bodies check per arm plus the optional tail (P039):
 //! `try-clean` (incl. the clean tail) and `try-binding-unused` (plain
@@ -80,8 +85,10 @@
 //! `named-param-unused` (untouched named param alongside checked positions)
 //! are silent with zero notes; `named-param-body-wrong` matches its oracle
 //! `TS2322`. No value-type facts about params flow anywhere: `return p`
-//! rides the existing non-literal position gate and `const y: T = p` the
-//! `t3` identifier gate (both unit-pinned in `pith-solver`).
+//! rides the existing non-literal position gate, while `const y: T = p`
+//! resolves one level through the identifier gate (P048) — primitively
+//! annotated params check like their annotation, anything else declines
+//! per-position (unit-pinned in `pith-solver`).
 //! One fixture still diverges by design
 //! (the oracle errors where the subset declines): `unannotated-param`
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
@@ -274,7 +281,14 @@ fn map_inner_init_kind(kind: FrontendInitKind) -> InitKind {
 /// Identity resolves through the binder from the fact's own symbol linkage
 /// (mirroring [`fallback_span`]); object initializers become member facts
 /// (always fresh); assertion initializers carry their cast fact through.
-fn map_inner_decl(parsed: &ParsedFile, binder: &Binder, inner: &FrontendInnerDecl) -> InnerDecl {
+/// `init_ident` is the P048 seam (mirrors the check-const driver):
+/// bare-identifier initializer names slice from the init fact span.
+fn map_inner_decl(
+    parsed: &ParsedFile,
+    binder: &Binder,
+    inner: &FrontendInnerDecl,
+    source: &str,
+) -> InnerDecl {
     let (name, span, symbol) = fallback_span(parsed, binder, inner.symbol, inner.scope);
     let init_object = inner.members.as_ref().map(|members| ObjectInit {
         members: members
@@ -294,6 +308,14 @@ fn map_inner_decl(parsed: &ParsedFile, binder: &Binder, inner: &FrontendInnerDec
             .as_ref()
             .map(|init| map_inner_init_kind(init.kind))
     };
+    let init_ident = match &inner.init {
+        Some(init) if init.kind == FrontendInitKind::NonLiteral && init_object.is_none() => {
+            slice_of(source, init.span)
+                .filter(|text| is_bare_identifier(text))
+                .map(str::to_owned)
+        }
+        _ => None,
+    };
     InnerDecl {
         name,
         span,
@@ -306,6 +328,7 @@ fn map_inner_decl(parsed: &ParsedFile, binder: &Binder, inner: &FrontendInnerDec
         },
         annotation: inner.annotation.as_ref().map(|ann| ann.text.clone()),
         init,
+        init_ident,
         init_object,
         // No array-member facts yet (see `map_function_return`).
         init_array: None,
@@ -317,6 +340,23 @@ fn map_inner_decl(parsed: &ParsedFile, binder: &Binder, inner: &FrontendInnerDec
     }
 }
 
+/// Slices `source` at a fact span (`None` on skew — only possible with
+/// recovery from parse errors; mirrors the check-const driver's seam).
+fn slice_of(source: &str, span: Span) -> Option<&str> {
+    let lo = usize::try_from(span.lo).ok()?;
+    let hi = usize::try_from(span.hi).ok()?;
+    source.get(lo..hi)
+}
+
+/// Whether sliced text is a bare identifier (mirrors the check-const
+/// driver's check).
+fn is_bare_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
 /// Maps one frontend straight body to the solver's: leading declarators in
 /// source order plus the terminal return.
 fn map_straight(
@@ -324,11 +364,12 @@ fn map_straight(
     binder: &Binder,
     leading: &[FrontendInnerDecl],
     tail: &FrontendReturn,
+    source: &str,
 ) -> StraightBody {
     StraightBody {
         leading: leading
             .iter()
-            .map(|inner| map_inner_decl(parsed, binder, inner))
+            .map(|inner| map_inner_decl(parsed, binder, inner, source))
             .collect(),
         tail: map_function_return(tail),
     }
@@ -390,11 +431,12 @@ fn map_straight_throw(
     binder: &Binder,
     leading: &[FrontendInnerDecl],
     tail: Option<&FrontendReturn>,
+    source: &str,
 ) -> StraightThrowBody {
     StraightThrowBody {
         leading: leading
             .iter()
-            .map(|inner| map_inner_decl(parsed, binder, inner))
+            .map(|inner| map_inner_decl(parsed, binder, inner, source))
             .collect(),
         tail: tail.map(map_function_return),
     }
@@ -426,7 +468,7 @@ fn fallback_span(
 ///   (always fresh: only direct syntactic literals carry them), assertion
 ///   positions carry casts, and straight bodies map leading declarators
 ///   plus the tail return through [`map_straight`].
-fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDecl> {
+fn functions_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<FunctionDecl> {
     parsed
         .functions
         .iter()
@@ -447,7 +489,7 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                     else_branch,
                 } => FunctionBody::BranchReturns(map_joined(then_branch, else_branch)),
                 FunctionBodyFact::StraightBody { leading, tail } => {
-                    FunctionBody::StraightBody(map_straight(parsed, binder, leading, tail))
+                    FunctionBody::StraightBody(map_straight(parsed, binder, leading, tail, source))
                 }
                 FunctionBodyFact::TryCatch {
                     try_branch,
@@ -470,7 +512,7 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                     tail: map_function_return(tail),
                 }),
                 FunctionBodyFact::StraightThrow { leading, tail } => FunctionBody::StraightThrow(
-                    map_straight_throw(parsed, binder, leading, tail.as_ref()),
+                    map_straight_throw(parsed, binder, leading, tail.as_ref(), source),
                 ),
                 FunctionBodyFact::TryUnsupported { reason } => FunctionBody::TryUnsupported {
                     reason: reason.clone(),
@@ -524,7 +566,7 @@ fn run_pipeline(source: &str) -> (ParsedFile, FileReport) {
         "frontend errors: {frontend_errors:?}"
     );
     let binder = build_binder(&parsed);
-    let decls = functions_from_facts(&parsed, &binder);
+    let decls = functions_from_facts(&parsed, &binder, source);
     let mut db = QueryDb::new();
     let report = check_functions(FILE, &decls, &binder, &mut db);
     (parsed, report)
@@ -848,15 +890,162 @@ fixture_test!(
     0
 );
 
+fixture_test!(
+    straight_identifier_init_matches_ts2322,
+    "straight-identifier-init.ts",
+    "straight-identifier-init.expected.txt",
+    0
+);
+
 #[test]
-fn straight_identifier_init_divergence_pins_ts2322() {
+fn straight_let_init_divergence_pins_ts2322() {
     // By design the subset declines where the oracle errors: tsc reports
-    // `TS2322` on the identifier-initialized inner declarator (it knows the
-    // parameter's value type) while the solver records one unsupported note
-    // and stays silent — no value-type facts, never a forced verdict.
-    let source = include_str!("../../../corpus/check-functions/straight-identifier-init.ts");
+    // `TS2322` on the `let`-initialized inner declarator (it observes the
+    // literal through the mutable binding) while the solver records one
+    // unsupported note and stays silent — `let` bindings never propagate.
+    let source = include_str!("../../../corpus/check-functions/straight-let-init-declined.ts");
     let expected =
-        include_str!("../../../corpus/check-functions/straight-identifier-init.expected.txt");
+        include_str!("../../../corpus/check-functions/straight-let-init-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'number' is not assignable to type 'string'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("'let' binding"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn unknown_param_propagates_like_literal() {
+    // An `unknown`-annotated parameter checks like an `unknown` literal
+    // (probe p18): `TS2322` spelling `unknown` at the use.
+    expect_differential(
+        "unknown_param_propagates_like_literal",
+        "function f(uu: unknown): string {\n  const x: string = uu;\n  return \"s\";\n}\n",
+        "inline.ts:TS2322: Type 'unknown' is not assignable to type 'string'.",
+        0,
+    );
+}
+
+#[test]
+fn any_param_is_silent() {
+    // An `any`-annotated parameter admits silently (probe p17, clean).
+    expect_differential(
+        "any_param_is_silent",
+        "function f(au: any): string {\n  const x: string = au;\n  return \"s\";\n}\n",
+        "",
+        0,
+    );
+}
+
+#[test]
+fn shadowed_outer_const_loses_to_param() {
+    // Scope-sensitivity end to end (probe p28): the use resolves to the
+    // nearest binding (the parameter), so the outer const never leaks in.
+    let source = "const n = \"s\";\nfunction f(n: number): number {\n  const x: string = n;\n\
+         return 1;\n}\n";
+    expect_differential(
+        "shadowed_outer_const_loses_to_param",
+        source,
+        "inline.ts:TS2322: Type 'number' is not assignable to type 'string'.",
+        0,
+    );
+}
+
+#[test]
+fn optional_param_declines() {
+    // Optional parameters carry `| undefined` (probe p16), which
+    // single-level propagation cannot spell: decline, never a forced
+    // verdict. The oracle baseline holds a continuation line, so only the
+    // header pair is pinned here.
+    let source = "function f(b?: number): string {\n  const x: string = b;\n  return \"s\";\n}\n";
+    let expected =
+        "inline.ts:TS2322: Type 'number | undefined' is not assignable to type 'string'.\n\
+          Type 'undefined' is not assignable to type 'string'.";
+    let headers: Vec<(String, String)> = parse_baseline(expected)
+        .into_iter()
+        .filter(|line| line.0 == "TS2322")
+        .collect();
+    assert_eq!(
+        headers,
+        [(
+            "TS2322".to_owned(),
+            "Type 'number | undefined' is not assignable to type 'string'.".to_owned()
+        )],
+        "baseline pins the oracle header"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("optional"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn forward_reference_in_function_declines() {
+    // Uses only see earlier leadings (probe p22, where tsc spells TS2448
+    // plus TS2454): the not-yet-declared source declines.
+    let source =
+        "function h(): number {\n  const x: number = later;\n  const later = 1;\n  return 1;\n}\n";
+    let expected = "inline.ts:TS2448: Block-scoped variable 'later' used before its declaration.\n\
+        inline.ts:TS2454: Variable 'later' is used before being assigned.";
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            (
+                "TS2448".to_owned(),
+                "Block-scoped variable 'later' used before its declaration.".to_owned()
+            ),
+            (
+                "TS2454".to_owned(),
+                "Variable 'later' is used before being assigned.".to_owned()
+            ),
+        ],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("used before its declaration"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn cross_scope_const_declines() {
+    // One function pass sees only its own leadings and params (probe p21,
+    // where tsc checks the top-level const): the outer name declines
+    // instead of leaking across scopes.
+    let source = "const n = 1;\nfunction g(): number {\n  const x: string = n;\n  return 1;\n}\n";
+    let expected = "inline.ts:TS2322: Type 'number' is not assignable to type 'string'.";
     assert_eq!(
         parse_baseline(expected),
         [(
@@ -875,7 +1064,7 @@ fn straight_identifier_init_divergence_pins_ts2322() {
     assert!(
         report.unsupported[0]
             .reason
-            .contains("non-literal initializer"),
+            .contains("no checkable const declarator"),
         "reason: {}",
         report.unsupported[0].reason
     );
@@ -1308,18 +1497,16 @@ fn pipeline_is_deterministic_across_runs() {
 fn driver_maps_facts_without_hand_feeding() {
     // Guards the mapping itself: names from symbol linkage, params verbatim,
     // annotation text verbatim, return kinds per variant (boolean payload
-    // preserved in members), spans anchored to the file.
-    let parsed = parse_module(
-        FILE,
-        "m.ts",
-        "function add(a: number, b): string {\n  return \"ok\";\n}\n\
-         function point(): { x: number; done: boolean } {\n  return { x: 1, done: false };\n}\n",
-    );
+    // preserved in members), identifier inits sliced from fact spans, spans
+    // anchored to the file.
+    let source = "function add(a: number, b): string {\n  return \"ok\";\n}\n\
+         function point(): { x: number; done: boolean } {\n  return { x: 1, done: false };\n}\n";
+    let parsed = parse_module(FILE, "m.ts", source);
     let errors = &parsed.errors;
     assert!(parsed.errors.is_empty(), "errors: {errors:?}");
     assert_eq!(parsed.functions.len(), 2);
     let binder = build_binder(&parsed);
-    let decls = functions_from_facts(&parsed, &binder);
+    let decls = functions_from_facts(&parsed, &binder, source);
     assert_eq!(decls.len(), 2);
     assert_eq!(decls[0].name, "add");
     assert_eq!(decls[0].return_annotation.as_deref(), Some("string"));

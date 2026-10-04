@@ -174,6 +174,7 @@ fn narrowing_inputs_from_facts(
             kind: DeclKind::Const,
             annotation,
             init,
+            init_ident: None,
             init_object: None,
             // No array-member facts yet (see the check-functions driver).
             init_array: None,
