@@ -1024,6 +1024,11 @@ fn check_function_decls(ctx: &mut FileCtx<'_>) {
 /// pairs stay merged so the existing multiple-declaration decline fires
 /// (tsc's `TS2300` duplicate is the pinned gap); unresolvable callees fall
 /// into the existing undeclared-name decline.
+///
+/// Overload caveat (P044): merged imports always carry a `Complex` body, so
+/// a local `declare function` plus an imported same-name now resolves the
+/// import as the implementation instead of declining — defensible (the
+/// import IS the implementation), and every multi-body shape still declines.
 fn merged_functions(ctx: &FileCtx<'_>) -> Vec<FunctionDecl> {
     let mut merged: Vec<FunctionDecl> = ctx.input.functions.clone();
     // One imported declaration per callee name per file: pushing per call
@@ -1058,6 +1063,7 @@ fn merged_functions(ctx: &FileCtx<'_>) -> Vec<FunctionDecl> {
                 params: found.params.clone(),
                 params_complex: found.params_complex,
                 is_async: found.is_async,
+                has_type_params: found.has_type_params,
                 return_annotation: found.return_annotation.clone(),
                 body: super::FunctionBody::Complex,
             });
