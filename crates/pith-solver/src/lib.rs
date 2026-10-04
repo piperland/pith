@@ -258,10 +258,11 @@
 //!   of the `...rest: T[]` element type (one `TS2345` at the first mismatch,
 //!   same shape). Explicit `undefined` at an optional position is silent
 //!   (its type carries `| undefined`); at fixed and rest positions it
-//!   diagnoses like any other mismatch. Overload failures spell `TS2769`
-//!   with continuation lines; multiple same-name declarations (overloads, or
-//!   shadowing the fact set cannot disambiguate — a documented precision
-//!   limit) decline with reason.
+//!   diagnoses like any other mismatch. Overload groups resolve by any-match
+//!   (P044, below): the implementation signature never participates, and at
+//!   most one diagnostic fires per call. Several same-name declarations with
+//!   bodies (shadowing the fact set cannot disambiguate — a documented
+//!   precision limit) still decline with reason.
 //! - Still declined per site, each with its reason: required-after-optional
 //!   shapes (`(a?: T, b: U)` — tsc itself errors the declaration with
 //!   `TS1016` and checks calls at the exact total, both unmirrorable without
@@ -278,6 +279,46 @@
 //!   arity still enforced): expression facts do not exist yet, and declining
 //!   whole calls over one identifier argument would forfeit decidable arity
 //!   verdicts.
+//!
+//! Overload signatures (P044, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p044-probes/`):
+//!
+//! - `PITH2769` <-> `TS2769`: every arity-compatible signature fails on
+//!   types: `No overload matches this call.` plus the continuation lines
+//!   (`  The last overload gave the following error.` and the last
+//!   signature's first `TS2345`-shaped mismatch, indented), anchored at the
+//!   mismatched argument of the LAST signature in source order.
+//! - `PITH2575` <-> `TS2575`: the count falls strictly between admitted
+//!   ranges: `No overload expects 2 arguments, but overloads do exist that
+//!   expect either 1 or 3 arguments.` (callee-anchored; the pair names the
+//!   nearest distinct signature minimums below and above — ranges contribute
+//!   their minimum).
+//! - Resolution is any-match, order-independent: a call is clean when ANY
+//!   signature admits it (a first-signature mismatch never surfaces when a
+//!   later one matches, and vice versa). The implementation signature never
+//!   participates (a call matching only the `...args: any[]` implementation
+//!   still fails); `declare function` overloads and implementation-less
+//!   groups resolve the same way (tsc's `TS2391` declaration diagnostic stays
+//!   declined declaration-side — the subset spells no declaration
+//!   diagnostics — while calls still check).
+//! - Arity filters first, per signature: no compatible signature unions to
+//!   `TS2554` (`Expected 1-2 arguments, but got 0.`, exact when the union is
+//!   one count) at the callee for too-few and at `args[union-max]` for
+//!   too-many, or `TS2555` below a rest minimum (`m16`) — all shared with the
+//!   single-signature tail. Exactly one compatible signature checks exactly
+//!   like a lone declaration (its own `TS2345` at the first mismatch).
+//! - Generic signatures decline with a distinct reason (the oracle admits
+//!   them — a pinned oracle-clean divergence), as do signatures with
+//!   union/object/conditional/unknown parameter types (each with its own
+//!   text-specific reason): exclusions that leave a matching signature stay
+//!   clean (sound — the oracle checks a superset), but a call no checkable
+//!   signature admits declines with every exclusion recorded, never a forced
+//!   `TS2769` (the oracle might match an excluded signature or elaborate a
+//!   different last signature).
+//! - Assertion arguments pre-evaluate once per call: declined casts diagnose
+//!   `TS2352` even when arity fails across overloads (`m15`), and matching
+//!   uses the result kind (`m14`); complex casts skip per-argument, exactly
+//!   like non-literals.
 //!
 //! Member calls on known values (P024, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p024-probes/`)):
@@ -656,6 +697,11 @@ pub const CODE_ARITY: &str = "PITH2554";
 pub const CODE_ARITY_MIN: &str = "PITH2555";
 /// Code for call-site argument-type mismatches (oracle `TS2345`).
 pub const CODE_ARG_TYPE: &str = "PITH2345";
+/// Code for overload calls matching no signature (oracle `TS2769`).
+pub const CODE_OVERLOAD: &str = "PITH2769";
+/// Code for overload calls with an admitted-by-none count inside the span
+/// of ranges (oracle `TS2575`).
+pub const CODE_OVERLOAD_ARITY: &str = "PITH2575";
 /// Code for declined `as`/angle assertions (oracle `TS2352`).
 pub const CODE_CAST: &str = "PITH2352";
 /// Code for declined `satisfies` assertions (oracle `TS1360`).
@@ -1324,6 +1370,11 @@ pub struct FunctionDecl {
     /// only async functions unwrap `Promise<T>` returns; non-async
     /// `Promise` returns decline instead of mis-checking.
     pub is_async: bool,
+    /// `true` when the declaration carries type parameters (`<T>`, ...).
+    /// Driver-mapped from the adapter's type-parameter facts (mirroring
+    /// [`ClassDecl::has_type_params`]). Overload resolution declines generic
+    /// signatures with a distinct reason instead of resolving them.
+    pub has_type_params: bool,
     /// Raw return annotation text; `None` means unannotated.
     pub return_annotation: Option<String>,
     /// Body shape; single returns, the three P023 joins, P031 straight
@@ -2502,9 +2553,14 @@ pub struct CallSite {
 ///   one signal. A name that is neither declared nor unresolved-tracked is
 ///   driver skew, recorded as [`UnsupportedDecl`] rather than silently
 ///   dropped.
-/// - Several declarations bear the name (overloads, or shadowing the
-///   fact set cannot disambiguate): one [`UnsupportedDecl`] — overload
-///   resolution is future work, never speculative.
+/// - Several declarations bear the name: more than one body means shadowing
+///   (one [`UnsupportedDecl`] — implementations cannot be disambiguated),
+///   else every `NoBody` signature resolves by any-match (see
+///   [`check_overload_call`]): generic and otherwise-uncheckable signatures
+///   are excluded with distinct reasons (clean when a remaining signature
+///   admits the call, one [`UnsupportedDecl`] otherwise), and checkable
+///   groups diagnose only when every signature fails (`PITH2769`,
+///   `PITH2575`, or the union `PITH2554`/`PITH2555`).
 /// - Exactly one declaration: parameter gates (structural first —
 ///   `params_complex`, non-trailing rest, unannotated, required-after-optional,
 ///   uncheckable parameter types — each its own [`UnsupportedDecl`] at the
@@ -2570,47 +2626,43 @@ fn check_one_call(
         return;
     };
     if candidates.len() != 1 {
-        report.unsupported.push(UnsupportedDecl {
+        let mut run = OverloadRun {
             file,
-            span: call.callee_span,
-            reason: format!(
-                "multiple declarations for '{}': overload resolution is outside the subset",
-                call.callee
-            ),
-        });
+            decls,
+            call,
+            report,
+        };
+        check_overload_call(&mut run, candidates);
         return;
     }
-    let decl = &decls[candidates[0]];
+    check_single_call(file, &decls[candidates[0]], call, report);
+}
+
+/// Checks one call site against exactly one declaration, pushing into
+/// `report`.
+///
+/// Parameter gates first (each its own [`UnsupportedDecl`] at the callee
+/// span), then at most one diagnostic: arity (`PITH2554`, or `PITH2555`
+/// below a rest minimum) beats arg types (`PITH2345`), and only the first
+/// mismatched argument reports (all probed on tsc 7.0.2).
+fn check_single_call(file: FileId, decl: &FunctionDecl, call: &CallSite, report: &mut FileReport) {
     let Some(resolved) = call_params(call, decl, file, report) else {
         return;
     };
+    let target = owned_target(resolved);
     let site = VerdictSite {
         anchor: call.callee_span,
         args: &call.args,
     };
-    let fixed: Vec<CallParam> = resolved
-        .fixed
-        .into_iter()
-        .map(|(expected, display, optional)| CallParam {
-            expected,
-            display,
-            optional,
-        })
-        .collect();
-    let rest = resolved.rest.map(|(expected, display)| CallParam {
-        expected,
-        display,
-        optional: false,
-    });
-    let target = CallTarget {
-        fixed: &fixed,
+    let view = CallTarget {
+        fixed: &target.fixed,
         arity: CallArity {
-            min: resolved.min,
-            max: resolved.max,
+            min: target.min,
+            max: target.max,
         },
-        rest: rest.as_ref(),
+        rest: target.rest.as_ref(),
     };
-    emit_call_verdict(file, &site, &target, report);
+    emit_call_verdict(file, &site, &view, report);
 }
 
 /// One resolved call parameter: the expected type when checkable plus the
@@ -2832,28 +2884,39 @@ struct ResolvedCallParams {
     rest: Option<(Option<TypeId>, String)>,
 }
 
-/// Gates one call's parameter list for [`check_one_call`].
+/// Gates one call's parameter list for [`check_single_call`].
 ///
 /// `Some` carries the admitted range plus per-position expectations (see
 /// [`ResolvedCallParams`]); `None` means one [`UnsupportedDecl`] was pushed
-/// at the callee span and the call declines. Structural gates run first
-/// (`params_complex`, non-trailing rest), then parameter-by-parameter in
-/// order (unannotated, required-after-optional, then the type text): the
-/// first failure wins, so reasons stay single and deterministic.
+/// at the callee span and the call declines.
 fn call_params(
     call: &CallSite,
     decl: &FunctionDecl,
     file: FileId,
     report: &mut FileReport,
 ) -> Option<ResolvedCallParams> {
+    match resolve_params(decl) {
+        Ok(resolved) => Some(resolved),
+        Err(reason) => {
+            decline(call, file, report, &reason);
+            None
+        }
+    }
+}
+
+/// Resolves one declaration's parameter list into its admitted call shape.
+///
+/// `Ok` carries the range plus per-position expectations (see
+/// [`ResolvedCallParams`]); `Err` carries the bare decline reason.
+/// Structural gates run first (`params_complex`, non-trailing rest), then
+/// parameter-by-parameter in order (unannotated, required-after-optional,
+/// then the type text): the first failure wins, so reasons stay single and
+/// deterministic. Overload resolution reuses this per signature, so generic
+/// signatures gate separately (see [`check_overload_call`]) rather than
+/// here.
+fn resolve_params(decl: &FunctionDecl) -> Result<ResolvedCallParams, String> {
     if decl.params_complex {
-        decline(
-            call,
-            file,
-            report,
-            "non-identifier parameter pattern is outside the subset",
-        );
-        return None;
+        return Err("non-identifier parameter pattern is outside the subset".to_owned());
     }
     if let Some(trailing) = decl
         .params
@@ -2861,64 +2924,37 @@ fn call_params(
         .position(|param| param.is_rest)
         .filter(|index| index.saturating_add(1) != decl.params.len())
     {
-        decline(
-            call,
-            file,
-            report,
-            &format!(
-                "rest parameter '{}' must be last: trailing positions are outside the subset",
-                decl.params[trailing].name
-            ),
-        );
-        return None;
+        return Err(format!(
+            "rest parameter '{}' must be last: trailing positions are outside the subset",
+            decl.params[trailing].name
+        ));
     }
     let mut fixed = Vec::with_capacity(decl.params.len());
     let mut rest: Option<(Option<TypeId>, String)> = None;
     let mut seen_optional = false;
     for param in &decl.params {
         if !param.annotated {
-            decline(
-                call,
-                file,
-                report,
-                &format!(
-                    "unannotated parameter '{}' is outside the subset",
-                    param.name
-                ),
-            );
-            return None;
+            return Err(format!(
+                "unannotated parameter '{}' is outside the subset",
+                param.name
+            ));
         }
         if param.is_rest {
-            match classify_rest_element(param) {
-                Ok(element) => rest = Some(element),
-                Err(reason) => {
-                    decline(call, file, report, &reason);
-                    return None;
-                }
-            }
+            rest = Some(classify_rest_element(param)?);
             continue;
         }
         if param.optional {
             seen_optional = true;
         } else if seen_optional {
-            decline(
-                call,
-                file,
-                report,
-                &format!(
-                    "required parameter '{}' follows an optional parameter: \
-                    required-after-optional shapes are outside the subset",
-                    param.name
-                ),
-            );
-            return None;
+            return Err(format!(
+                "required parameter '{}' follows an optional parameter: \
+                required-after-optional shapes are outside the subset",
+                param.name
+            ));
         }
         match classify_param(param) {
             Ok((expected, display)) => fixed.push((expected, display, param.optional)),
-            Err(reason) => {
-                decline(call, file, report, &reason);
-                return None;
-            }
+            Err(reason) => return Err(reason),
         }
     }
     let min = fixed.iter().filter(|member| !member.2).count();
@@ -2927,7 +2963,7 @@ fn call_params(
     } else {
         Some(fixed.len())
     };
-    Some(ResolvedCallParams {
+    Ok(ResolvedCallParams {
         fixed,
         min,
         max,
@@ -2942,6 +2978,485 @@ fn decline(call: &CallSite, file: FileId, report: &mut FileReport, reason: &str)
         span: call.callee_span,
         reason: format!("call to '{}': {reason}", call.callee),
     });
+}
+
+/// One resolved call target with owned positions for the shared verdict
+/// tail: [`ResolvedCallParams`] moved into [`CallParam`]s plus the admitted
+/// range, so overload attempts (which reuse one target across the arity and
+/// type phases) and [`check_single_call`] share one construction.
+struct OwnedTarget {
+    /// Fixed positions in source order.
+    fixed: Vec<CallParam>,
+    /// Fewest admitted arguments (the required prefix).
+    min: usize,
+    /// Most admitted fixed arguments (`None` when a rest element trails).
+    max: Option<usize>,
+    /// Rest-element expectation (`None` for exact/range lists).
+    rest: Option<CallParam>,
+}
+
+/// Moves one resolved parameter list into an [`OwnedTarget`].
+fn owned_target(resolved: ResolvedCallParams) -> OwnedTarget {
+    let fixed = resolved
+        .fixed
+        .into_iter()
+        .map(|(expected, display, optional)| CallParam {
+            expected,
+            display,
+            optional,
+        })
+        .collect();
+    let rest = resolved.rest.map(|(expected, display)| CallParam {
+        expected,
+        display,
+        optional: false,
+    });
+    OwnedTarget {
+        fixed,
+        min: resolved.min,
+        max: resolved.max,
+        rest,
+    }
+}
+
+/// Mutable checking state for one [`check_overload_call`] run, bundled so
+/// the per-phase helpers stay lean (pedantic arity discipline, mirroring
+/// [`MemberRun`]).
+struct OverloadRun<'a> {
+    file: FileId,
+    decls: &'a [FunctionDecl],
+    call: &'a CallSite,
+    report: &'a mut FileReport,
+}
+
+/// One checkable overload signature: its resolved parameter list, in source
+/// order (the last entry elaborates `TS2769`).
+struct OverloadCandidate {
+    /// The admitted range plus per-position expectations.
+    resolved: ResolvedCallParams,
+}
+
+/// One first-mismatch inside an overload attempt: the offending argument
+/// span plus the oracle's `TS2345`-shaped elaboration pieces.
+struct OverloadMismatch {
+    /// Span of the mismatched argument (the oracle anchor).
+    span: Span,
+    /// Widened actual-type name (`'boolean'`, `'number'`, ...).
+    actual: &'static str,
+    /// Expected parameter-type text (`'number'`, `'string'`, ...).
+    display: String,
+}
+
+/// Checks one call site against several same-name declarations, pushing
+/// into the run report (probed tsc 7.0.2 `--strict --pretty false`; probes
+/// in `.agent/scratch/p044-probes/`, rules in the module docs).
+///
+/// At most one diagnostic ever fires per call; declines push exactly one
+/// [`UnsupportedDecl`]. Outcomes, in order:
+///
+/// - More than one declaration carries a body (shadowing, not overloads):
+///   one [`UnsupportedDecl`] — implementations cannot be disambiguated.
+/// - Generic signatures and signatures [`resolve_params`] rejects (union,
+///   object, conditional, or unknown parameter types, one at a time) are
+///   excluded with their own reasons: if any remaining signature admits the
+///   call the site is clean (sound: the oracle checks a superset), else one
+///   [`UnsupportedDecl`] records every exclusion — never a forced verdict.
+/// - Otherwise every signature is checkable and the call resolves by
+///   any-match (see [`resolve_overload`]).
+fn check_overload_call(run: &mut OverloadRun<'_>, candidates: &[usize]) {
+    let bodies = candidates
+        .iter()
+        .filter(|index| !matches!(run.decls[**index].body, FunctionBody::NoBody { .. }))
+        .count();
+    if bodies > 1 {
+        run.report.unsupported.push(UnsupportedDecl {
+            file: run.file,
+            span: run.call.callee_span,
+            reason: format!(
+                "multiple declarations with bodies for '{}': shadowing is outside the subset",
+                run.call.callee
+            ),
+        });
+        return;
+    }
+    let mut checkable: Vec<OverloadCandidate> = Vec::with_capacity(candidates.len());
+    let mut excluded: Vec<String> = Vec::new();
+    for index in candidates {
+        let decl = &run.decls[*index];
+        if !matches!(decl.body, FunctionBody::NoBody { .. }) {
+            continue;
+        }
+        if decl.has_type_params {
+            excluded.push(
+                "overload signature with generic type parameters is outside the subset".to_owned(),
+            );
+            continue;
+        }
+        match resolve_params(decl) {
+            Ok(resolved) => checkable.push(OverloadCandidate { resolved }),
+            Err(reason) => excluded.push(reason),
+        }
+    }
+    // Cast pre-evaluation emits `TS2352` exactly once per call, before any
+    // arity verdict (probed tsc 7.0.2 P044 `m15`); every path below reuses
+    // these kinds and never re-evaluates.
+    let kinds = effective_arg_kinds(run.file, run.call, run.report);
+    if !excluded.is_empty() {
+        let clean = checkable
+            .iter()
+            .any(|candidate| overload_matches(&candidate.resolved, &kinds));
+        if !clean {
+            let checkable_note = if checkable.is_empty() {
+                String::new()
+            } else {
+                format!("; {} checkable fail", checkable.len())
+            };
+            let detail = format!("excluded: {}{checkable_note}", excluded.join("; "));
+            run.report.unsupported.push(UnsupportedDecl {
+                file: run.file,
+                span: run.call.callee_span,
+                reason: format!(
+                    "call to '{}': no overload signature admits this call ({detail})",
+                    run.call.callee
+                ),
+            });
+        }
+        return;
+    }
+    if checkable.len() == 1 {
+        let Some(candidate) = checkable.pop() else {
+            // Unreachable: the length check guarantees one entry. Decline
+            // instead of forcing a verdict.
+            run.report.unsupported.push(UnsupportedDecl {
+                file: run.file,
+                span: run.call.callee_span,
+                reason: format!(
+                    "call to '{}': no overload signature admits this call",
+                    run.call.callee
+                ),
+            });
+            return;
+        };
+        check_resolved_call(run, candidate.resolved, &kinds);
+        return;
+    }
+    resolve_overload(run, &checkable, &kinds);
+}
+
+/// Checks one resolved signature inside an overload group through the
+/// shared verdict tail, over cast-pre-evaluated argument kinds (so `TS2352`
+/// diagnostics fire exactly once per call, before any arity verdict — the
+/// probed `m15` order).
+fn check_resolved_call(
+    run: &mut OverloadRun<'_>,
+    resolved: ResolvedCallParams,
+    kinds: &[Option<InitKind>],
+) {
+    let target = owned_target(resolved);
+    let synth: Vec<CallArg> = run
+        .call
+        .args
+        .iter()
+        .zip(kinds.iter())
+        .map(|(argument, kind)| CallArg {
+            kind: kind.unwrap_or(InitKind::NonLiteral),
+            span: argument.span,
+            cast: None,
+        })
+        .collect();
+    let site = VerdictSite {
+        anchor: run.call.callee_span,
+        args: &synth,
+    };
+    let view = CallTarget {
+        fixed: &target.fixed,
+        arity: CallArity {
+            min: target.min,
+            max: target.max,
+        },
+        rest: target.rest.as_ref(),
+    };
+    emit_call_verdict(run.file, &site, &view, run.report);
+}
+
+/// Resolves one call against two or more checkable overload signatures by
+/// any-match (probed tsc 7.0.2 P044): the call is clean when ANY signature
+/// admits it, whatever the order; otherwise exactly one diagnostic fires —
+/// `TS2554`/`TS2555` when no signature admits the count (union range, or
+/// the gap spelling `TS2575`), else `TS2769` elaborating the last
+/// signature's first mismatch.
+fn resolve_overload(
+    run: &mut OverloadRun<'_>,
+    checkable: &[OverloadCandidate],
+    kinds: &[Option<InitKind>],
+) {
+    let count = run.call.args.len();
+    let compatible: Vec<usize> = checkable
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| arity_admits(&candidate.resolved, count))
+        .map(|(index, _)| index)
+        .collect();
+    if compatible.is_empty() {
+        emit_no_compatible(run, checkable, count);
+        return;
+    }
+    if compatible.len() == 1 {
+        let resolved = single_compatible(&checkable[compatible[0]]);
+        check_resolved_call(run, resolved, kinds);
+        return;
+    }
+    let clean = compatible
+        .iter()
+        .any(|index| overload_matches(&checkable[*index].resolved, kinds));
+    if clean {
+        return;
+    }
+    let Some(last) = compatible.last() else {
+        return;
+    };
+    let Some(mismatch) = first_overload_mismatch(&checkable[*last].resolved, run.call, kinds)
+    else {
+        return;
+    };
+    run.report.diagnostics.push(PithDiagnostic {
+        code: CODE_OVERLOAD.to_owned(),
+        file: run.file,
+        span: mismatch.span,
+        message: format!(
+            "No overload matches this call.\n  The last overload gave the following error.\n    \
+            Argument of type '{}' is not assignable to parameter of type '{}'.",
+            mismatch.actual, mismatch.display
+        ),
+    });
+}
+
+/// Copies one compatible overload signature's resolved parameter list
+/// (borrowed candidates cannot move theirs out).
+fn single_compatible(candidate: &OverloadCandidate) -> ResolvedCallParams {
+    ResolvedCallParams {
+        fixed: candidate.resolved.fixed.clone(),
+        min: candidate.resolved.min,
+        max: candidate.resolved.max,
+        rest: candidate.resolved.rest.clone(),
+    }
+}
+
+/// Whether one resolved signature admits an argument count (the range gate
+/// of [`emit_call_verdict`], without diagnostics).
+fn arity_admits(resolved: &ResolvedCallParams, count: usize) -> bool {
+    if count < resolved.min {
+        return false;
+    }
+    match resolved.max {
+        Some(max) => count <= max,
+        None => true,
+    }
+}
+
+/// Whether one resolved signature admits a call with pre-evaluated
+/// argument kinds: the count in range, and every checkable position equal
+/// (non-literal and complex-cast positions skip, accept-all parameters
+/// never mismatch, explicit `undefined` at optional positions is silent —
+/// the [`check_call_arguments`] precedents, without diagnostics).
+fn overload_matches(resolved: &ResolvedCallParams, kinds: &[Option<InitKind>]) -> bool {
+    arity_admits(resolved, kinds.len()) && first_overload_mismatch_inner(resolved, kinds).is_none()
+}
+
+/// Finds the first type mismatch of one resolved signature over
+/// pre-evaluated argument kinds, or `None` when every checkable position
+/// agrees (arity unchecked — callers gate counts separately).
+fn first_overload_mismatch_inner(
+    resolved: &ResolvedCallParams,
+    kinds: &[Option<InitKind>],
+) -> Option<(usize, &'static str, String)> {
+    for (index, kind) in kinds.iter().enumerate() {
+        let Some(kind) = kind else {
+            continue;
+        };
+        let (expected, display, optional) = if let Some(fixed) = resolved.fixed.get(index) {
+            (fixed.0, fixed.1.as_str(), fixed.2)
+        } else if let Some(element) = resolved.rest.as_ref() {
+            (element.0, element.1.as_str(), false)
+        } else {
+            continue;
+        };
+        if *kind == InitKind::Undefined && optional {
+            continue;
+        }
+        let Some(expected) = expected else {
+            continue;
+        };
+        if kind.type_id() != expected {
+            return Some((index, kind.name(), display.to_owned()));
+        }
+    }
+    None
+}
+
+/// Finds the first type mismatch of one resolved signature at a call site,
+/// pairing the inner mismatch with the mismatched argument's span (the
+/// oracle anchor).
+fn first_overload_mismatch(
+    resolved: &ResolvedCallParams,
+    call: &CallSite,
+    kinds: &[Option<InitKind>],
+) -> Option<OverloadMismatch> {
+    let (index, actual, display) = first_overload_mismatch_inner(resolved, kinds)?;
+    Some(OverloadMismatch {
+        span: call.args[index].span,
+        actual,
+        display,
+    })
+}
+
+/// Emits the no-arity-compatible diagnostic for an overload call: below the
+/// union minimum the `TS2554` range (or `TS2555` below a rest minimum, the
+/// [`emit_call_verdict`] spellings) at the callee; past the union maximum
+/// `TS2554` at the first excess argument; strictly between, the gap
+/// spelling `TS2575` naming the nearest signature minimums below and above
+/// (all probed tsc 7.0.2 P044).
+fn emit_no_compatible(run: &mut OverloadRun<'_>, checkable: &[OverloadCandidate], count: usize) {
+    let file = run.file;
+    let anchor = run.call.callee_span;
+    let (min_union, max_union) = union_arity(checkable);
+    if count < min_union {
+        let (code, message) = if max_union.is_none() {
+            (
+                CODE_ARITY_MIN,
+                format!("Expected at least {min_union} arguments, but got {count}."),
+            )
+        } else {
+            (
+                CODE_ARITY,
+                format!(
+                    "Expected {} arguments, but got {count}.",
+                    range_text(CallArity {
+                        min: min_union,
+                        max: max_union,
+                    })
+                ),
+            )
+        };
+        run.report.diagnostics.push(PithDiagnostic {
+            code: code.to_owned(),
+            file,
+            span: anchor,
+            message,
+        });
+        return;
+    }
+    if let Some(max) = max_union {
+        if count > max {
+            run.report.diagnostics.push(PithDiagnostic {
+                code: CODE_ARITY.to_owned(),
+                file,
+                span: run.call.args[max].span,
+                message: format!(
+                    "Expected {} arguments, but got {count}.",
+                    range_text(CallArity {
+                        min: min_union,
+                        max: max_union,
+                    })
+                ),
+            });
+            return;
+        }
+    }
+    let Some((lo, hi)) = gap_bounds(checkable, count) else {
+        run.report.unsupported.push(UnsupportedDecl {
+            file,
+            span: anchor,
+            reason: format!(
+                "call to '{}': no overload signature admits {count} arguments",
+                run.call.callee
+            ),
+        });
+        return;
+    };
+    run.report.diagnostics.push(PithDiagnostic {
+        code: CODE_OVERLOAD_ARITY.to_owned(),
+        file,
+        span: anchor,
+        message: format!(
+            "No overload expects {count} arguments, but overloads do exist that expect either \
+            {lo} or {hi} arguments."
+        ),
+    });
+}
+
+/// The union admitted count of several checkable signatures: the minimum of
+/// their minimums plus the maximum of their maximums (`None` when any rest
+/// signature trails — too-many is then inadmissible, exactly like
+/// [`emit_call_verdict`]).
+fn union_arity(checkable: &[OverloadCandidate]) -> (usize, Option<usize>) {
+    let min_union = checkable
+        .iter()
+        .map(|candidate| candidate.resolved.min)
+        .min()
+        .unwrap_or(0);
+    let max_union = if checkable
+        .iter()
+        .any(|candidate| candidate.resolved.max.is_none())
+    {
+        None
+    } else {
+        checkable
+            .iter()
+            .filter_map(|candidate| candidate.resolved.max)
+            .max()
+    };
+    (min_union, max_union)
+}
+
+/// The nearest distinct signature minimums below and above an
+/// admitted-by-none count (probed tsc 7.0.2 P044: ranges contribute their
+/// minimum, e.g. `1-2` plus `5` names `1` and `5`). `None` when either side
+/// is missing (unreachable in the gap branch — the caller declines instead
+/// of forcing a verdict).
+fn gap_bounds(checkable: &[OverloadCandidate], count: usize) -> Option<(usize, usize)> {
+    let mut mins: Vec<usize> = checkable
+        .iter()
+        .map(|candidate| candidate.resolved.min)
+        .collect();
+    mins.sort_unstable();
+    mins.dedup();
+    let lo = mins.iter().rev().find(|min| **min < count).copied()?;
+    let hi = mins.iter().find(|min| **min > count).copied()?;
+    Some((lo, hi))
+}
+
+/// Pre-evaluates assertion arguments once per overload call: `None` marks
+/// positions matching never fails (non-literal arguments, complex casts,
+/// and boundary (`any`/`unknown`/`never`) cast results — the
+/// [`check_call_arguments`] precedents). Declined casts diagnose `TS2352`
+/// at the operand span exactly once, before any arity verdict (probed tsc
+/// 7.0.2 P044 `m14`/`m15`); admitted results check like their kind.
+fn effective_arg_kinds(
+    file: FileId,
+    call: &CallSite,
+    report: &mut FileReport,
+) -> Vec<Option<InitKind>> {
+    let mut kinds = Vec::with_capacity(call.args.len());
+    for argument in &call.args {
+        let Some(cast) = argument.cast.as_ref() else {
+            kinds.push(if argument.kind == InitKind::NonLiteral {
+                None
+            } else {
+                Some(argument.kind)
+            });
+            continue;
+        };
+        match evaluate_cast(cast) {
+            CastEvaluation::Complex(_) => kinds.push(None),
+            CastEvaluation::Decline(result) => {
+                emit_cast_diagnostic(file, cast, report);
+                kinds.push(result.into_init());
+            }
+            CastEvaluation::Admit(result) => kinds.push(result.into_init()),
+        }
+    }
+    kinds
 }
 
 /// Classifies one annotated rest parameter into its element `(expected,
@@ -3501,6 +4016,7 @@ fn check_one_class<'a>(decl: &'a ClassDecl, run: &mut ClassRun<'a, 'a>) {
         params: decl.ctor_params.clone(),
         params_complex: decl.ctor_complex,
         is_async: false,
+        has_type_params: false,
         return_annotation: None,
         body: FunctionBody::Empty,
     });
@@ -10917,6 +11433,7 @@ mod tests {
                 .collect(),
             params_complex: false,
             is_async: false,
+            has_type_params: false,
             return_annotation: annotation.map(str::to_owned),
             body,
         }
@@ -10951,6 +11468,7 @@ mod tests {
                 .collect(),
             params_complex: false,
             is_async: false,
+            has_type_params: false,
             return_annotation: Some("number".to_owned()),
             body: single(InitKind::Number),
         }
@@ -12008,8 +12526,10 @@ mod tests {
 
     #[test]
     fn call_multiple_declarations_decline() {
-        // Overloads (or shadowing the fact set cannot disambiguate): no
-        // speculative resolution, one unsupported note.
+        // Two bodied declarations of one name mean shadowing, not overloads:
+        // implementations cannot be disambiguated, so one unsupported note
+        // (bodiless overload signatures resolve instead — see the P044
+        // tests below).
         let binder = calls_binder(&[("over", span(0, 10))], &[]);
         let decls = [
             callable("over", vec![("a", "number")]),
@@ -12031,6 +12551,271 @@ mod tests {
             report.unsupported[0]
                 .reason
                 .contains("multiple declarations"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    /// An overload signature declaration: fully annotated primitive params
+    /// with no body (fact-fed from one `NoBody` overload signature).
+    fn overload_sig(name: &str, params: Vec<FunctionParam>) -> FunctionDecl {
+        FunctionDecl {
+            name: name.to_owned(),
+            span: span(0, 10),
+            scope: 0,
+            symbol: None,
+            params,
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("number".to_owned()),
+            body: FunctionBody::NoBody { declared: false },
+        }
+    }
+
+    /// One exact-arity annotated primitive parameter for overload tests.
+    fn fixed_param(name: &str, ty: &str) -> FunctionParam {
+        FunctionParam {
+            name: name.to_owned(),
+            annotated: true,
+            annotation: Some(ty.to_owned()),
+            optional: false,
+            is_rest: false,
+        }
+    }
+
+    /// One optional annotated primitive parameter for overload tests.
+    fn optional_param(name: &str, ty: &str) -> FunctionParam {
+        FunctionParam {
+            name: name.to_owned(),
+            annotated: true,
+            annotation: Some(ty.to_owned()),
+            optional: true,
+            is_rest: false,
+        }
+    }
+
+    #[test]
+    fn overload_any_match_is_silent() {
+        // Probed tsc 7.0.2 P044: a call is clean when ANY signature admits
+        // it — a first-signature mismatch never surfaces when a later one
+        // matches, and vice versa. The `(a: any)` implementation never
+        // participates (it would admit every call below, yet verdicts still
+        // follow the signatures).
+        let binder = calls_binder(&[("pick", span(0, 10))], &[]);
+        let decls = [
+            overload_sig("pick", vec![fixed_param("a", "number")]),
+            overload_sig("pick", vec![fixed_param("a", "string")]),
+            callable("pick", vec![("a", "any")]),
+        ];
+        let first_match = [call(
+            "pick",
+            span(20, 24),
+            vec![(InitKind::Number, span(25, 26))],
+        )];
+        let report = check_calls(FILE, &decls, &first_match, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        let second_match = [call(
+            "pick",
+            span(30, 34),
+            vec![(InitKind::String, span(35, 39))],
+        )];
+        let report = check_calls(FILE, &decls, &second_match, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn overload_all_fail_is_pith2769_at_last_signature() {
+        // Probed tsc 7.0.2 P044: every arity-compatible signature fails on
+        // types, so the call spells `TS2769` elaborating the LAST
+        // signature's first mismatch at that argument.
+        let binder = calls_binder(&[("pick", span(0, 10))], &[]);
+        let decls = [
+            overload_sig("pick", vec![fixed_param("a", "number")]),
+            overload_sig("pick", vec![fixed_param("a", "string")]),
+            callable("pick", vec![("a", "any")]),
+        ];
+        let calls = [call(
+            "pick",
+            span(20, 24),
+            vec![(InitKind::Boolean, span(25, 29))],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_OVERLOAD);
+        assert_eq!(report.diagnostics[0].span, span(25, 29));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "No overload matches this call.\n  The last overload gave the following error.\n    \
+            Argument of type 'boolean' is not assignable to parameter of type 'string'."
+        );
+    }
+
+    #[test]
+    fn overload_single_compatible_checks_like_lone_declaration() {
+        // Probed tsc 7.0.2 P044: exactly one arity-compatible signature
+        // reports its own `TS2345` at the first mismatch.
+        let binder = calls_binder(&[("opt", span(0, 10))], &[]);
+        let decls = [
+            overload_sig(
+                "opt",
+                vec![fixed_param("a", "number"), optional_param("b", "number")],
+            ),
+            overload_sig("opt", vec![fixed_param("a", "string")]),
+            callable("opt", vec![("a", "any"), ("b", "any")]),
+        ];
+        let calls = [call(
+            "opt",
+            span(20, 23),
+            vec![
+                (InitKind::String, span(24, 27)),
+                (InitKind::Number, span(29, 30)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(report.diagnostics[0].span, span(24, 27));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'string' is not assignable to parameter of type 'number'."
+        );
+    }
+
+    #[test]
+    fn overload_union_arity_is_pith2554() {
+        // Probed tsc 7.0.2 P044: no signature admits the count, so the call
+        // unions to `TS2554` (exact here) at the first excess argument.
+        let binder = calls_binder(&[("over", span(0, 10))], &[]);
+        let decls = [
+            overload_sig("over", vec![fixed_param("a", "number")]),
+            overload_sig("over", vec![fixed_param("a", "string")]),
+            callable("over", vec![("a", "any")]),
+        ];
+        let calls = [call(
+            "over",
+            span(30, 34),
+            vec![
+                (InitKind::Number, span(35, 36)),
+                (InitKind::Number, span(38, 39)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARITY);
+        assert_eq!(report.diagnostics[0].span, span(38, 39));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Expected 1 arguments, but got 2."
+        );
+    }
+
+    #[test]
+    fn overload_gap_is_pith2575() {
+        // Probed tsc 7.0.2 P044: the count falls strictly between admitted
+        // ranges, so the call spells the gap diagnostic at the callee,
+        // naming the nearest signature minimums below and above.
+        let binder = calls_binder(&[("d", span(0, 10))], &[]);
+        let decls = [
+            overload_sig("d", vec![fixed_param("a", "number")]),
+            overload_sig(
+                "d",
+                vec![
+                    fixed_param("a", "number"),
+                    fixed_param("b", "number"),
+                    fixed_param("c", "number"),
+                ],
+            ),
+            callable("d", vec![("a", "any")]),
+        ];
+        let calls = [call(
+            "d",
+            span(30, 31),
+            vec![
+                (InitKind::Number, span(32, 33)),
+                (InitKind::Number, span(35, 36)),
+            ],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.unsupported.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_OVERLOAD_ARITY);
+        assert_eq!(report.diagnostics[0].span, span(30, 31));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "No overload expects 2 arguments, but overloads do exist that expect either 1 or 3 \
+            arguments."
+        );
+    }
+
+    #[test]
+    fn overload_generic_signature_declines_distinctly() {
+        // The oracle admits generic signatures (a pinned oracle-clean
+        // divergence), so the solver excludes them with a distinct reason:
+        // a call a remaining signature admits stays clean, while a call
+        // none admits declines with the exclusion recorded — never a forced
+        // `TS2769`.
+        let binder = calls_binder(&[("g", span(0, 10))], &[]);
+        let mut generic = overload_sig("g", vec![fixed_param("a", "T")]);
+        generic.has_type_params = true;
+        let decls = [
+            generic,
+            overload_sig("g", vec![fixed_param("a", "number")]),
+            callable("g", vec![("a", "any")]),
+        ];
+        let clean = [call(
+            "g",
+            span(20, 21),
+            vec![(InitKind::Number, span(22, 23))],
+        )];
+        let report = check_calls(FILE, &decls, &clean, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        let declined = [call(
+            "g",
+            span(30, 31),
+            vec![(InitKind::Boolean, span(32, 38))],
+        )];
+        let report = check_calls(FILE, &decls, &declined, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("generic type parameters"),
             "reason: {}",
             report.unsupported[0].reason
         );
@@ -13130,6 +13915,7 @@ mod tests {
                 params: vec![generic_param(param_ann)],
                 params_complex: false,
                 is_async: false,
+                has_type_params: false,
                 return_annotation: ret_ann.map(str::to_owned),
                 body,
             },
@@ -13446,6 +14232,7 @@ mod tests {
                 ],
                 params_complex: false,
                 is_async: false,
+                has_type_params: false,
                 return_annotation: Some("T".to_owned()),
                 body: FunctionBody::SingleReturn(FunctionReturn {
                     kind: Some(InitKind::NonLiteral),
@@ -13835,6 +14622,7 @@ mod tests {
                 ],
                 params_complex: false,
                 is_async: false,
+                has_type_params: false,
                 return_annotation: Some("A".to_owned()),
                 body: FunctionBody::SingleReturn(FunctionReturn {
                     kind: Some(InitKind::NonLiteral),
