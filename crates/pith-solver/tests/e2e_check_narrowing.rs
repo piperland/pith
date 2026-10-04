@@ -179,6 +179,7 @@ fn narrowing_inputs_from_facts(
             // No array-member facts yet (see the check-functions driver).
             init_array: None,
             cast: None,
+            init_ternary: None,
         });
     }
     let guards = parsed

@@ -132,6 +132,7 @@ fn decls_from_handfed(
                     // No array-member facts yet (see the check-functions driver).
                     init_array: None,
                     cast: None,
+                    init_ternary: None,
                 },
                 init_text: spec.init_text.map(str::to_owned),
                 cross_file_deps: Vec::new(),

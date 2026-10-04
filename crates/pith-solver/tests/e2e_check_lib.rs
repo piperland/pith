@@ -137,6 +137,7 @@ fn decls_from_handfed(
                     members: members.to_vec(),
                 }),
                 cast: None,
+                init_ternary: None,
             }
         })
         .collect()
@@ -174,6 +175,7 @@ fn functions_from_handfed(
                         members: members.to_vec(),
                     }),
                     cast: None,
+                    ternary: None,
                 }),
             }
         })

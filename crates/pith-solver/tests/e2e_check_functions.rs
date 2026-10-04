@@ -117,13 +117,31 @@
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
 //! present, solver silent with one unsupported note — instead of forcing a
 //! false match.
+//! Ternary `c ? A : B` returns check per arm through two synthetic positions
+//! (P051): `ternary-return-clean` is silent with zero notes;
+//! `ternary-return-wrong-then` and `ternary-return-wrong-else` match their
+//! oracle `TS2322`s (one arm each, at arm spans) while
+//! `ternary-return-both-wrong` matches twice. Identifier arms resolve one
+//! level (`ternary-return-ident`: the parameter arm diagnoses while the
+//! clean declaration stays silent); `any` arms emit nothing while the
+//! sibling still checks (`ternary-return-any-arm`), `unknown` arms check as
+//! `unknown` (`ternary-return-unknown-arm`), and `never` arms vanish while
+//! the sibling checks (`ternary-return-never-arm`). Two more fixtures
+//! diverge by design (the oracle still checks the checkable arm where the
+//! subset declines whole-declaration — each pins its oracle error plus one
+//! unsupported note with its distinct reason): `ternary-return-nested-declined`
+//! and `ternary-return-complex-declined`. Baselines keep diagnostic headers
+//! only: tsc elaborates const-position unions with an indented detail line
+//! that the header-only differential (and the solver's first-line message
+//! contract) excludes — see the check-const P051 section.
 
 use pith_frontend::{
     parse_module, CastFact as FrontendCastFact, CastKind as FrontendCastKind,
     CastOperandKind as FrontendCastOperandKind, EffectCallFact as FrontendEffectCall,
     FunctionBodyFact, FunctionFact as FrontendFunction, InitKind as FrontendInitKind,
     InnerDeclFact as FrontendInnerDecl, ParsedFile, ReturnKind as FrontendReturnKind,
-    SingleReturnFact as FrontendReturn,
+    SingleReturnFact as FrontendReturn, TernaryArmFact as FrontendTernaryArm,
+    TernaryFact as FrontendTernary,
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
@@ -131,7 +149,8 @@ use pith_solver::{
     check_functions, CastInput, CastKind, CountedForBody, DeclKind, EffectCall, ElseIfChainBody,
     FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardChainBody,
     GuardEffectBody, GuardThrowBody, InitKind, InnerDecl, JoinedReturns, ObjectInit,
-    ObjectMemberInit, ObjectMemberKind, StraightBody, StraightThrowBody, SwitchBody, TryCatchBody,
+    ObjectMemberInit, ObjectMemberKind, StraightBody, StraightThrowBody, SwitchBody, TernaryArm,
+    TernaryInit, TryCatchBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -236,7 +255,58 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
         // adapter emits them.
         init_array: None,
         cast: ret.cast.as_ref().map(map_cast),
+        // Ternary shapes ride without identifier names here (see
+        // `map_ternary_return`): join legs never slice bare, so they keep
+        // the historical whole-declaration non-literal decline.
+        ternary: ret
+            .ternary
+            .as_ref()
+            .map(|ternary| map_ternary(ternary, None)),
     }
+}
+
+/// Maps one frontend ternary arm to the solver's (P051): kind through the
+/// widened [`map_return_kind`], span verbatim from facts, the nested flag
+/// verbatim, and — only with a source text — the P048 seam for
+/// bare-identifier arms (top-level single returns feed `Some`; join legs
+/// feed `None` and decline instead of expanding).
+fn map_ternary_arm(arm: &FrontendTernaryArm, source: Option<&str>) -> TernaryArm {
+    let kind = map_return_kind(arm.kind);
+    let bare = kind == InitKind::NonLiteral && !arm.is_conditional;
+    let init_ident = if bare {
+        source
+            .and_then(|text| slice_of(text, arm.span))
+            .filter(|text| is_bare_identifier(text))
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    TernaryArm {
+        kind,
+        span: arm.span,
+        init_ident,
+        is_conditional: arm.is_conditional,
+    }
+}
+
+/// Maps one frontend ternary fact to the solver's: both arms in source
+/// order, each through [`map_ternary_arm`].
+fn map_ternary(ternary: &FrontendTernary, source: Option<&str>) -> TernaryInit {
+    TernaryInit {
+        then_arm: map_ternary_arm(&ternary.then_arm, source),
+        else_arm: map_ternary_arm(&ternary.else_arm, source),
+    }
+}
+
+/// Maps one top-level ternary return to the solver's (P051): the literal
+/// shape through [`map_function_return`] plus the P048 seam per arm, so
+/// bare-identifier arms resolve one level in [`check_one`].
+fn map_ternary_return(source: &str, ret: &FrontendReturn) -> FunctionReturn {
+    let mut mapped = map_function_return(ret);
+    if let Some(ternary) = ret.ternary.as_ref() {
+        mapped.ternary = Some(map_ternary(ternary, Some(source)));
+    }
+    mapped
 }
 
 /// Maps one frontend guard-effect tail to the solver's: the literal shape
@@ -546,7 +616,9 @@ fn map_body(
     source: &str,
 ) -> FunctionBody {
     match &func.body {
-        FunctionBodyFact::SingleReturn(ret) => FunctionBody::SingleReturn(map_function_return(ret)),
+        FunctionBodyFact::SingleReturn(ret) => {
+            FunctionBody::SingleReturn(map_ternary_return(source, ret))
+        }
         FunctionBodyFact::SequenceReturns { first, second } => {
             FunctionBody::SequenceReturns(map_joined(first, second))
         }
@@ -570,7 +642,11 @@ fn map_body(
             try_branch,
             catch_branch,
             tail,
-        } => FunctionBody::TryCatch(map_try_catch(try_branch, catch_branch, tail.as_ref())),
+        } => FunctionBody::TryCatch(Box::new(map_try_catch(
+            try_branch,
+            catch_branch,
+            tail.as_ref(),
+        ))),
         FunctionBodyFact::Switch { cases, default } => {
             FunctionBody::Switch(map_switch(cases, default.as_ref()))
         }
@@ -1041,6 +1117,117 @@ fixture_test!(
     named_param_unused_is_silent,
     "named-param-unused.ts",
     "named-param-unused.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_return_clean_is_silent,
+    "ternary-return-clean.ts",
+    "ternary-return-clean.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_return_wrong_then_matches_ts2322,
+    "ternary-return-wrong-then.ts",
+    "ternary-return-wrong-then.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_return_wrong_else_matches_ts2322,
+    "ternary-return-wrong-else.ts",
+    "ternary-return-wrong-else.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_return_both_wrong_matches_ts2322_twice,
+    "ternary-return-both-wrong.ts",
+    "ternary-return-both-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_return_ident_arm_checks_per_arm,
+    "ternary-return-ident.ts",
+    "ternary-return-ident.expected.txt",
+    0
+);
+
+#[test]
+fn ternary_return_nested_divergence_pins_ts2322() {
+    // By design the subset declines where the oracle errors: tsc reports
+    // `TS2322` at the inner wrong arm while the solver records one
+    // unsupported note and stays silent — the subset joins one level only,
+    // never a partial verdict over the checkable arm.
+    let source = include_str!("../../../corpus/check-functions/ternary-return-nested-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-functions/ternary-return-nested-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("nested ternary"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn ternary_return_complex_arm_divergence_pins_ts2322() {
+    // By design the subset declines where the oracle errors: tsc reports
+    // `TS2322` at the wrong literal arm (the call arm checks clean) while
+    // the solver records one unsupported note and stays silent — complex
+    // arms decline whole-declaration, never a partial verdict.
+    let source = include_str!("../../../corpus/check-functions/ternary-return-complex-declined.ts");
+    let expected = include_str!(
+        "../../../corpus/check-functions/ternary-return-complex-declined.expected.txt"
+    );
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("non-literal"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+fixture_test!(
+    ternary_return_any_arm_checks_sibling,
+    "ternary-return-any-arm.ts",
+    "ternary-return-any-arm.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_return_unknown_arm_matches_ts2322,
+    "ternary-return-unknown-arm.ts",
+    "ternary-return-unknown-arm.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_return_never_arm_checks_sibling,
+    "ternary-return-never-arm.ts",
+    "ternary-return-never-arm.expected.txt",
     0
 );
 

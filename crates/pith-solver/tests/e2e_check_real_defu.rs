@@ -220,6 +220,7 @@ fn consts_from_facts(
             // No array-member facts yet (see the check-functions driver).
             init_array: None,
             cast: None,
+            init_ternary: None,
         });
         idents.push(ident.map(str::to_owned));
         texts.push(text);
@@ -253,6 +254,7 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
         // No array-member facts yet (see the check-functions driver).
         init_array: None,
         cast: None,
+        ternary: None,
     }
 }
 

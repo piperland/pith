@@ -178,6 +178,7 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
         // No array-member facts yet (see the check-functions driver).
         init_array: None,
         cast: None,
+        ternary: None,
     }
 }
 

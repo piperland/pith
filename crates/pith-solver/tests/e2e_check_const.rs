@@ -28,12 +28,27 @@
 //! span resolution agrees with the driver even when two same-name decls
 //! share a file. No check-const fixture shadows a name; the shadowing proof
 //! lives in the solver unit tests (`shadowed_same_name_verdicts_against_own_scopes`).
+//!
+//! Ternary `c ? A : B` initializers (P051): the driver maps the adapter's
+//! conditional facts (arm kinds plus arm spans, bare-identifier arm names
+//! sliced from arm spans like the P048 seam) into [`ConstDecl::init_ternary`].
+//! Agreeing arms check as one literal; differing arms diagnose the
+//! rank-ordered union once (`ternary-wrong-then`, `ternary-wrong-else`,
+//! `ternary-both-wrong`); nested, complex, and fresh-mix arms decline with
+//! distinct reasons (`ternary-nested-declined`,
+//! `ternary-complex-arm-declined`, `ternary-fresh-mix-declined`); `any`
+//! silences, `unknown` absorbs, `never` vanishes, identifiers resolve, and
+//! any condition qualifies (`ternary-call-cond`).
 
-use pith_frontend::{parse_module, InitKind as FrontendInitKind, ParsedFile};
+use pith_frontend::{
+    parse_module, InitKind as FrontendInitKind, ParsedFile, ReturnKind as FrontendReturnKind,
+    TernaryArmFact as FrontendTernaryArm, TernaryFact as FrontendTernary,
+};
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_file_with_aliases, ConstDecl, DeclKind, FileReport, InitKind, TypeAliasShape,
+    check_file_with_aliases, ConstDecl, DeclKind, FileReport, InitKind, TernaryArm, TernaryInit,
+    TypeAliasShape,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -84,6 +99,54 @@ fn map_init(kind: FrontendInitKind) -> InitKind {
         FrontendInitKind::Null => InitKind::Null,
         FrontendInitKind::Undefined => InitKind::Undefined,
         FrontendInitKind::NonLiteral => InitKind::NonLiteral,
+    }
+}
+
+/// Maps one frontend ternary-arm kind to the solver's, variant by variant.
+///
+/// The boolean payload is dropped (the const join spells widened names
+/// only — fresh-literal mixes decline solver-side instead of mis-spelling).
+/// Exhaustive so a new frontend variant fails to compile instead of
+/// silently mis-checking.
+fn map_ternary_kind(kind: FrontendReturnKind) -> InitKind {
+    match kind {
+        FrontendReturnKind::Number => InitKind::Number,
+        FrontendReturnKind::String => InitKind::String,
+        FrontendReturnKind::Boolean(_) => InitKind::Boolean,
+        FrontendReturnKind::Null => InitKind::Null,
+        FrontendReturnKind::Undefined => InitKind::Undefined,
+        FrontendReturnKind::NonLiteral => InitKind::NonLiteral,
+    }
+}
+
+/// Maps one frontend ternary arm to the solver's (P051): kind through the
+/// widened map, span verbatim from facts, the nested flag verbatim, and the
+/// P048 seam for bare-identifier arms (driver-sliced from the arm fact span
+/// — the adapter emits no identifier facts for arms; anything else feeds
+/// `None` and declines solver-side).
+fn map_ternary_arm(source: &str, arm: &FrontendTernaryArm) -> TernaryArm {
+    let kind = map_ternary_kind(arm.kind);
+    let init_ident = if kind == InitKind::NonLiteral && !arm.is_conditional {
+        slice_of(source, arm.span)
+            .filter(|text| is_bare_identifier(text))
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    TernaryArm {
+        kind,
+        span: arm.span,
+        init_ident,
+        is_conditional: arm.is_conditional,
+    }
+}
+
+/// Maps one frontend ternary fact to the solver's: both arms in source
+/// order, each through [`map_ternary_arm`].
+fn map_ternary(source: &str, ternary: &FrontendTernary) -> TernaryInit {
+    TernaryInit {
+        then_arm: map_ternary_arm(source, &ternary.then_arm),
+        else_arm: map_ternary_arm(source, &ternary.else_arm),
     }
 }
 
@@ -164,6 +227,13 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<C
                 // No array-member facts yet (see the check-functions driver).
                 init_array: None,
                 cast: None,
+                // Ternary arms ride the adapter's conditional facts (P051);
+                // the bare-identifier arm seam lives in `map_ternary_arm`.
+                init_ternary: decl
+                    .init
+                    .as_ref()
+                    .and_then(|init| init.ternary.as_ref())
+                    .map(|ternary| map_ternary(source, ternary)),
             }
         })
         .collect()
@@ -201,10 +271,15 @@ fn run_pipeline(source: &str) -> FileReport {
 
 /// Parses normalized oracle lines (`file:TSNNNN: message`) into sorted
 /// `(numeric-code, message)` pairs; spans/positions are already folded away.
+/// Indented continuation lines (the oracle's union-join elaboration, e.g.
+/// the second line of a const-ternary `TS2322`) are SKIPPED, not folded:
+/// the solver pins the header line exactly and never emits elaborations,
+/// while the oracle harness checks the full text against tsc.
 fn parse_baseline(expected: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = expected
         .lines()
         .filter(|line| !line.trim().is_empty())
+        .filter(|line| !line.starts_with(char::is_whitespace))
         .map(|line| {
             let mut parts = line.splitn(3, ':');
             let _file = parts.next().unwrap_or("");
@@ -358,6 +433,129 @@ fixture_test!(
     ident_chain_checks_like_literals,
     "ident-chain.ts",
     "ident-chain.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_clean_is_silent,
+    "ternary-clean.ts",
+    "ternary-clean.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_wrong_then_matches_union_ts2322,
+    "ternary-wrong-then.ts",
+    "ternary-wrong-then.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_wrong_else_matches_union_ts2322,
+    "ternary-wrong-else.ts",
+    "ternary-wrong-else.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_both_wrong_dedupes_to_one_ts2322,
+    "ternary-both-wrong.ts",
+    "ternary-both-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_ident_arms_are_silent,
+    "ternary-ident-clean.ts",
+    "ternary-ident-clean.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_ident_agreeing_arms_check_as_one_literal,
+    "ternary-ident-agree-wrong.ts",
+    "ternary-ident-agree-wrong.expected.txt",
+    0
+);
+
+#[test]
+fn ternary_nested_divergence_pins_ts2322() {
+    // By design the subset declines where the oracle errors: tsc reports
+    // `TS2322` with the union spelling on the nested ternary while the
+    // solver records one unsupported note and stays silent — the subset
+    // joins one level only, never recursively.
+    let source = include_str!("../../../corpus/check-const/ternary-nested-declined.ts");
+    let expected = include_str!("../../../corpus/check-const/ternary-nested-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string | number' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("nested ternary"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn ternary_fresh_mix_divergence_pins_ts2322() {
+    // By design the subset declines where the oracle errors: tsc retains
+    // the fresh spelling (`number | "ok"`) on the literal/identifier mix
+    // while the solver records one unsupported note and stays silent —
+    // widened-only spellings never fake fresh literals (the P034
+    // no-misspelling discipline).
+    let source = include_str!("../../../corpus/check-const/ternary-fresh-mix-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-const/ternary-fresh-mix-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'number | \"ok\"' is not assignable to type 'string'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("fresh-literal"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+fixture_test!(
+    ternary_complex_arm_is_unsupported,
+    "ternary-complex-arm-declined.ts",
+    "ternary-complex-arm-declined.expected.txt",
+    1
+);
+fixture_test!(
+    ternary_any_arm_is_silent,
+    "ternary-any-arm-clean.ts",
+    "ternary-any-arm-clean.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_unknown_arm_absorbs_to_unknown_ts2322,
+    "ternary-unknown-arm.ts",
+    "ternary-unknown-arm.expected.txt",
+    0
+);
+fixture_test!(
+    ternary_call_condition_checks_like_plain,
+    "ternary-call-cond.ts",
+    "ternary-call-cond.expected.txt",
     0
 );
 
