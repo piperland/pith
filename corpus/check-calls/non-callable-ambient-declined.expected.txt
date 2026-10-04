@@ -1,0 +1,2 @@
+non-callable-ambient-declined.ts:TS2349: This expression is not callable.
+  Type 'Number' has no call signatures.

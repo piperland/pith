@@ -268,3 +268,18 @@ where the oracle still checks the checkable arm). Return arms diagnose at
 arm spans through dotted synthetic names; const-position joins diagnose
 once at the declaration (see the check-const P051 section). Probes in
 `.agent/scratch/p051-probes/`.
+
+## P063 ambient declarations
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| ambient-declared-declined.ts | clean | silent + 1 UNSUPPORTED (pinned) |
+| ambient-overload-declared-declined.ts | clean | silent + 2 UNSUPPORTED, one per signature (pinned) |
+| ts2391-impl-less-declined.ts | 1x TS2391 | silent + 2 UNSUPPORTED, one per signature (pinned) |
+
+Differential: 3/3 pinned divergences (2 oracle-clean + 1 oracle-error).
+Ambient declarations carry no body to check, and the subset spells no
+declaration diagnostics — so every bodyless declaration records one
+unsupported note and stays silent instead of forcing a verdict. Call
+resolution over the same shapes lives in the check-calls P063 section.
+Probes in `.agent/scratch/p063-probes/`.

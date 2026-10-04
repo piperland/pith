@@ -1,0 +1,4 @@
+ts2391-impl-less-group.ts:TS2391: Function implementation is missing or not immediately following the declaration.
+ts2391-impl-less-group.ts:TS2769: No overload matches this call.
+  The last overload gave the following error.
+    Argument of type 'boolean' is not assignable to parameter of type 'string'.

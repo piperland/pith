@@ -43,19 +43,36 @@ tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs` (normalized
 | named-structural-methoded-declined.ts | clean | 1 UNSUPPORTED (methoded shape declines in the shared comparison; pinned divergence) |
 | named-structural-nonliteral.ts | clean | 2 UNSUPPORTED (identifier arg declines distinctly, call result keeps the opaque decline; pinned divergences) |
 | named-alias-call-declined.ts | 1x TS2322 | 1 UNSUPPORTED (no alias tables at call sites — opaque decline; pinned divergence) |
+| ambient-clean.ts | clean | silent (2 ambient calls: arity + arg types match) |
+| ambient-wrong-type.ts | 1x TS2345 (`Argument of type 'string' …`) | 1x PITH2345 at the mismatched arg |
+| ambient-too-few.ts | 1x TS2554 (`Expected 2 arguments, but got 1.`) | 1x PITH2554 at the callee |
+| ambient-too-many.ts | 1x TS2554 (`Expected 1 arguments, but got 2.`) | 1x PITH2554 at the first excess arg |
+| ambient-overload-clean.ts | clean | silent (each call matches a different ambient signature) |
+| ambient-overload-wrong.ts | 1x TS2769 + continuations | 1x PITH2769, message carries both continuations |
+| ambient-overload-generic-declined.ts | clean | silent + 1 UNSUPPORTED (generic ambient signature excluded distinctly; oracle instantiates `T` — pinned divergence) |
+| overload-impl-excluded.ts | 1x TS2345 (`Argument of type 'boolean' …`) | 1x PITH2345 (implementation signature never participates) |
+| ts2391-impl-less-group.ts | 1x TS2391 (on the declaration) + 1x TS2769 + continuations | 1x PITH2769 (calls still resolve; the declaration diagnostic stays declined) |
+| non-callable-ambient-declined.ts | 1x TS2349 + continuation | UNSUPPORTED (bound name declares no function signature; the subset never spells `TS2349`) |
 
-Differential: 20/20 match on the checkable direct-call subset (7
-silent/clean + 13 diagnostic groups); 9/9 divergences pinned explicitly
+Differential: 27/27 match on the checkable direct-call subset (9
+silent/clean + 18 diagnostic groups); 12/12 divergences pinned explicitly
 (oracle errors while the solver declines or skips, or oracle clean while
 the solver declines) — unresolved-callee silence (tracked once, never
 double-diagnosed), required-after-optional shapes, generic overload
 signatures, opaque named-param calls, generic `T` calls, imported-shape
-calls, methoded-shape calls, non-literal shape args, and alias-named
-calls are acknowledged non-goals, never silent gaps. PITH-P044 converted
+calls, methoded-shape calls, non-literal shape args, alias-named
+calls, generic ambient signatures, non-callable ambient shapes, and the
+TS2391 declaration diagnostic are acknowledged non-goals, never silent
+gaps. PITH-P044 converted
 the old overload decline into matches (any-match resolution, union
 arities, and the gap spelling). PITH-P037 converted the old
 range/variadic declines into matches. PITH-P062 converted the local-shape
-object-arg decline into matches (shared P017 comparison).
+object-arg decline into matches (shared P017 comparison). PITH-P063
+admitted ambient declarations into call resolution (single declarations
+check like lone declarations; ambient groups resolve by any-match; the
+implementation signature never participates) while keeping declaration
+diagnostics (`TS2391`), generic/union ambient params, and non-callable
+ambient shapes declined distinctly.
 
 Member differential: 3/3 match on the checkable opaque subset (1 silent +
 2 diagnostic groups); 3/3 divergences pinned explicitly —
@@ -103,6 +120,28 @@ unsupported), `named-structural-methoded-declined` (oracle clean, solver
 one unsupported), `named-structural-nonliteral` (oracle clean,
 solver two unsupported), `named-alias-call-declined` (oracle `TS2322`,
 solver one unsupported).
+
+## P063 ambient overload declaration admission
+
+Single `declare function` declarations check exactly like lone bodied
+declarations (`ambient-clean` silent; `ambient-wrong-type` one `TS2345`;
+`ambient-too-few`/`too-many` one `TS2554` each — no declaration
+diagnostic for the missing body), and ambient overload groups resolve by
+the P044 any-match (`ambient-overload-clean` silent;
+`ambient-overload-wrong` one `TS2769` with continuations). The
+implementation signature never participates (`overload-impl-excluded`:
+one `TS2345` from the compatible signature, never an impl-shaped
+verdict). Declined distinctly, never partial verdicts: generic ambient
+signatures ride the existing exclusion (`ambient-overload-generic-declined`,
+oracle clean — pinned divergence), union ambient params the existing
+union decline (probed — generic/union instantiation stays out of scope),
+missing
+implementations keep the `TS2391` declaration diagnostic declined while
+calls still resolve (`ts2391-impl-less-group`, oracle `TS2391` +
+`TS2769` — pinned divergence), and calls to bound non-functions
+(`declare const`, `non-callable-ambient-declined`) decline with the
+no-signature reason (oracle `TS2349` plus a lib-spelled continuation —
+pinned divergence). Probes in `.agent/scratch/p063-probes/`.
 
 Probe rules (tsc 7.0.2, recorded in `pith-solver` docs): one family per
 call site, arity beats arg types, only the first mismatched argument
