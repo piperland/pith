@@ -14,7 +14,12 @@ tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs` (normalized
 | wrong-arg-type.ts | 1x TS2345 (`Argument of type 'string' …`) | 1x PITH2345 at the mismatched arg |
 | unresolved-callee.ts | 1x TS2304 | silent (already tracked as unresolved; never double-diagnosed) |
 | method-call-excluded.ts | clean | silent, zero call facts (methods out of scope) |
-| overloads-declined.ts | 1x TS2554 | UNSUPPORTED (multiple declarations; resolution is future work) |
+| overloads-declined.ts | 1x TS2554 | 1x PITH2554 at the excess arg (P044 union arity) |
+| overload-clean.ts | clean | silent (each call matches a different signature) |
+| overload-first-match.ts | clean | silent (first match + later-only match) |
+| overload-wrong-all.ts | 1x TS2769 + continuations | 1x PITH2769, message carries both continuations |
+| overload-arity.ts | 2x TS2554 + 1x TS2575 | same (union `1-3`; gap names `1` and `3`) |
+| overload-generic-declined.ts | 1x TS2769 + continuations | UNSUPPORTED (generic excluded distinctly) |
 | rest-param-declined.ts | clean | silent (PITH-P037: rest admits 1-or-more; converts the old variadic decline) |
 | range-correct.ts | clean | silent (optional + defaulted ranges admit every call, incl. explicit `undefined`) |
 | range-too-few.ts | 1x TS2554 (`Expected 1-2 arguments, but got 0.`) | 1x PITH2554 at the callee |
@@ -29,12 +34,14 @@ tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs` (normalized
 | member-unknown-receiver.ts | 1x TS2304 | silent, zero member facts (tracked unresolved; never double-diagnosed) |
 | member-lib-declined.ts | clean | 4x UNSUPPORTED (range/overload/variadic lib shapes) |
 
-Differential: 11/11 match on the checkable direct-call subset (4
-silent/clean + 7 diagnostic groups); 3/3 divergences pinned explicitly
+Differential: 16/16 match on the checkable direct-call subset (6
+silent/clean + 10 diagnostic groups); 3/3 divergences pinned explicitly
 (oracle errors while the solver declines or skips) — unresolved-callee
-silence (tracked once, never double-diagnosed), overload resolution, and
-required-after-optional shapes are acknowledged non-goals, never silent
-gaps. PITH-P037 converted the old range/variadic declines into matches.
+silence (tracked once, never double-diagnosed), required-after-optional
+shapes, and generic overload signatures are acknowledged non-goals, never
+silent gaps. PITH-P044 converted the old overload decline into matches
+(any-match resolution, union arities, and the gap spelling). PITH-P037
+converted the old range/variadic declines into matches.
 
 Member differential: 3/3 match on the checkable opaque subset (1 silent +
 2 diagnostic groups); 3/3 divergences pinned explicitly —
@@ -47,7 +54,11 @@ non-goals, never silent gaps).
 Probe rules (tsc 7.0.2, recorded in `pith-solver` docs): one family per
 call site, arity beats arg types, only the first mismatched argument
 reports; too-few anchors at the callee, too-many at the first excess
-argument, arg-type at the mismatched argument.
+argument, arg-type at the mismatched argument. Overload rules (P044):
+any-match across signatures (the implementation never participates);
+all-fail spells `TS2769` with two continuation lines at the last
+signature's first mismatch; admitted-by-none counts union to `TS2554` /
+`TS2555`, or to the gap spelling `TS2575` strictly between ranges.
 
 Out of scope (no facts, solver never sees them): method/member calls on
 non-allowlisted receivers, computed members (`JSON["parse"]()`), optional
