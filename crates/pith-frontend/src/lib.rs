@@ -167,6 +167,16 @@
 //! members) keep classifying the whole assertion [`InitKind::NonLiteral`],
 //! exactly like any other unmodeled expression.
 //!
+//! Conditional facts (P051): [`InitFact`] and [`SingleReturnFact`] each
+//! carry an optional [`TernaryFact`] for `c ? a : b` (probed tsc 7.0.2).
+//! The fact records per-arm literal kinds plus each arm's own span, and
+//! whether the parentheses-peeled arm is itself a conditional (nested
+//! ternaries decline distinctly solver-side). The condition never narrows
+//! (any condition qualifies), so it carries no facts; `&&` / `||` / `??`
+//! never reach facts (logical, not conditional). Object, array, and
+//! assertion arms classify `NonLiteral` with no member/cast facts: those
+//! arms decline distinctly solver-side instead of mis-checking.
+//!
 //! Parameter enabling (P014, entailed by the call checker): each
 //! [`FunctionParamFact`] additionally carries its annotation text plus
 //! `optional`/`is_rest` markers. Range-arity checking reads them directly:
@@ -519,6 +529,10 @@ pub struct InitFact {
     pub span: Span,
     /// Outermost assertion facts; `None` for non-assertion initializers.
     pub cast: Option<CastFact>,
+    /// Conditional facts when the initializer is `c ? a : b` (P051);
+    /// `None` otherwise. The kind stays [`InitKind::NonLiteral` either
+    /// way — the solver evaluates the ternary fact instead of the kind.
+    pub ternary: Option<TernaryFact>,
 }
 
 /// One `const` declarator's declaration facts, keyed to its symbol.
@@ -657,6 +671,42 @@ pub struct ReturnMemberFact {
     pub span: Span,
 }
 
+/// One arm of a `c ? a : b` conditional (P051).
+///
+/// Arms classify with [`return_kind`] over the parentheses-peeled arm, so a
+/// parenthesized literal still reads as a literal (the cast-fact precedent:
+/// parentheses never change the classified shape). The span is the arm's own
+/// range (parens included), so drivers slice bare-identifier arms from facts
+/// and the solver anchors per-arm positions without string-searching.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TernaryArmFact {
+    /// Literal kind of the arm expression (`NonLiteral` for identifiers,
+    /// calls, objects, nested ternaries, and everything else).
+    pub kind: ReturnKind,
+    /// Span of the arm expression.
+    pub span: Span,
+    /// Whether the peeled arm is itself a conditional: nested ternaries
+    /// decline distinctly solver-side (never a partial verdict over the
+    /// other arm).
+    pub is_conditional: bool,
+}
+
+/// Conditional facts for one initializer or return expression (P051).
+///
+/// Present iff the parentheses-peeled expression is `c ? a : b`. The
+/// condition never narrows (any condition qualifies — a call, a member test,
+/// or a plain identifier all admit), so it carries no facts. `&&` / `||` /
+/// `??` never reach here (logical, not conditional). Object, array, and
+/// assertion arms classify `NonLiteral` with no member/cast facts: those
+/// arms decline distinctly solver-side instead of mis-checking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TernaryFact {
+    /// The `then` (`?`) arm's expression facts.
+    pub then_arm: TernaryArmFact,
+    /// The `else` (`:`) arm's expression facts.
+    pub else_arm: TernaryArmFact,
+}
+
 /// A straight-line `return <expr>;`: literal kind + span, plus member facts
 /// when the returned expression is an object literal (literal order).
 ///
@@ -675,6 +725,11 @@ pub struct SingleReturnFact {
     pub members: Option<Vec<ReturnMemberFact>>,
     /// Outermost assertion facts; `None` for non-assertion returns.
     pub cast: Option<CastFact>,
+    /// Conditional facts when the returned expression is `c ? a : b`
+    /// (P051); `None` otherwise. The kind stays
+    /// [`ReturnKind::NonLiteral`] either way — the solver evaluates the
+    /// ternary fact instead of the kind.
+    pub ternary: Option<TernaryFact>,
 }
 
 /// One leading `const`/`let` declarator inside a straight-line body.
@@ -2064,6 +2119,53 @@ fn return_kind(source: &str, expression: &Expression<'_>) -> ReturnKind {
     }
 }
 
+/// Peels parenthesized layers off one expression (P051).
+///
+/// Parentheses never change the classified shape (the `cast_fact` and
+/// `typeof`-guard transparency precedent): a parenthesized literal still
+/// reads as a literal, and a parenthesized ternary still reads as one.
+fn peeled_expression<'a>(expression: &'a Expression<'a>) -> &'a Expression<'a> {
+    let mut current = expression;
+    while let Expression::ParenthesizedExpression(parenthesized) = current {
+        current = &parenthesized.expression;
+    }
+    current
+}
+
+/// Classifies one ternary arm into its [`TernaryArmFact`] (P051).
+///
+/// The kind reads off the parentheses-peeled arm while the span stays the
+/// arm's own whole range (parens included, so a parenthesized identifier
+/// still slices un-bare and declines exactly like P048's `p13` instead of
+/// resolving through the P048 seam).
+fn ternary_arm_fact(source: &str, file: FileId, arm: &Expression<'_>) -> TernaryArmFact {
+    let peeled = peeled_expression(arm);
+    let span = arm.span();
+    TernaryArmFact {
+        kind: return_kind(source, peeled),
+        span: Span {
+            file,
+            lo: span.start,
+            hi: span.end,
+        },
+        is_conditional: matches!(peeled, Expression::ConditionalExpression(_)),
+    }
+}
+
+/// Records conditional facts for one initializer or return expression
+/// (P051): `Some` with per-arm kinds + spans iff the parentheses-peeled
+/// expression is `c ? a : b`, else `None` (the caller keeps its historical
+/// literal kind, which reads [`ReturnKind::NonLiteral`] for conditionals).
+fn ternary_fact(source: &str, file: FileId, expression: &Expression<'_>) -> Option<TernaryFact> {
+    let Expression::ConditionalExpression(conditional) = peeled_expression(expression) else {
+        return None;
+    };
+    Some(TernaryFact {
+        then_arm: ternary_arm_fact(source, file, &conditional.consequent),
+        else_arm: ternary_arm_fact(source, file, &conditional.alternate),
+    })
+}
+
 /// Whether a member-call receiver names a known value with opaque lib
 /// signatures solver-side (`JSON`, `Object`, `Array`, `console`, `Math`).
 ///
@@ -2439,6 +2541,7 @@ fn single_return_fact(
             span,
             members: Some(members),
             cast: None,
+            ternary: None,
         })
     } else {
         Some(SingleReturnFact {
@@ -2446,6 +2549,7 @@ fn single_return_fact(
             span,
             members: None,
             cast: cast_fact(source, file, argument),
+            ternary: ternary_fact(source, file, argument),
         })
     }
 }
@@ -2690,6 +2794,7 @@ fn straight_declarator(
                 hi: span.end,
             },
             cast: cast_fact(collector.source, collector.file, expression),
+            ternary: ternary_fact(collector.source, collector.file, expression),
         }
     });
     let members = match declarator.init.as_ref() {
@@ -3819,6 +3924,7 @@ impl DeclCollector<'_> {
                     hi: span.end,
                 },
                 cast: cast_fact(self.source, self.file, expression),
+                ternary: ternary_fact(self.source, self.file, expression),
             }
         });
 
@@ -5600,6 +5706,101 @@ export function f(a: string): string { return a + b; }
             assert_eq!((init.span.lo, init.span.hi), expected_init.1);
             assert_eq!(init.span.file, FileId(0));
         }
+    }
+
+    #[test]
+    fn ternary_facts_record_arm_kinds_and_spans() {
+        // P051: `flag ? 1 : "oops"` records per-arm kinds plus each arm's
+        // own span with no conditional flag; the whole init still reads
+        // NonLiteral (the solver evaluates the ternary fact, not the kind).
+        let src = "const t: number = flag ? 1 : \"oops\";\n";
+        let pf = parse_module(FileId(0), "t.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 1);
+        let init = pf.decls[0].init.as_ref().expect("initialized");
+        assert_eq!(init.kind, InitKind::NonLiteral);
+        assert_eq!(slice_of(src, init.span), "flag ? 1 : \"oops\"");
+        let ternary = init.ternary.as_ref().expect("ternary facts");
+        assert_eq!(ternary.then_arm.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, ternary.then_arm.span), "1");
+        assert!(!ternary.then_arm.is_conditional);
+        assert_eq!(ternary.else_arm.kind, ReturnKind::String);
+        assert_eq!(slice_of(src, ternary.else_arm.span), "\"oops\"");
+        assert!(!ternary.else_arm.is_conditional);
+    }
+
+    #[test]
+    fn ternary_facts_flag_nested_arms() {
+        // P051: a parenthesized conditional arm still reads conditional
+        // (parentheses peel transparently), while identifier and call arms
+        // read NonLiteral without the flag.
+        let src = "const t: number = flag ? (other ? 1 : 2) : tag();\n";
+        let pf = parse_module(FileId(0), "t.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let init = pf.decls[0].init.as_ref().expect("initialized");
+        let ternary = init.ternary.as_ref().expect("ternary facts");
+        assert_eq!(ternary.then_arm.kind, ReturnKind::NonLiteral);
+        assert_eq!(slice_of(src, ternary.then_arm.span), "(other ? 1 : 2)");
+        assert!(ternary.then_arm.is_conditional);
+        assert_eq!(ternary.else_arm.kind, ReturnKind::NonLiteral);
+        assert_eq!(slice_of(src, ternary.else_arm.span), "tag()");
+        assert!(!ternary.else_arm.is_conditional);
+    }
+
+    #[test]
+    fn ternary_facts_peel_parenthesized_literals() {
+        // P051: a parenthesized literal arm classifies as a literal while
+        // its span stays whole (parens included), and a parenthesized
+        // ternary still records facts.
+        let src = "const t: number = (flag ? (1) : y);\n";
+        let pf = parse_module(FileId(0), "t.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        let init = pf.decls[0].init.as_ref().expect("initialized");
+        assert_eq!(init.kind, InitKind::NonLiteral);
+        let ternary = init.ternary.as_ref().expect("ternary facts");
+        assert_eq!(ternary.then_arm.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, ternary.then_arm.span), "(1)");
+        assert!(!ternary.then_arm.is_conditional);
+        assert_eq!(ternary.else_arm.kind, ReturnKind::NonLiteral);
+        assert_eq!(slice_of(src, ternary.else_arm.span), "y");
+    }
+
+    #[test]
+    fn ternary_facts_absent_for_plain_inits() {
+        // P051: plain literals and calls record no ternary facts (the
+        // solver keeps its historical paths).
+        let src = "const a: number = 1;\nconst b: number = tag();\n";
+        let pf = parse_module(FileId(0), "t.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 2);
+        let first = pf.decls[0].init.as_ref().expect("initialized");
+        assert_eq!(first.kind, InitKind::Number);
+        assert!(first.ternary.is_none());
+        let second = pf.decls[1].init.as_ref().expect("initialized");
+        assert_eq!(second.kind, InitKind::NonLiteral);
+        assert!(second.ternary.is_none());
+    }
+
+    #[test]
+    fn ternary_facts_record_return_arms() {
+        // P051: `return flag ? 1 : x;` stays a single return whose fact
+        // carries the arm kinds plus arm spans for the solver's per-arm
+        // positions.
+        let src = "function pick(flag: boolean): number {\n  return flag ? 1 : x;\n}\n";
+        let pf = parse_module(FileId(0), "t.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        let FunctionBodyFact::SingleReturn(ret) = &pf.functions[0].body else {
+            panic!("expected single return, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(ret.kind, ReturnKind::NonLiteral);
+        assert_eq!(slice_of(src, ret.span), "flag ? 1 : x");
+        let ternary = ret.ternary.as_ref().expect("ternary facts");
+        assert_eq!(ternary.then_arm.kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, ternary.then_arm.span), "1");
+        assert_eq!(ternary.else_arm.kind, ReturnKind::NonLiteral);
+        assert_eq!(slice_of(src, ternary.else_arm.span), "x");
+        assert!(!ternary.else_arm.is_conditional);
     }
 
     #[test]
