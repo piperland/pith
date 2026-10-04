@@ -41,8 +41,9 @@
 //! any condition qualifies (`ternary-call-cond`).
 
 use pith_frontend::{
-    parse_module, InitKind as FrontendInitKind, ParsedFile, ReturnKind as FrontendReturnKind,
-    TernaryArmFact as FrontendTernaryArm, TernaryFact as FrontendTernary,
+    parse_module, InitFact as FrontendInitFact, InitKind as FrontendInitKind, ParsedFile,
+    ReturnKind as FrontendReturnKind, TernaryArmFact as FrontendTernaryArm,
+    TernaryFact as FrontendTernary,
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
@@ -100,6 +101,24 @@ fn map_init(kind: FrontendInitKind) -> InitKind {
         FrontendInitKind::Undefined => InitKind::Undefined,
         FrontendInitKind::NonLiteral => InitKind::NonLiteral,
     }
+}
+
+/// Maps one frontend initializer fact to the solver's, with the P060 regex
+/// seam: the adapter emits no regex facts (regex literals classify
+/// `NonLiteral` frontend-side), so a bare `NonLiteral` whose sliced text
+/// leads with `/` maps to [`InitKind::RegExp`] — division cannot lead an
+/// expression, so only regex literals match. Casts, ternaries, and member
+/// refs keep their own facts (never reclassified); anything else keeps its
+/// historical mapping.
+fn map_init_kind(source: &str, init: &FrontendInitFact) -> InitKind {
+    let sliced_regex = init.cast.is_none()
+        && init.ternary.is_none()
+        && init.member_ref.is_none()
+        && slice_of(source, init.span).is_some_and(|text| text.trim_start().starts_with('/'));
+    if init.kind == FrontendInitKind::NonLiteral && sliced_regex {
+        return InitKind::RegExp;
+    }
+    map_init(init.kind)
 }
 
 /// Maps one frontend ternary-arm kind to the solver's, variant by variant.
@@ -193,7 +212,9 @@ fn is_bare_identifier(text: &str) -> bool {
 /// - `scope`/`symbol` via the declarator scope fact plus binder resolution;
 /// - `kind` is `const` (the adapter emits no `let` facts yet);
 /// - `annotation` as the frontend's colon-stripped text verbatim;
-/// - `init` via the explicit [`map_init`] variant map;
+/// - `init` via the explicit [`map_init`] variant map, plus the P060 regex
+///   seam ([`map_init_kind`]: a bare `NonLiteral` slicing to a leading `/`
+///   feeds [`InitKind::RegExp`]);
 /// - `init_ident` is the P048 seam: bare-identifier initializer names are
 ///   driver-sliced from the init fact span (the adapter emits no
 ///   identifier-init facts — see the solver's module-level BLOCKER);
@@ -221,7 +242,7 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<C
                 symbol,
                 kind: DeclKind::Const,
                 annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
-                init: decl.init.as_ref().map(|init| map_init(init.kind)),
+                init: decl.init.as_ref().map(|init| map_init_kind(source, init)),
                 init_ident,
                 init_object: None,
                 // No array-member facts yet (see the check-functions driver).
@@ -392,9 +413,39 @@ fixture_test!(
     1
 );
 fixture_test!(
-    no_annotation_is_unsupported,
+    no_annotation_infers_silently,
     "no-annotation.ts",
     "no-annotation.expected.txt",
+    0
+);
+fixture_test!(
+    unannotated_null_undefined_are_silent,
+    "unannotated-null-undefined-silent.ts",
+    "unannotated-null-undefined-silent.expected.txt",
+    0
+);
+fixture_test!(
+    unannotated_regex_is_silent,
+    "unannotated-regex-silent.ts",
+    "unannotated-regex-silent.expected.txt",
+    0
+);
+fixture_test!(
+    regex_mismatch_spells_regexp,
+    "regex-mismatch.ts",
+    "regex-mismatch.expected.txt",
+    0
+);
+fixture_test!(
+    unannotated_array_keeps_decline,
+    "unannotated-array-declined.ts",
+    "unannotated-array-declined.expected.txt",
+    1
+);
+fixture_test!(
+    unannotated_object_keeps_decline,
+    "unannotated-object-declined.ts",
+    "unannotated-object-declined.expected.txt",
     1
 );
 fixture_test!(
@@ -713,6 +764,39 @@ fn ident_depth2_declines_at_second_hop() {
 }
 
 #[test]
+fn regex_annotation_declines_with_lib_reason() {
+    // Pinned double divergence (P060): tsc is clean on the matching `r`
+    // but spells `TS2322` on the mismatched `s`, while the subset declines
+    // both — a written `: RegExp` names an unmodeled lib class, so neither
+    // use checks (never a forced verdict, never a false `TS2304`).
+    let source = include_str!("../../../corpus/check-const/regex-annotation-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-const/regex-annotation-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'RegExp'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 2);
+    for note in &report.unsupported {
+        assert!(
+            note.reason.contains("lib type annotation"),
+            "reason: {}",
+            note.reason
+        );
+    }
+}
+
+#[test]
 fn ident_let_declines() {
     // Pinned oracle-error divergence (P048): tsc observes the literal
     // through the mutable binding (TS2322) while the solver declines —
@@ -823,4 +907,25 @@ fn driver_maps_facts_without_hand_feeding() {
         assert_eq!(decl.span.file, FILE);
         assert!(decl.span.lo < decl.span.hi);
     }
+}
+
+#[test]
+fn driver_detects_regex_literals_through_source_seam() {
+    // Guards the P060 seam: a bare `NonLiteral` slicing to a leading `/`
+    // feeds [`InitKind::RegExp`] (never an identifier name), while division
+    // and parenthesized shapes keep the historical `NonLiteral` mapping.
+    let source = "const r = /x/, g = /ab+c/gi, q = a / b;\n";
+    let parsed = parse_module(FILE, "m.ts", source);
+    let errors = &parsed.errors;
+    assert!(parsed.errors.is_empty(), "errors: {errors:?}");
+    assert_eq!(parsed.decls.len(), 3);
+    let binder = build_binder(&parsed);
+    let decls = decls_from_facts(&parsed, &binder, source);
+    assert_eq!(decls.len(), 3);
+    assert_eq!(decls[0].init, Some(InitKind::RegExp));
+    assert_eq!(decls[0].init_ident, None);
+    assert_eq!(decls[1].init, Some(InitKind::RegExp));
+    assert_eq!(decls[1].init_ident, None);
+    assert_eq!(decls[2].init, Some(InitKind::NonLiteral));
+    assert_eq!(decls[2].init_ident, None);
 }

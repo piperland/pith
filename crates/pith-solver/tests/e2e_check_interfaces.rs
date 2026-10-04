@@ -340,6 +340,11 @@ fn iface_excess_member_matches_ts2353() {
 
 #[test]
 fn iface_merged_pair_resolves_both_meanings() {
+    // P060 flips one of the two historical notes: the unannotated `Foo`
+    // declarator now infers silently through the delegated `check_one`
+    // gate, so only the non-literal value use still records a note (the
+    // fixture header still names both — that corpus is outside this task's
+    // scope, so the header drift is noted here instead of rewritten).
     expect_differential(
         "iface_merged_pair_resolves_both_meanings",
         include_str!("../../../corpus/check-interfaces/iface-merged-pair.ts"),
@@ -367,7 +372,7 @@ fn iface_merged_pair_resolves_both_meanings() {
             },
         ],
         include_str!("../../../corpus/check-interfaces/iface-merged-pair.expected.txt"),
-        2,
+        1,
     );
 }
 
