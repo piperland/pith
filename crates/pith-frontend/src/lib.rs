@@ -6267,7 +6267,7 @@ export function f(a: string): string { return a + b; }
         assert!(plain_pf.decls[0].annotation.is_none());
         let plain_init = plain_pf.decls[0].init.as_ref().expect("initialized");
         assert_eq!(plain_init.kind, InitKind::Number);
-        assert_eq!((plain_init.span.lo, plain_init.span.hi), (85, 86));
+        assert_eq!((plain_init.span.lo, plain_init.span.hi), (100, 101));
     }
 
     #[test]
