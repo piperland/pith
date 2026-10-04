@@ -129,11 +129,13 @@
 //!   through their own facts — `u2` reports the inner return at its own
 //!   span); `var`, destructured bindings, deeper nesting, non-terminal
 //!   returns, and bodies past the item cap stay [`FunctionBody::Complex`].
-//! - Identifier-initialized leading declarators decline per-position
-//!   (pinned oracle-error divergence: `t3` spells `TS2322` where the
-//!   subset has no value-type facts), and unannotated declined casts still
-//!   diagnose `TS2352` at the operand span (`u3`). Inner object literals
-//!   check through the object path (`t5`).
+//! - Identifier-initialized leading declarators resolve one level (P048):
+//!   an in-file `const` with a literal initializer (or a primitively
+//!   annotated parameter) checks through the existing literal paths, so
+//!   `t3` now matches its `TS2322`; anything else declines per-position
+//!   with a distinct reason (never a forced verdict). Unannotated declined
+//!   casts still diagnose `TS2352` at the operand span (`u3`). Inner object
+//!   literals check through the object path (`t5`).
 //!
 //! Try/catch bodies (P039, probed on tsc 7.0.2 `--strict --pretty false`;
 //! probes in `.agent/scratch/p039-probes/`):
@@ -269,9 +271,10 @@
 //! - Body positions touching the param ride the EXISTING gates, never a new
 //!   verdict: `return p` declines whole-decl through the non-literal
 //!   position-naming gate in [`function_shape`], while `const y: T = p`
-//!   declines per-position through [`check_one`]'s identifier gate (the P031
-//!   `t3` precedent — pinned oracle-error divergences, never forced
-//!   verdicts).
+//!   resolves one level through [`check_one`]'s identifier gate (P048):
+//!   primitively annotated params check like their annotation (the P031
+//!   `t3` flip — first divergence-to-match), anything else declines
+//!   per-position with a distinct reason (never a forced verdict).
 //! - Call-site args against opaque (known interface/alias) params decline
 //!   DISTINCTLY per site (`parameter type 'Point' for 'p' is an opaque named
 //!   type: outside the subset`, at the callee): even a matching object arg
@@ -682,6 +685,62 @@
 //!   with reasons. No existing corpus fixture declares an alias, so no
 //!   baseline moves.
 //!
+//! Single-level identifier literal propagation (P048, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p048-probes/`):
+//!
+//! - A `const` initializer that is a bare identifier (`init_ident`, a
+//!   driver-sliced seam like [`EnumDecl::init_text`] — the adapter emits no
+//!   identifier-init facts, see the BLOCKER below) resolves ONE level
+//!   through the [`Binder`] and checks through the existing literal paths,
+//!   diagnosing at the USE span: `const a = 1; const b: string = a;`
+//!   reports `Type 'number' is not assignable to type 'string'.`, exactly
+//!   like a direct literal (probes `p01`–`p03`, `p29`).
+//! - The propagated kind prefers the source's primitive/boundary annotation
+//!   when one is present (tsc types uses by the DECLARED type): a wrongly
+//!   annotated source still errors at its own span while the use checks
+//!   against the annotation (`p04` clean at the use, `p05` spelling
+//!   `'string'` at the use — both matched). Unannotated literal sources
+//!   propagate their literal kind; admitted `as`-cast sources propagate
+//!   their result kind (`any`/`never` admit silently, `unknown` checks).
+//! - Function parameters count as sources for leading positions: a required
+//!   primitively annotated param checks like its annotation (`t3` flips
+//!   decline-to-match; `p14`, `p28` shadowing still resolves nearest), `any`
+//!   /`never` admit silently and `unknown` checks (probes `p17`–`p19`),
+//!   while optional params decline (tsc spells `number | undefined`, probe
+//!   `p16` — and defaulted params share the fact bit, so they decline too,
+//!   probe `p20`), and union/generic/complex annotations decline (probe
+//!   `p30`).
+//! - Declines, each with a distinct reason, never a forced verdict: cycles
+//!   (the source's own init names the use — `p08`, `p09` spell `TS2448` plus
+//!   `TS2454` in tsc), `let` declarators (mutable: reassignment is invisible
+//!   to the pass, probes `p06`–`p07`), depth-2+ chains (the source itself
+//!   initializes from an identifier, probe `p10`), use-before-declaration
+//!   (the source is declared later, probes `p08`, `p11`, `p22`), non-literal
+//!   sources (calls, objects, missing inits, complex casts), non-primitive
+//!   source annotations, and same-file names no checkable declarator or
+//!   parameter claims (top-level `let`/`var` emit no declarator facts,
+//!   functions, imports and other cross-file meanings, cross-scope consts —
+//!   probe `p21`). Unresolvable names keep the historical non-literal
+//!   decline, and unannotated uses keep the unannotated decline (nothing to
+//!   check against). Parenthesized idents are not bare, so they decline as
+//!   before (probe `p13`, clean in tsc).
+//! - Discipline (H-002): resolution state lives in per-call side tables
+//!   ([`IdentTable`], keyed by [`SymbolId`] plus declaration order — never in
+//!   [`TypeData`](pith_types::TypeData)), one declaration-order pass (uses
+//!   only see earlier declarators; no flow analysis, so reassignment never
+//!   updates a kind), single level (only the cycle check looks one step past
+//!   the source, comparing [`SymbolId`]s — never strings). Structural
+//!   annotations (`{...}`, arrays, interfaces, enums, unions) keep today's
+//!   declines: resolution substitutes only the primitive tail.
+//!
+//! BLOCKER (P004 adapter gap, same seam as [`EnumDecl::init_text`]):
+//! [`ConstDecl::init_ident`] and [`InnerDecl::init_ident`] are driver-sliced
+//! from the initializer fact span (bare identifiers only — anything else
+//! feeds `None` and keeps the historical decline) until the adapter emits an
+//! identifier-init fact. Spans/scopes/identities always come from adapter
+//! facts; only the referenced NAME rides the seam, and every resolution step
+//! goes through the [`Binder`].
+//!
 //! Lib types, first cut (P034, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p034-probes/`):
 //!
@@ -1068,6 +1127,13 @@ pub struct ConstDecl {
     pub annotation: Option<String>,
     /// Initializer literal kind; `None` means no initializer.
     pub init: Option<InitKind>,
+    /// Referenced name when the initializer is a bare identifier (`None`
+    /// otherwise). Driver-sliced from the initializer fact span (bare
+    /// identifiers only) until the adapter emits identifier-init facts —
+    /// see the module-level P048 BLOCKER. [`check_one`] resolves it one
+    /// level through the [`Binder`]; every other initializer shape feeds
+    /// `None` and keeps its historical path.
+    pub init_ident: Option<String>,
     /// Object-literal members when the initializer is `{ ... }`; `None`
     /// otherwise. A `Some` paired with a primitive `init` (or vice versa)
     /// is contradictory input and becomes an [`UnsupportedDecl`].
@@ -1160,6 +1226,11 @@ pub struct InnerDecl {
     /// Initializer literal kind; `None` for object/array literals (whose
     /// shapes live in `init_object`/`init_array`) or missing initializers.
     pub init: Option<InitKind>,
+    /// Referenced name when the initializer is a bare identifier (`None`
+    /// otherwise). Same driver-sliced seam as [`ConstDecl::init_ident`]:
+    /// the synthetic [`ConstDecl`] carries it into [`check_one`], so
+    /// leading positions resolve exactly like top-level consts.
+    pub init_ident: Option<String>,
     /// Object-literal members when the initializer is `{ ... }`; `None`
     /// otherwise.
     pub init_object: Option<ObjectInit>,
@@ -2058,6 +2129,495 @@ impl FreshnessTable {
     }
 }
 
+/// One declarator visible to single-level identifier resolution (P048).
+///
+/// Built per checking run from the checked declarators in declaration
+/// order (top-level [`ConstDecl`]s, or straight-body leadings); `checked`
+/// counts how many have been checked so far, so a use only sees earlier
+/// declarators — one declaration-order pass, no flow analysis. Parameters
+/// ride alongside for function bodies (names only: parameter facts carry
+/// no [`SymbolId`]). Occurrence-varying resolution state lives HERE, never
+/// in [`TypeData`](pith_types::TypeData) (H-002).
+#[derive(Clone, Debug, Default)]
+struct IdentTable {
+    /// Every candidate source declarator, in declaration order.
+    inputs: Vec<IdentInput>,
+    /// The enclosing function's parameters (empty outside functions).
+    params: Vec<IdentParam>,
+    /// How many `inputs` the current use may see (its declaration index).
+    checked: usize,
+}
+
+/// One candidate source declarator for [`IdentTable`].
+#[derive(Clone, Debug)]
+struct IdentInput {
+    /// Binder identity of the declarator (`None` when unresolvable: the
+    /// entry never matches, and uses resolving to it fall through).
+    symbol: Option<SymbolId>,
+    /// `const` vs `let` (mutable bindings never propagate, whatever they
+    /// initialize from).
+    kind: DeclKind,
+    /// Raw annotation text; `None` means unannotated.
+    annotation: Option<String>,
+    /// The entry's initializer shape: what a use would propagate.
+    init: PropInit,
+}
+
+/// One function parameter for [`IdentTable`]: the name plus the annotation
+/// facts [`FunctionParam`] carries. Matching is by name within the single
+/// enclosing function — scope-safety comes from the binder having resolved
+/// the USE to an unclaimed same-file symbol first, so a shadowing binding
+/// always wins before params are consulted.
+#[derive(Clone, Debug)]
+struct IdentParam {
+    /// Parameter name as written.
+    name: String,
+    /// Raw annotation text; `None` means unannotated (whole declarations
+    /// with unannotated params decline earlier, so this is defensive).
+    annotation: Option<String>,
+    /// `true` for `b?: number` and defaulted `b: T = …` (the facts conflate
+    /// the two, so both decline: tsc spells `| undefined` for the former).
+    optional: bool,
+}
+
+/// What one [`IdentInput`] would propagate to a use.
+#[derive(Clone, Debug)]
+enum PropInit {
+    /// A classifiable kind: literals plus admitted-cast results.
+    Literal(InitKind),
+    /// An accept-all cast result (`any`/`never`): uses stay silent.
+    Silent,
+    /// The entry itself initializes from an identifier: single level stops
+    /// here (depth-2+), except when it names the use itself (a cycle).
+    Ident {
+        /// Referenced name.
+        name: String,
+        /// Scope the reference resolves from (the entry's own scope).
+        scope: u32,
+    },
+    /// Anything else (calls, objects, arrays, missing inits, complex
+    /// casts): never propagates.
+    Other,
+}
+
+/// Classifies one source initializer shape into [`PropInit`].
+///
+/// `has_shape` folds object/array members (those never propagate);
+/// casts propagate their evaluated result kind (`any`/`never` admit
+/// silently, `unknown` checks), complex ones do not; bare identifiers
+/// propagate one level, everything else does not.
+fn source_init_kind(
+    init: Option<InitKind>,
+    has_shape: bool,
+    cast: Option<&CastInput>,
+    ident: Option<&str>,
+    scope: u32,
+) -> PropInit {
+    if has_shape {
+        return PropInit::Other;
+    }
+    if let Some(cast) = cast {
+        return match evaluate_cast(cast) {
+            CastEvaluation::Admit(result) | CastEvaluation::Decline(result) => match result {
+                CastType::Any | CastType::Never => PropInit::Silent,
+                CastType::Unknown => PropInit::Literal(InitKind::Unknown),
+                CastType::Literal(kind) => PropInit::Literal(kind),
+            },
+            CastEvaluation::Complex(_) => PropInit::Other,
+        };
+    }
+    if let Some(kind) = init {
+        if kind == InitKind::NonLiteral {
+            return match ident {
+                Some(name) => PropInit::Ident {
+                    name: name.to_owned(),
+                    scope,
+                },
+                None => PropInit::Other,
+            };
+        }
+        return PropInit::Literal(kind);
+    }
+    PropInit::Other
+}
+
+/// Binder identity for identifier resolution: the driver-resolved id when
+/// it names a same-file symbol, else scope-sensitive resolution from the
+/// given scope (mirroring [`binder_span_for`]'s trust rule; foreign ids
+/// are store-relative numbers, so the file check is cheap skew defense).
+fn ident_symbol(
+    binder: &Binder,
+    file: FileId,
+    name: &str,
+    scope: u32,
+    symbol: Option<SymbolId>,
+) -> Option<SymbolId> {
+    if let Some(id) = symbol {
+        if binder
+            .store()
+            .get(id)
+            .is_some_and(|found| found.file == file)
+        {
+            return Some(id);
+        }
+    }
+    binder.resolve(file, scope, name)
+}
+
+/// One [`IdentInput`] from a top-level declarator, in declaration order.
+fn ident_input_from_decl(binder: &Binder, file: FileId, decl: &ConstDecl) -> IdentInput {
+    IdentInput {
+        symbol: ident_symbol(binder, file, &decl.name, decl.scope, decl.symbol),
+        kind: decl.kind,
+        annotation: decl.annotation.clone(),
+        init: source_init_kind(
+            decl.init,
+            decl.init_object.is_some() || decl.init_array.is_some(),
+            decl.cast.as_ref(),
+            decl.init_ident.as_deref(),
+            decl.scope,
+        ),
+    }
+}
+
+/// One [`IdentInput`] from a straight-body leading declarator, in source
+/// order (unannotated skipped ones included: their kinds stay visible to
+/// later uses even though they never check).
+fn ident_input_from_leading(binder: &Binder, file: FileId, inner: &InnerDecl) -> IdentInput {
+    IdentInput {
+        symbol: ident_symbol(binder, file, &inner.name, inner.scope, inner.symbol),
+        kind: inner.kind,
+        annotation: inner.annotation.clone(),
+        init: source_init_kind(
+            inner.init,
+            inner.init_object.is_some() || inner.init_array.is_some(),
+            inner.cast.as_ref(),
+            inner.init_ident.as_deref(),
+            inner.scope,
+        ),
+    }
+}
+
+/// Builds the [`IdentTable`] inputs for one [`check_file`] run, in
+/// declaration order.
+fn ident_inputs_from_decls(binder: &Binder, file: FileId, decls: &[ConstDecl]) -> Vec<IdentInput> {
+    decls
+        .iter()
+        .map(|decl| ident_input_from_decl(binder, file, decl))
+        .collect()
+}
+
+/// Builds the [`IdentTable`] inputs for one straight-body function, in
+/// source order.
+fn ident_inputs_from_leadings(
+    binder: &Binder,
+    file: FileId,
+    leadings: &[InnerDecl],
+) -> Vec<IdentInput> {
+    leadings
+        .iter()
+        .map(|inner| ident_input_from_leading(binder, file, inner))
+        .collect()
+}
+
+/// Builds the [`IdentTable`] params for one function: names plus
+/// annotation facts only (no value types flow — H-002 opacity holds; the
+/// use-side classifier maps annotated params to kinds at check time).
+fn ident_params_from_function(params: &[FunctionParam]) -> Vec<IdentParam> {
+    params
+        .iter()
+        .map(|param| IdentParam {
+            name: param.name.clone(),
+            annotation: param.annotation.clone(),
+            optional: param.optional,
+        })
+        .collect()
+}
+
+/// What one source annotation propagates (P048): primitives map to their
+/// kind, `any`/`never` admit silently, `unknown` checks as unknown;
+/// everything else (unions, shapes, aliases-to-shapes, unknown names,
+/// `void`) never propagates.
+enum SourceType {
+    /// Check uses against this kind.
+    Kind(InitKind),
+    /// Uses stay silent (`any`/`never`).
+    Silent,
+    /// The annotation is unpropagatable: the caller declines.
+    Unusable,
+}
+
+/// Maps one annotation text to [`SourceType`] through the canonical
+/// annotation maps (single source of truth — no duplicated name table).
+fn source_type_from_text(text: &str) -> SourceType {
+    if let Some(id) = annotation_type(text) {
+        if id == TypeStore::VOID {
+            return SourceType::Unusable;
+        }
+        let kind = if id == TypeStore::NUMBER {
+            InitKind::Number
+        } else if id == TypeStore::STRING {
+            InitKind::String
+        } else if id == TypeStore::BOOLEAN {
+            InitKind::Boolean
+        } else if id == TypeStore::NULL {
+            InitKind::Null
+        } else {
+            InitKind::Undefined
+        };
+        return SourceType::Kind(kind);
+    }
+    if let Some(id) = boundary_annotation_type(text) {
+        if id == TypeStore::ANY || id == TypeStore::NEVER {
+            return SourceType::Silent;
+        }
+        return SourceType::Kind(InitKind::Unknown);
+    }
+    SourceType::Unusable
+}
+
+/// Classifies one SOURCE annotation through single-level alias expansion:
+/// bare alias names expand ([`expand_local_alias`] is pure — no report
+/// effects, unlike [`expand_local_annotation`]); primitives and boundaries
+/// map, everything else is unusable.
+fn source_annotation_type(scope: &LocalAliasScope<'_, '_>, annotation: &str) -> SourceType {
+    let text = annotation.trim();
+    match expand_local_alias(scope, text) {
+        LocalAliasStep::Keep => source_type_from_text(text),
+        LocalAliasStep::Primitive(spelling) => source_type_from_text(&spelling),
+        LocalAliasStep::Shape(_) | LocalAliasStep::Decline(_) => SourceType::Unusable,
+    }
+}
+
+/// What one identifier-initializer resolution leaves for annotation routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IdentResolution {
+    /// Not an identifier use, or unresolvable: the existing paths apply.
+    Keep,
+    /// Check through the existing literal paths with this kind.
+    Substitute(InitKind),
+    /// Accept-all source (`any`/`never`): the use stays silent.
+    Silent,
+    /// The use declines with the reason.
+    Decline(String),
+}
+
+/// Resolves one bare-identifier initializer one level (P048).
+///
+/// `Keep` covers non-identifier shapes and unresolvable names (the existing
+/// paths apply, exactly as before); `Substitute`/`Silent` carry
+/// propagatable sources into annotation routing, where they check like
+/// literals; `Decline` carries the reason. Only the primitive tail routes
+/// here: structural annotations return earlier, so object/array/interface/
+/// enum/union uses keep today's declines, and `any`/`unknown`-annotated
+/// uses bypass entirely (those admit every bearing value — resolution must
+/// never note under them).
+fn resolve_ident(
+    decl: &ConstDecl,
+    binder: &Binder,
+    scope: &LocalAliasScope<'_, '_>,
+    table: &IdentTable,
+    file: FileId,
+) -> IdentResolution {
+    if let Some(raw) = decl.annotation.as_deref() {
+        if let Some(id) = boundary_annotation_type(raw.trim()) {
+            if id == TypeStore::ANY || id == TypeStore::UNKNOWN {
+                return IdentResolution::Keep;
+            }
+        }
+    }
+    let Some(name) = decl.init_ident.as_deref() else {
+        return IdentResolution::Keep;
+    };
+    if decl.init != Some(InitKind::NonLiteral)
+        || decl.init_object.is_some()
+        || decl.init_array.is_some()
+        || decl.cast.is_some()
+    {
+        return IdentResolution::Keep;
+    }
+    let Some(target) = binder.resolve(file, decl.scope, name) else {
+        return IdentResolution::Keep;
+    };
+    // A resolved symbol always lives in the checking file (resolution
+    // walks that file's scope tree only): cross-file meanings surface as
+    // same-file import bindings and fall through to the not-in-scope
+    // decline below.
+    let use_symbol = ident_symbol(binder, file, &decl.name, decl.scope, decl.symbol);
+    if Some(target) == use_symbol {
+        return IdentResolution::Decline(format!(
+            "identifier '{name}' initializes from itself: \
+            cyclic initializers are outside the subset"
+        ));
+    }
+    let judged = IdentUse {
+        name,
+        target,
+        use_symbol,
+    };
+    resolve_table_target(binder, scope, table, file, &judged)
+}
+
+/// One bound identifier use for table resolution: the referenced name, its
+/// resolved symbol, and the using declarator's symbol (the cycle check
+/// compares the two — never strings).
+struct IdentUse<'a> {
+    /// Referenced name as fed on the use.
+    name: &'a str,
+    /// Binder identity the name resolved to (same file — checked before).
+    target: SymbolId,
+    /// Binder identity of the using declarator (`None` when unresolvable).
+    use_symbol: Option<SymbolId>,
+}
+
+/// Resolves one bound same-file identifier against the declaration table:
+/// visible const declarators propagate (annotation first, then shape),
+/// `let` declarators decline, identifier-initialized sources cycle-check
+/// then decline as depth-2+, and later declarators decline as
+/// use-before-declaration. Misses fall to parameters, then to the
+/// not-in-scope decline.
+fn resolve_table_target(
+    binder: &Binder,
+    scope: &LocalAliasScope<'_, '_>,
+    table: &IdentTable,
+    file: FileId,
+    judged: &IdentUse<'_>,
+) -> IdentResolution {
+    let position = table
+        .inputs
+        .iter()
+        .position(|input| input.symbol == Some(judged.target));
+    if let Some(index) = position.filter(|index| *index < table.checked) {
+        return resolve_visible_input(
+            &table.inputs[index],
+            binder,
+            scope,
+            file,
+            judged.name,
+            judged.use_symbol,
+        );
+    }
+    if position.is_some() {
+        return IdentResolution::Decline(format!(
+            "identifier '{}' is used before its declaration: \
+            forward references are outside the single-pass subset",
+            judged.name
+        ));
+    }
+    if let Some(resolution) = resolve_param_source(table, judged.name) {
+        return resolution;
+    }
+    IdentResolution::Decline(format!(
+        "identifier '{}' names no checkable const declarator or parameter in scope: \
+        only in-scope 'const' declarators with literal initializers propagate",
+        judged.name
+    ))
+}
+
+/// Propagates one visible table entry: `let` bindings decline (mutable —
+/// reassignment is invisible to the single pass), identifier-initialized
+/// sources cycle-check (naming the use back) then decline as depth-2+,
+/// and literal sources propagate (source annotation first, then shape).
+fn resolve_visible_input(
+    input: &IdentInput,
+    binder: &Binder,
+    scope: &LocalAliasScope<'_, '_>,
+    file: FileId,
+    name: &str,
+    use_symbol: Option<SymbolId>,
+) -> IdentResolution {
+    if input.kind == DeclKind::Let {
+        return IdentResolution::Decline(format!(
+            "identifier '{name}' names a 'let' binding: mutable bindings may be \
+            reassigned, which the single declaration-order pass cannot observe"
+        ));
+    }
+    if input.kind != DeclKind::Const {
+        return IdentResolution::Keep;
+    }
+    match &input.init {
+        PropInit::Literal(kind) => resolve_literal_source(scope, input, *kind, name),
+        PropInit::Silent => IdentResolution::Silent,
+        PropInit::Ident {
+            name: source,
+            scope: source_scope,
+        } => {
+            if binder.resolve(file, *source_scope, source) == use_symbol {
+                IdentResolution::Decline(format!(
+                    "identifier '{name}' initializes from '{source}' which names it back: \
+                    cyclic initializers are outside the subset"
+                ))
+            } else {
+                IdentResolution::Decline(format!(
+                    "identifier '{name}' initializes from another identifier: \
+                    single-level propagation only"
+                ))
+            }
+        }
+        PropInit::Other => IdentResolution::Decline(format!(
+            "identifier '{name}' does not initialize from a literal: \
+            only literal initializers propagate"
+        )),
+    }
+}
+
+/// Propagates one visible literal-kind source: the source's
+/// primitive/boundary annotation wins when present (tsc types uses by the
+/// DECLARED type — probes `p04`/`p05`), else the literal kind flows.
+fn resolve_literal_source(
+    scope: &LocalAliasScope<'_, '_>,
+    input: &IdentInput,
+    kind: InitKind,
+    name: &str,
+) -> IdentResolution {
+    let Some(raw) = input.annotation.as_deref() else {
+        return IdentResolution::Substitute(kind);
+    };
+    match source_annotation_type(scope, raw) {
+        SourceType::Kind(propagated) => IdentResolution::Substitute(propagated),
+        SourceType::Silent => IdentResolution::Silent,
+        SourceType::Unusable => IdentResolution::Decline(format!(
+            "identifier '{name}' is annotated with a non-primitive type: \
+            only primitive-annotated consts propagate"
+        )),
+    }
+}
+
+/// Resolves one identifier against the enclosing function's parameters:
+/// `None` when no parameter bears the name (the caller falls through to
+/// the not-in-scope decline). Required primitively annotated params check
+/// like their annotation; `any`/`never` admit silently and `unknown`
+/// checks; optional, duplicate, unannotated, and non-primitive params
+/// decline with distinct reasons.
+fn resolve_param_source(table: &IdentTable, name: &str) -> Option<IdentResolution> {
+    let mut hits = table.params.iter().filter(|param| param.name == name);
+    let param = hits.next()?;
+    if hits.next().is_some() {
+        return Some(IdentResolution::Decline(format!(
+            "multiple parameters named '{name}': duplicate bindings are outside the subset"
+        )));
+    }
+    let Some(raw) = param.annotation.as_deref() else {
+        return Some(IdentResolution::Decline(format!(
+            "parameter '{name}' has no annotation: nothing to propagate"
+        )));
+    };
+    if param.optional {
+        return Some(IdentResolution::Decline(format!(
+            "parameter '{name}' is optional: its type carries '| undefined', \
+            which single-level propagation cannot spell"
+        )));
+    }
+    Some(match source_type_from_text(raw.trim()) {
+        SourceType::Kind(kind) => IdentResolution::Substitute(kind),
+        SourceType::Silent => IdentResolution::Silent,
+        SourceType::Unusable => IdentResolution::Decline(format!(
+            "parameter '{name}' is not primitively annotated: \
+            only primitive-annotated parameters propagate"
+        )),
+    })
+}
+
 /// Checks every declarator in `decls` for `file`, threading each annotated
 /// declaration's type through `db` (one memoized [`QueryKind::TypeOf`] query
 /// per annotated declaration) and returning the sorted [`FileReport`].
@@ -2104,8 +2664,14 @@ pub fn check_file_with_aliases(
         aliases,
         const_names: &const_names,
     };
+    let mut idents = IdentTable {
+        inputs: ident_inputs_from_decls(binder, file, decls),
+        params: Vec::new(),
+        checked: 0,
+    };
     let mut report = FileReport::default();
     for (index, decl) in decls.iter().enumerate() {
+        idents.checked = index;
         let mut ctx = CheckCtx {
             file,
             node: occurrence_node(index),
@@ -2113,6 +2679,7 @@ pub fn check_file_with_aliases(
             freshness: &freshness,
             report: &mut report,
             extra: &[],
+            idents: &idents,
         };
         check_one(decl, binder, &mut ctx, &scope);
     }
@@ -2164,55 +2731,102 @@ pub fn check_functions(
     binder: &Binder,
     db: &mut QueryDb,
 ) -> FileReport {
-    let mut synth: Vec<ConstDecl> = Vec::with_capacity(decls.len());
     let mut report = FileReport::default();
+    let mut freshness = FreshnessTable::default();
+    let mut occurrence = 0usize;
     for decl in decls {
         let span = binder_span_for(binder, file, &decl.name, decl.scope, decl.symbol, decl.span);
         match function_shape(decl) {
             Ok(shaped) => {
-                for shaped_return in shaped.returns {
-                    synth.push(ConstDecl {
-                        name: shaped_return.site.name,
-                        span: shaped_return.site.span,
-                        scope: shaped_return.site.scope,
-                        symbol: shaped_return.site.symbol,
-                        kind: shaped_return.site.kind,
-                        annotation: shaped_return.site.annotation,
-                        init: shaped_return.kind,
-                        init_object: shaped_return.init_object,
-                        init_array: shaped_return.init_array,
-                        cast: shaped_return.cast,
-                    });
-                }
+                let mut run = FunctionRun {
+                    file,
+                    decl,
+                    shaped: &shaped,
+                    binder,
+                    db: &mut *db,
+                    freshness: &mut freshness,
+                    occurrence: &mut occurrence,
+                    report: &mut report,
+                };
+                check_shaped_function(&mut run);
             }
             Err(reason) => report
                 .unsupported
                 .push(UnsupportedDecl { file, span, reason }),
         }
     }
-    let mut freshness = FreshnessTable::default();
-    for (index, decl) in synth.iter().enumerate() {
-        if let Some(init) = decl.init_object.as_ref() {
-            freshness
-                .fresh
-                .insert((file, function_occurrence_node(index)), init.fresh);
-        }
+    sort_report(&mut report);
+    report
+}
+
+/// Mutable checking state for one [`check_functions`] declaration, bundled
+/// so the per-position loop stays lean (pedantic arity discipline,
+/// mirroring [`MemberRun`]).
+struct FunctionRun<'a> {
+    file: FileId,
+    decl: &'a FunctionDecl,
+    shaped: &'a ShapedBody,
+    binder: &'a Binder,
+    db: &'a mut QueryDb,
+    freshness: &'a mut FreshnessTable,
+    occurrence: &'a mut usize,
+    report: &'a mut FileReport,
+}
+
+/// The straight-body leading declarators of one function (empty for every
+/// other body shape): the [`IdentTable`] inputs for its positions.
+fn function_leadings(decl: &FunctionDecl) -> &[InnerDecl] {
+    match &decl.body {
+        FunctionBody::StraightBody(straight) => &straight.leading,
+        FunctionBody::StraightThrow(straight) => &straight.leading,
+        _ => &[],
     }
-    for (index, decl) in synth.iter().enumerate() {
+}
+
+/// Checks one shaped function declaration: builds its per-function
+/// [`IdentTable`] (leadings in order plus params), assigns disjoint
+/// occurrence nodes from the shared counter, and delegates each position
+/// through the shared [`check_one`] path with the visibility cursor set
+/// (leadings see earlier leadings; returns see all leadings).
+fn check_shaped_function(run: &mut FunctionRun<'_>) {
+    let mut idents = IdentTable {
+        inputs: ident_inputs_from_leadings(run.binder, run.file, function_leadings(run.decl)),
+        params: ident_params_from_function(&run.decl.params),
+        checked: 0,
+    };
+    for shaped_return in &run.shaped.returns {
+        let node = function_occurrence_node(*run.occurrence);
+        *run.occurrence = run.occurrence.saturating_add(1);
+        let synth = ConstDecl {
+            name: shaped_return.site.name.clone(),
+            span: shaped_return.site.span,
+            scope: shaped_return.site.scope,
+            symbol: shaped_return.site.symbol,
+            kind: shaped_return.site.kind,
+            annotation: shaped_return.site.annotation.clone(),
+            init: shaped_return.kind,
+            init_ident: shaped_return.init_ident.clone(),
+            init_object: shaped_return.init_object.clone(),
+            init_array: shaped_return.init_array.clone(),
+            cast: shaped_return.cast.clone(),
+        };
+        if let Some(init) = synth.init_object.as_ref() {
+            run.freshness.fresh.insert((run.file, node), init.fresh);
+        }
+        idents.checked = shaped_return.leading_index.unwrap_or(idents.inputs.len());
         let mut ctx = CheckCtx {
-            file,
-            node: function_occurrence_node(index),
-            db: &mut *db,
-            freshness: &freshness,
-            report: &mut report,
+            file: run.file,
+            node,
+            db: &mut *run.db,
+            freshness: &*run.freshness,
+            report: &mut *run.report,
             extra: &[],
+            idents: &idents,
         };
         // Function returns thread no alias tables (pinned P038 gap: return
         // annotations naming aliases keep today's verdicts).
-        check_one(decl, binder, &mut ctx, &LocalAliasScope::EMPTY);
+        check_one(&synth, run.binder, &mut ctx, &LocalAliasScope::EMPTY);
     }
-    sort_report(&mut report);
-    report
 }
 
 /// Identity plus annotation for one synthetic checkable position:
@@ -2249,6 +2863,14 @@ struct SynthReturn {
     site: SynthSite,
     /// Literal kind; `None` iff the position is an object or array literal.
     kind: Option<InitKind>,
+    /// Bare-identifier name from a leading declarator (`Some`), or `None`
+    /// for returns and non-identifier positions. Rides into the synthetic
+    /// [`ConstDecl::init_ident`] so leadings resolve exactly like consts.
+    init_ident: Option<String>,
+    /// Leading-declarator index within its straight body (`Some`), or `None`
+    /// for return positions. Sets the [`IdentTable`] visibility cursor when
+    /// the synthetic declaration checks, so uses only see earlier leadings.
+    leading_index: Option<usize>,
     /// Object-literal members when the position is `{ ... }`; `None`
     /// otherwise.
     init_object: Option<ObjectInit>,
@@ -2442,8 +3064,8 @@ fn shape_straight_throw(
     effective: &str,
 ) -> Result<Vec<SynthReturn>, String> {
     let mut positions = Vec::with_capacity(body.leading.len().saturating_add(1));
-    for inner in &body.leading {
-        if let Some(position) = shape_leading(inner) {
+    for (leading_index, inner) in body.leading.iter().enumerate() {
+        if let Some(position) = shape_leading(inner, leading_index) {
             positions.push(position);
         }
     }
@@ -2509,8 +3131,8 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         FunctionBody::StraightThrow(body) => shape_straight_throw(decl, body, &effective)?,
         FunctionBody::StraightBody(straight) => {
             let mut positions = Vec::with_capacity(straight.leading.len().saturating_add(1));
-            for inner in &straight.leading {
-                if let Some(position) = shape_leading(inner) {
+            for (leading_index, inner) in straight.leading.iter().enumerate() {
+                if let Some(position) = shape_leading(inner, leading_index) {
                     positions.push(position);
                 }
             }
@@ -2563,7 +3185,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
 /// remaining positions). The impossible kind/member pairs (`Some` +
 /// `Some`, `None` + `None`) pass through into the shared
 /// contradictory/missing unsupported paths in [`check_one`].
-fn shape_leading(inner: &InnerDecl) -> Option<SynthReturn> {
+fn shape_leading(inner: &InnerDecl, leading_index: usize) -> Option<SynthReturn> {
     if inner.annotation.is_none() && inner.cast.is_none() {
         return None;
     }
@@ -2577,6 +3199,8 @@ fn shape_leading(inner: &InnerDecl) -> Option<SynthReturn> {
             annotation: inner.annotation.clone(),
         },
         kind: inner.init,
+        init_ident: inner.init_ident.clone(),
+        leading_index: Some(leading_index),
         init_object: inner.init_object.clone(),
         init_array: inner.init_array.clone(),
         cast: inner.cast.clone(),
@@ -2602,6 +3226,8 @@ fn shape_return(
         return Ok(SynthReturn {
             site,
             kind: body.kind,
+            init_ident: None,
+            leading_index: None,
             init_object: body.init_object.clone(),
             init_array: body.init_array.clone(),
             cast: body.cast.clone(),
@@ -2619,6 +3245,8 @@ fn shape_return(
     Ok(SynthReturn {
         site,
         kind: body.kind,
+        init_ident: None,
+        leading_index: None,
         init_object: body.init_object.clone(),
         init_array: body.init_array.clone(),
         cast: None,
@@ -4260,6 +4888,9 @@ fn whole_class_reason(decl: &ClassDecl) -> Option<String> {
 fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
     let base = run.occurrence;
     let mut freshness = FreshnessTable::default();
+    // Class properties check no declarator family: identifier initializers
+    // keep the historical non-literal decline through the empty table.
+    let empty_idents = IdentTable::default();
     for (offset, prop) in decl.properties.iter().enumerate() {
         let node = class_occurrence_node(base, offset);
         if let Some(init) = prop.init_object.as_ref() {
@@ -4284,6 +4915,7 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             kind: DeclKind::Const,
             annotation: prop.annotation.clone(),
             init: prop.init,
+            init_ident: None,
             init_object: prop.init_object.clone(),
             init_array: None,
             cast: None,
@@ -4295,6 +4927,7 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             freshness: &freshness,
             report: &mut *run.report,
             extra: &[],
+            idents: &empty_idents,
         };
         // Class properties thread no alias tables (pinned P038 gap).
         check_one(&synth, run.binder, &mut ctx, &LocalAliasScope::EMPTY);
@@ -6004,6 +6637,9 @@ fn check_narrowing_decl(
     let freshness = nctx.freshness;
     let report: &mut FileReport = &mut *nctx.report;
     let span = binder_span(binder, file, decl);
+    // Narrowing checks no declarator family for identifier uses: identifier
+    // initializers keep their historical gates through the empty table.
+    let empty_idents = IdentTable::default();
     let Some(raw) = decl.annotation.as_deref() else {
         report.unsupported.push(UnsupportedDecl {
             file,
@@ -6040,6 +6676,7 @@ fn check_narrowing_decl(
             freshness,
             report,
             extra: &[],
+            idents: &empty_idents,
         };
         // Array initializers need the array-aware object path in
         // [`check_one`]; every other shape keeps the direct object path.
@@ -6068,6 +6705,7 @@ fn check_narrowing_decl(
             freshness,
             report: &mut *report,
             extra: &[],
+            idents: &empty_idents,
         };
         check_one(decl, binder, &mut ctx, &LocalAliasScope::EMPTY);
         return;
@@ -7089,6 +7727,7 @@ fn finish_primitive_check(
             freshness: ctx.freshness,
             report,
             extra: ctx.extra,
+            idents: ctx.idents,
         };
         check_array_init_vs_annotation(span, annotation, &init_array.members, &mut ctx);
         return;
@@ -7335,6 +7974,100 @@ fn expand_local_annotation(
     }
 }
 
+/// One identifier-propagation step's inputs for [`resolve_ident_init`],
+/// bundled so arity stays flat (pedantic discipline).
+struct IdentStep<'a, 'b, 'c, 'd, 'e, 'f> {
+    decl: &'a ConstDecl,
+    binder: &'b Binder,
+    scope: &'c LocalAliasScope<'d, 'e>,
+    idents: &'c IdentTable,
+    file: FileId,
+    span: Span,
+    report: &'f mut FileReport,
+    init: &'f mut Option<InitKind>,
+}
+
+/// Single-level identifier propagation step for [`check_one`] (P048): a
+/// bare-identifier initializer resolving to an in-file literal const (or a
+/// primitively annotated parameter) checks through the existing literal
+/// paths with the propagated kind; anything else keeps its historical
+/// gate. Returns true when the declaration is done (silent or declined
+/// with the note pushed); otherwise substitutes the propagated kind into
+/// `init` in place.
+fn resolve_ident_init(step: IdentStep<'_, '_, '_, '_, '_, '_>) -> bool {
+    let IdentStep {
+        decl,
+        binder,
+        scope,
+        idents,
+        file,
+        span,
+        report,
+        init,
+    } = step;
+    match resolve_ident(decl, binder, scope, idents, file) {
+        IdentResolution::Keep => false,
+        IdentResolution::Substitute(kind) => {
+            *init = Some(kind);
+            false
+        }
+        IdentResolution::Silent => true,
+        IdentResolution::Decline(reason) => {
+            report
+                .unsupported
+                .push(UnsupportedDecl { file, span, reason });
+            true
+        }
+    }
+}
+
+/// Finishes an annotated declaration for [`check_one`]: alias expansion,
+/// then the boundary path and the shared primitive tail. Split out so
+/// `check_one` stays within the line budget; behavior identical.
+fn finish_annotated_check(
+    decl: &ConstDecl,
+    span: Span,
+    annotation: &str,
+    init: Option<InitKind>,
+    scope: &LocalAliasScope<'_, '_>,
+    ctx: &mut CheckCtx<'_>,
+) {
+    let file = ctx.file;
+    // Local alias expansion sits after the promise/array/union/lib gates
+    // so those spellings keep their verdicts (see
+    // `expand_local_annotation`).
+    let rewritten = match expand_local_annotation(scope, annotation, file, span, &mut *ctx.report) {
+        LocalAnnotation::Done => return,
+        LocalAnnotation::Keep => None,
+        LocalAnnotation::Rewritten(spelling) => Some(spelling),
+    };
+    let annotation: &str = rewritten.as_deref().unwrap_or(annotation);
+    // Boundary annotations (probed tsc 7.0.2 — see
+    // `resolve_boundary_annotation`): bearing means any initializer shape,
+    // object or array members, or assertion facts are present.
+    let bearing = init.is_some()
+        || decl.init_object.is_some()
+        || decl.init_array.is_some()
+        || decl.cast.is_some();
+    let Some(ann_ty) =
+        resolve_boundary_annotation(annotation, span, file, bearing, &mut *ctx.report)
+    else {
+        return;
+    };
+    // Thread through the memo database: the annotation type is the answer
+    // to this declaration's TypeOf query (see `finish_primitive_check`).
+    let mut tail = CheckCtx {
+        file,
+        node: ctx.node,
+        db: &mut *ctx.db,
+        freshness: ctx.freshness,
+        report: &mut *ctx.report,
+        extra: ctx.extra,
+        idents: ctx.idents,
+    };
+    finish_primitive_check(ann_ty, init, decl, span, annotation, &mut tail);
+}
+
 /// Takes the shared [`CheckCtx`] (file, node, memo store, freshness table,
 /// report, and extra cross-file edges) so the arity stays flat as the
 /// subset grows; `binder` and `decl` ride alongside.
@@ -7350,6 +8083,7 @@ fn check_one(
     let freshness = ctx.freshness;
     let report: &mut FileReport = &mut *ctx.report;
     let extra = ctx.extra;
+    let idents = ctx.idents;
     let span = binder_span(binder, file, decl);
     let Some(raw) = decl.annotation.as_deref() else {
         decline_unannotated(decl, span, file, &mut *report);
@@ -7362,7 +8096,7 @@ fn check_one(
     // Assertion evaluation runs before annotation routing (see
     // `apply_assertion`): declined casts diagnose independently of the
     // annotation while admitted results substitute the initializer kind.
-    let init = match apply_assertion(decl, span, file, annotation, &mut *report) {
+    let mut init = match apply_assertion(decl, span, file, annotation, &mut *report) {
         AssertedInit::Check(init) => init,
         AssertedInit::Done => return,
     };
@@ -7374,6 +8108,7 @@ fn check_one(
             freshness,
             report,
             extra,
+            idents,
         };
         if let Some(init_array) = decl.init_array.as_ref() {
             check_object_annotation_array_init(span, annotation, &init_array.members, &mut ctx);
@@ -7390,6 +8125,7 @@ fn check_one(
             freshness,
             report,
             extra,
+            idents,
         };
         check_array_annotation(decl, span, &array, init, &mut ctx);
         return;
@@ -7422,37 +8158,31 @@ fn check_one(
             .push(UnsupportedDecl { file, span, reason });
         return;
     }
-    // Local alias expansion sits after the promise/array/union/lib gates
-    // so those spellings keep their verdicts (see
-    // `expand_local_annotation`).
-    let rewritten = match expand_local_annotation(scope, annotation, file, span, &mut *report) {
-        LocalAnnotation::Done => return,
-        LocalAnnotation::Keep => None,
-        LocalAnnotation::Rewritten(spelling) => Some(spelling),
-    };
-    let annotation: &str = rewritten.as_deref().unwrap_or(annotation);
-    // Boundary annotations (probed tsc 7.0.2 — see
-    // `resolve_boundary_annotation`): bearing means any initializer shape,
-    // object or array members, or assertion facts are present.
-    let bearing = init.is_some()
-        || decl.init_object.is_some()
-        || decl.init_array.is_some()
-        || decl.cast.is_some();
-    let Some(ann_ty) = resolve_boundary_annotation(annotation, span, file, bearing, &mut *report)
-    else {
+    // Single-level identifier propagation (P048; see
+    // `resolve_ident_init`): substituted kinds check through the existing
+    // literal paths below, anything else keeps its historical gate.
+    if resolve_ident_init(IdentStep {
+        decl,
+        binder,
+        scope,
+        idents,
+        file,
+        span,
+        report: &mut *report,
+        init: &mut init,
+    }) {
         return;
-    };
-    // Thread through the memo database: the annotation type is the answer
-    // to this declaration's TypeOf query (see `finish_primitive_check`).
-    let mut tail = CheckCtx {
+    }
+    let mut ctx = CheckCtx {
         file,
         node,
         db: &mut *db,
         freshness,
         report: &mut *report,
         extra,
+        idents,
     };
-    finish_primitive_check(ann_ty, init, decl, span, annotation, &mut tail);
+    finish_annotated_check(decl, span, annotation, init, scope, &mut ctx);
 }
 
 /// Primitive annotation with an object-literal initializer (oracle spells
@@ -7504,6 +8234,10 @@ struct CheckCtx<'a> {
     freshness: &'a FreshnessTable,
     report: &'a mut FileReport,
     extra: &'a [Dep],
+    /// Single-level identifier sources for this run (P048). Paths that
+    /// check no declarator family thread an empty table and keep today's
+    /// verdicts.
+    idents: &'a IdentTable,
 }
 
 /// Object annotation (`{ a: number; ... }`) against any initializer.
@@ -8411,6 +9145,7 @@ pub fn check_interfaces(
         }
     }
     let mut report = FileReport::default();
+    let empty_idents = IdentTable::default();
     for (index, decl) in decls.iter().enumerate() {
         let mut route = InterfaceDeclCtx {
             file,
@@ -8421,6 +9156,7 @@ pub fn check_interfaces(
             db: &mut *db,
             freshness: &freshness,
             report: &mut report,
+            idents: &empty_idents,
         };
         route_declaration(&mut route);
     }
@@ -8440,6 +9176,9 @@ struct InterfaceDeclCtx<'a, 'b> {
     db: &'a mut QueryDb,
     freshness: &'a FreshnessTable,
     report: &'a mut FileReport,
+    /// Identifier sources (empty on the legacy interface entry — pinned
+    /// gap: those declarations keep today's verdicts).
+    idents: &'a IdentTable,
 }
 
 impl InterfaceDeclCtx<'_, '_> {
@@ -8453,6 +9192,7 @@ impl InterfaceDeclCtx<'_, '_> {
             freshness: self.freshness,
             report: &mut *self.report,
             extra: &[],
+            idents: self.idents,
         };
         // The legacy interface entry threads no alias tables (pinned P038
         // gap: alias annotations there keep today's verdicts).
@@ -8494,6 +9234,7 @@ impl InterfaceDeclCtx<'_, '_> {
             freshness: self.freshness,
             report: &mut *self.report,
             extra: &[],
+            idents: self.idents,
         };
         check_interface_shape(
             self.decl,
@@ -8764,6 +9505,7 @@ pub fn check_enums_with_aliases(
         aliases,
         const_names: &const_names,
     };
+    let empty_idents = IdentTable::default();
     for (index, decl) in decls.iter().enumerate() {
         let mut route = EnumDeclCtx {
             file,
@@ -8775,6 +9517,7 @@ pub fn check_enums_with_aliases(
             db: &mut *db,
             freshness: &freshness,
             report: &mut report,
+            idents: &empty_idents,
         };
         route_enum_declaration(&mut route);
     }
@@ -8796,6 +9539,9 @@ struct EnumDeclCtx<'a, 'b, 'c> {
     db: &'a mut QueryDb,
     freshness: &'a FreshnessTable,
     report: &'a mut FileReport,
+    /// Identifier sources (empty on the enum entry — pinned gap: those
+    /// declarations keep today's verdicts).
+    idents: &'a IdentTable,
 }
 
 impl EnumDeclCtx<'_, '_, '_> {
@@ -8809,6 +9555,7 @@ impl EnumDeclCtx<'_, '_, '_> {
             freshness: self.freshness,
             report: &mut *self.report,
             extra: &self.decl.cross_file_deps,
+            idents: self.idents,
         };
         check_one(&self.decl.decl, self.binder, &mut ctx, self.alias_scope);
     }
@@ -8843,6 +9590,7 @@ impl EnumDeclCtx<'_, '_, '_> {
             freshness: self.freshness,
             report: &mut *self.report,
             extra: &self.decl.cross_file_deps,
+            idents: self.idents,
         };
         check_interface_shape(&self.decl.decl, span, display, shape, &mut tail);
     }
@@ -8941,6 +9689,7 @@ impl EnumDeclCtx<'_, '_, '_> {
             freshness: self.freshness,
             report: &mut *self.report,
             extra: &self.decl.cross_file_deps,
+            idents: self.idents,
         };
         check_one(&rewritten, self.binder, &mut ctx, self.alias_scope);
     }
@@ -9650,6 +10399,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some(ann.to_owned()),
             init: Some(init),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -9671,6 +10421,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some(ann.to_owned()),
             init: None,
+            init_ident: None,
             init_object: Some(ObjectInit {
                 members: members
                     .into_iter()
@@ -10033,6 +10784,7 @@ mod tests {
                 kind: DeclKind::Const,
                 annotation: None,
                 init: Some(InitKind::Number),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -10112,6 +10864,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: ann.map(str::to_owned),
             init: Some(InitKind::NonLiteral),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: Some(CastInput {
@@ -10182,6 +10935,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some("any".to_owned()),
             init: None,
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -10843,6 +11597,7 @@ mod tests {
                 kind: DeclKind::Const,
                 annotation: None,
                 init: Some(InitKind::Number),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -10856,6 +11611,7 @@ mod tests {
                 kind: DeclKind::Const,
                 annotation: Some("number".to_owned()),
                 init: None,
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -10959,6 +11715,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some(ann.to_owned()),
             init: Some(init),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -11002,6 +11759,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some("number".to_owned()),
             init: Some(InitKind::String),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -11029,6 +11787,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some("string".to_owned()),
             init: Some(InitKind::Number),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -11054,6 +11813,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some("string".to_owned()),
             init: Some(InitKind::Number),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -11471,6 +12231,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some("{ a: number }".to_owned()),
             init: Some(InitKind::Number),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -11571,6 +12332,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some(ann.to_owned()),
             init: None,
+            init_ident: None,
             init_object: None,
             init_array: Some(ArrayInit { members }),
             cast: None,
@@ -13432,6 +14194,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some(ann.to_owned()),
             init,
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -13447,6 +14210,7 @@ mod tests {
             kind: DeclKind::Const,
             annotation: Some("unknown".to_owned()),
             init,
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -13939,6 +14703,7 @@ mod tests {
                 kind: DeclKind::Const,
                 annotation: Some("number | string".to_owned()),
                 init: None,
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -14239,6 +15004,7 @@ mod tests {
                 kind: DeclKind::Const,
                 annotation: None,
                 init: Some(InitKind::NonLiteral),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -15727,6 +16493,7 @@ mod tests {
                 kind: DeclKind::Const,
                 annotation: Some(annotation.to_owned()),
                 init: Some(init),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -16712,5 +17479,505 @@ mod tests {
             "reason: {}",
             report.unsupported[0].reason
         );
+    }
+
+    /// One identifier-initialized use: an annotated `const` whose
+    /// initializer names `source` (the P048 driver seam, hand-set here —
+    /// the e2e drivers slice it from the init fact span).
+    fn ident_use(name: &str, lo: u32, hi: u32, ann: &str, source: &str) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: Some(ann.to_owned()),
+            init: Some(InitKind::NonLiteral),
+            init_ident: Some(source.to_owned()),
+            init_object: None,
+            init_array: None,
+            cast: None,
+        }
+    }
+
+    /// One unannotated literal source: tsc infers the literal kind, so uses
+    /// propagate it (probes `p01`–`p03`).
+    fn literal_source(name: &str, lo: u32, hi: u32, init: InitKind) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: None,
+            init: Some(init),
+            init_ident: None,
+            init_object: None,
+            init_array: None,
+            cast: None,
+        }
+    }
+
+    /// One [`IdentTable`] holding only parameters, for classifier tests.
+    fn params_table(params: Vec<(&str, Option<&str>, bool)>) -> IdentTable {
+        IdentTable {
+            inputs: Vec::new(),
+            params: params
+                .into_iter()
+                .map(|(name, annotation, optional)| IdentParam {
+                    name: name.to_owned(),
+                    annotation: annotation.map(str::to_owned),
+                    optional,
+                })
+                .collect(),
+            checked: 0,
+        }
+    }
+
+    #[test]
+    fn ident_unannotated_source_propagates_clean() {
+        // `const a = 1; const b: number = a;` (probe p01): the use checks
+        // clean while the unannotated source keeps its own no-annotation
+        // note through the pre-existing gate.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            literal_source("a", 0, 10, InitKind::Number),
+            ident_use("b", 11, 21, "number", "a"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "no annotation: inference is outside the subset"
+        );
+    }
+
+    #[test]
+    fn ident_chain_wrong_diagnoses_at_use_span() {
+        // `const a = 1; const b: string = a;` spells TS2322 at the use
+        // (probe p02); the unannotated source keeps its own note.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            literal_source("a", 0, 10, InitKind::Number),
+            ident_use("b", 11, 21, "string", "a"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(report.diagnostics[0].span, span(11, 21));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "no annotation: inference is outside the subset"
+        );
+    }
+
+    #[test]
+    fn ident_annotated_source_wins_for_clean_use() {
+        // `const a: string = 1; const b: string = a;`: the source errors at
+        // its own span while the use checks against the DECLARED type, so
+        // the use stays silent (probe p04).
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            decl("a", 0, 10, "string", InitKind::Number),
+            ident_use("b", 11, 21, "string", "a"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].span, span(0, 10));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ident_annotated_source_spells_at_wrong_use() {
+        // `const a: string = 1; const b: number = a;`: tsc spells the
+        // declared `'string'` at the use (probe p05) — two diagnostics.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            decl("a", 0, 10, "string", InitKind::Number),
+            ident_use("b", 11, 21, "number", "a"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ident_cycle_declines_with_forward_then_cycle() {
+        // `const a: number = b; const b: number = a;` (probe p08, where tsc
+        // spells TS2448 plus TS2454): the first use is not yet declared,
+        // the second names its user back — two distinct notes, no verdict.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            ident_use("a", 0, 10, "number", "b"),
+            ident_use("b", 11, 21, "number", "a"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("used before its declaration"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("names it back"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn ident_self_cycle_declines() {
+        // `const a: number = a;` (probe p09): the use names itself.
+        let binder = binder_with(&[("a", span(0, 10))]);
+        let decls = [ident_use("a", 0, 10, "number", "a")];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("initializes from itself"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn ident_forward_reference_declines() {
+        // `const a: number = b; const b: number = 1;` (probe p11): the
+        // source is declared later, so the single pass has not seen it.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            ident_use("a", 0, 10, "number", "b"),
+            decl("b", 11, 21, "number", InitKind::Number),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("used before its declaration"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn ident_depth_two_chain_declines_at_second_hop() {
+        // Single level stops exactly once: `b` checks through the annotated
+        // source `a`, while `c` (whose source itself names an identifier)
+        // declines (probe p10, where tsc spells TS2322 on `c`).
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21)), ("c", span(22, 32))]);
+        let decls = [
+            decl("a", 0, 10, "number", InitKind::Number),
+            ident_use("b", 11, 21, "number", "a"),
+            ident_use("c", 22, 32, "string", "b"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("single-level"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn ident_let_source_declines() {
+        // `let` bindings never propagate (probe p06 is clean in tsc — a
+        // pinned divergence): mutability needs flow analysis, so the
+        // literal kind stays unobserved even without reassignment.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let source = ConstDecl {
+            kind: DeclKind::Let,
+            annotation: Some("number".to_owned()),
+            ..literal_source("a", 0, 10, InitKind::Number)
+        };
+        let decls = [source, ident_use("b", 11, 21, "number", "a")];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("'let' binding"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn ident_unclaimed_name_declines() {
+        // A declared name no input claims (top-level `let`/`var` emit no
+        // declarator facts; likewise functions and imports) never
+        // propagates (probe p23/p26 shapes).
+        let binder = binder_with(&[("q", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [ident_use("b", 11, 21, "string", "q")];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("no checkable const declarator"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn ident_unresolvable_name_keeps_historical_decline() {
+        // Names the binder cannot resolve keep the exact historical gate —
+        // resolution adds checks, never new verdicts here.
+        let binder = binder_with(&[("b", span(11, 21))]);
+        let decls = [ident_use("b", 11, 21, "number", "nope")];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "non-literal initializer is outside the subset"
+        );
+    }
+
+    #[test]
+    fn ident_unannotated_use_keeps_unannotated_decline() {
+        // `const c = a` (probe p12): nothing to check against, so the
+        // unannotated gate runs first and the identifier never resolves.
+        let binder = binder_with(&[("a", span(0, 10)), ("c", span(22, 32))]);
+        let use_decl = ConstDecl {
+            annotation: None,
+            ..ident_use("c", 22, 32, "number", "a")
+        };
+        let decls = [decl("a", 0, 10, "number", InitKind::Number), use_decl];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "no annotation: inference is outside the subset"
+        );
+    }
+
+    #[test]
+    fn ident_any_annotated_use_stays_silent() {
+        // `any` admits every bearing value: resolution bypasses entirely,
+        // so even an unresolvable identifier stays silent with no note.
+        let binder = binder_with(&[("b", span(11, 21))]);
+        let decls = [ident_use("b", 11, 21, "any", "nope")];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn ident_under_object_annotation_keeps_structural_decline() {
+        // Structural annotations route before resolution: `const o:
+        // { x: number } = a` (probe p31) keeps the historical non-literal
+        // decline instead of resolving.
+        let binder = binder_with(&[("a", span(0, 10)), ("o", span(11, 21))]);
+        let decls = [
+            decl("a", 0, 10, "number", InitKind::Number),
+            ident_use("o", 11, 21, "{ x: number; }", "a"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "non-literal initializer is outside the subset"
+        );
+    }
+
+    #[test]
+    fn ident_under_union_annotation_keeps_union_decline() {
+        // Union annotations gate before resolution: the union note wins over
+        // any identifier note.
+        let binder = binder_with(&[("a", span(0, 10)), ("u", span(11, 21))]);
+        let decls = [
+            decl("a", 0, 10, "number", InitKind::Number),
+            ident_use("u", 11, 21, "number | string", "a"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "union annotation 'number | string' is outside the subset"
+        );
+    }
+
+    #[test]
+    fn ident_param_source_classifies() {
+        // The parameter classifier maps names within one function: required
+        // primitives substitute, `any`/`never` silence, `unknown` checks,
+        // and everything else declines with its own reason.
+        let table = params_table(vec![
+            ("n", Some("number"), false),
+            ("au", Some("any"), false),
+            ("nv", Some("never"), false),
+            ("uu", Some("unknown"), false),
+            ("opt", Some("number"), true),
+            ("uni", Some("number | string"), false),
+            ("gen", Some("T"), false),
+        ]);
+        assert_eq!(
+            resolve_param_source(&table, "n"),
+            Some(IdentResolution::Substitute(InitKind::Number))
+        );
+        assert_eq!(
+            resolve_param_source(&table, "au"),
+            Some(IdentResolution::Silent)
+        );
+        assert_eq!(
+            resolve_param_source(&table, "nv"),
+            Some(IdentResolution::Silent)
+        );
+        assert_eq!(
+            resolve_param_source(&table, "uu"),
+            Some(IdentResolution::Substitute(InitKind::Unknown))
+        );
+        assert_eq!(resolve_param_source(&table, "missing"), None);
+        let optional = resolve_param_source(&table, "opt").expect("optional params decline");
+        assert!(
+            matches!(optional, IdentResolution::Decline(_)),
+            "optional: {optional:?}"
+        );
+        let union = resolve_param_source(&table, "uni").expect("unions decline");
+        assert!(
+            matches!(union, IdentResolution::Decline(_)),
+            "union: {union:?}"
+        );
+        let generic = resolve_param_source(&table, "gen").expect("generics decline");
+        assert!(
+            matches!(generic, IdentResolution::Decline(_)),
+            "generic: {generic:?}"
+        );
+    }
+
+    #[test]
+    fn ident_duplicate_params_decline() {
+        // Two parameters sharing a name cannot disambiguate: decline
+        // instead of picking first-wins.
+        let table = params_table(vec![
+            ("n", Some("number"), false),
+            ("n", Some("string"), false),
+        ]);
+        let declined = resolve_param_source(&table, "n").expect("duplicates decline");
+        assert!(
+            matches!(declined, IdentResolution::Decline(_)),
+            "duplicate: {declined:?}"
+        );
+    }
+
+    #[test]
+    fn ident_alias_source_expands() {
+        // Alias-to-primitive sources propagate the target: `const a: Num =
+        // 1` (with `Num = number`) checks uses as `number`.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let aliases = [TypeAliasShape {
+            name: "Num".to_owned(),
+            target: "number".to_owned(),
+            has_type_params: false,
+        }];
+        let decls = [
+            decl("a", 0, 10, "Num", InitKind::Number),
+            ident_use("b", 11, 21, "string", "a"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file_with_aliases(FILE, &decls, &binder, &mut db, &aliases);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ident_cast_source_propagates_result() {
+        // `const a = ("oops" as number)` evaluates once: the declined cast
+        // diagnoses at its own operand span while its result kind still
+        // propagates to uses (the admitted/declined-independent rule).
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let source = ConstDecl {
+            annotation: None,
+            init: Some(InitKind::NonLiteral),
+            init_ident: None,
+            cast: Some(CastInput {
+                operand: InitKind::String,
+                target: "number".to_owned(),
+                operand_span: span(6, 12),
+                kind: CastKind::As,
+            }),
+            ..literal_source("a", 0, 10, InitKind::Number)
+        };
+        let decls = [source, ident_use("b", 11, 21, "string", "a")];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_CAST);
+        assert_eq!(report.diagnostics[1].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
     }
 }
