@@ -761,9 +761,10 @@
 //! exactly like before.
 //!
 //! Local type aliases (P038, probed on tsc 7.0.2 `--strict --pretty false`;
-//! probes in `.agent/scratch/p038-probes/`):
+//! probes in `.agent/scratch/p038-probes/`; transitive chains add P052
+//! probes in `.agent/scratch/p052-probes/`):
 //!
-//! - Single-level expansion only, mirroring the P035 imported-alias rules:
+//! - Transitive expansion (P052), mirroring the P035 imported-alias rules:
 //!   alias-to-primitive/boundary rewrites the annotation to the target
 //!   spelling and checks exactly as if written (`Num = number`: clean uses
 //!   stay silent, `"oops"` diagnoses `TS2322` spelling `number`);
@@ -774,9 +775,11 @@
 //!   `type 'Color'` — each probed, unlike the P035 multifile pinned
 //!   divergence, which spells the alias).
 //! - Declines, each with a distinct reason, never a forced verdict:
-//!   chained (alias-to-alias; tsc resolves transitively — pinned divergence),
+//!   over-deep chains and cycles (P052 — chains resolve transitively now,
+//!   so the old chained-alias decline is gone),
 //!   generic (`has_type_params`, bare or `Box<number>`-head uses), circular
-//!   (self-targets; tsc's `TS2456` at the declaration is the pinned gap),
+//!   self-targets (part of the P052 cycle rule; tsc's `TS2456` at the
+//!   declaration is the pinned gap),
 //!   complex/non-identifier targets (unions, object literals, `T<K>` spells),
 //!   unclaimed targets (no interface, enum, or primitive owns the name), and
 //!   duplicate same-name aliases (tsc's `TS2300` is the pinned gap).
@@ -801,6 +804,32 @@
 //!   diagnose `PITH2304` — primitives/boundaries check, the rest decline
 //!   with reasons. No existing corpus fixture declares an alias, so no
 //!   baseline moves.
+//!
+//! Transitive alias chains (P052, probed on tsc 7.0.2 `--strict --pretty
+//! false`; probes in `.agent/scratch/p052-probes/`):
+//!
+//! - tsc resolves chains with NO depth limit: 2-, 5-, and 12-link chains all
+//!   check against the terminal spelling (`chain2`, `chain5`, `chain12`: a
+//!   wrong use diagnoses `TS2322` spelling the terminal primitive).
+//!   Self-cycles diagnose `TS2456` at the alias declaration and mutual cycles
+//!   at both (`self-cycle`, `mutual-cycle`) — the subset spells no
+//!   declaration diagnostics, so cycles decline at the use instead. Chains
+//!   through a generic instantiation (`chain-generic`: `type A =
+//!   Box<number>`) and to unions (`chain-union`) admit in tsc, but generics
+//!   never instantiate and unions stay outside the subset — those links
+//!   decline exactly as before. Chains to interfaces resolve transparently:
+//!   missing members spell the UNDERLYING interface (`chain-iface`:
+//!   `required in type 'Point'`), extending the P038 transparency rule.
+//! - The depth bound ([`MAX_ALIAS_CHAIN_DEPTH`], 8 links) is therefore a
+//!   solver-side termination guard, not an oracle mirror: 8 covers every
+//!   realistic chain with margin (the corpus exercises up to five links)
+//!   while longer chains decline distinctly instead of recursing without
+//!   end. Resolution threads a visited set of alias names, so self- and
+//!   mutual cycles decline (never a forced `TS2456`); over-depth chains
+//!   decline with their own reason; generic/complex/unclaimed links decline
+//!   exactly as before. Terminal primitives rewrite the spelling, terminal
+//!   interfaces/enums relink with the underlying display — one family per
+//!   site, bounded iteration, never unbounded recursion.
 //!
 //! Single-level identifier literal propagation (P048, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p048-probes/`):
@@ -2681,7 +2710,7 @@ fn source_type_from_text(text: &str) -> SourceType {
     SourceType::Unusable
 }
 
-/// Classifies one SOURCE annotation through single-level alias expansion:
+/// Classifies one SOURCE annotation through transitive alias expansion:
 /// bare alias names expand ([`expand_local_alias`] is pure — no report
 /// effects, unlike [`expand_local_annotation`]); primitives and boundaries
 /// map, everything else is unusable.
@@ -2960,7 +2989,7 @@ pub fn check_file(
 /// Checks every `const`/`let` declarator in `decls` for `file` with local
 /// type aliases in scope, returning the sorted [`FileReport`].
 ///
-/// `aliases` feeds single-level expansion (P038):
+/// `aliases` feeds transitive expansion (P038, chains via P052):
 /// alias-to-primitive/boundary annotations check as if the target were
 /// written, everything else named declines with a distinct reason.
 /// [`check_file`] threads an empty table; [`multifile`] keeps its own
@@ -8330,7 +8359,16 @@ fn finish_primitive_check(
     }
 }
 
-/// One single-level local alias expansion step for an annotation.
+/// Maximum alias links followed when resolving one annotation (P052).
+///
+/// tsc 7.0.2 resolves 2-, 5-, and 12-link chains with no error (probes in
+/// `.agent/scratch/p052-probes/`), so the bound is a solver-side termination
+/// guard, not an oracle mirror: 8 covers every realistic chain with margin
+/// while longer chains decline distinctly instead of recursing without end.
+pub const MAX_ALIAS_CHAIN_DEPTH: usize = 8;
+
+/// One local alias expansion step for an annotation (transitive up to
+/// [`MAX_ALIAS_CHAIN_DEPTH`] links — see [`expand_local_alias`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LocalAliasStep {
     /// No alias claims the name: the existing paths apply.
@@ -8340,23 +8378,116 @@ enum LocalAliasStep {
     /// Alias-to-shape: the underlying interface/enum/namespace name, for the
     /// caller to relink (or decline when it holds no shape tables).
     Shape(String),
-    /// Unexpandable: chained, generic, circular, complex, duplicate,
+    /// Unexpandable: over-deep, cyclic, generic, complex, duplicate,
     /// shadowed, or unclaimed targets decline with distinct reasons.
     Decline(String),
 }
 
-/// Expands one annotation naming a file-local alias, ONE level (mirrors the
-/// P035 `expand_imported_alias` rules locally).
+/// Walking state for [`classify_alias_target`], bundled so the link step
+/// stays lean (pedantic arity discipline).
+#[derive(Debug)]
+struct AliasChain<'a> {
+    /// Every alias table in scope (head lookups and link advances).
+    aliases: &'a [TypeAliasShape],
+    /// Head alias name (names head-attributed reasons: over-depth limits).
+    head: &'a str,
+    /// Alias names followed so far (head first): the cycle guard.
+    visited: Vec<&'a str>,
+    /// Links followed so far (each advance toward another alias counts one).
+    links: usize,
+}
+
+/// One [`AliasChain`] link outcome: terminal steps carry the
+/// [`LocalAliasStep`], advances carry the next alias to follow.
+#[derive(Debug)]
+enum ChainOutcome<'a> {
+    /// Terminal: return the step to the caller.
+    Done(LocalAliasStep),
+    /// Advance: follow this alias on the next link.
+    Next(&'a TypeAliasShape),
+}
+
+impl<'a> AliasChain<'a> {
+    /// Starts a walk at the head alias (already checked non-generic by the
+    /// caller): the head name seeds the visited set.
+    fn new(aliases: &'a [TypeAliasShape], head: &'a TypeAliasShape) -> Self {
+        Self {
+            aliases,
+            head: head.name.as_str(),
+            visited: vec![head.name.as_str()],
+            links: 0,
+        }
+    }
+
+    /// Classifies one link (`target` is the trimmed target text of the alias
+    /// named `linker`): primitives rewrite, bare non-alias names surface for
+    /// relinking, and unexpandable targets decline — while names claiming
+    /// another live alias advance the walk when the bound allows.
+    fn step(&mut self, linker: &'a str, target: &str) -> ChainOutcome<'a> {
+        if target.is_empty() || target == linker {
+            return ChainOutcome::Done(LocalAliasStep::Decline(format!(
+                "type alias '{linker}' is circular: \
+                 circular aliases are outside the subset"
+            )));
+        }
+        if self.visited.contains(&target) {
+            return ChainOutcome::Done(LocalAliasStep::Decline(format!(
+                "type alias '{linker}' targets '{target}': \
+                 circular alias chains are outside the subset"
+            )));
+        }
+        if annotation_type(target).is_some() || boundary_annotation_type(target).is_some() {
+            return ChainOutcome::Done(LocalAliasStep::Primitive(target.to_owned()));
+        }
+        if !is_name_segment(target) {
+            return ChainOutcome::Done(LocalAliasStep::Decline(format!(
+                "type alias '{linker}' targets '{target}': \
+                 non-identifier alias targets are outside the subset"
+            )));
+        }
+        let mut claimed = self.aliases.iter().filter(|shape| shape.name == target);
+        let Some(next) = claimed.next() else {
+            return ChainOutcome::Done(LocalAliasStep::Shape(target.to_owned()));
+        };
+        if claimed.next().is_some() {
+            return ChainOutcome::Done(LocalAliasStep::Decline(format!(
+                "multiple type alias declarations for '{target}': \
+                 merging is outside the subset"
+            )));
+        }
+        if next.has_type_params {
+            return ChainOutcome::Done(LocalAliasStep::Decline(format!(
+                "type alias '{}' is generic: generic aliases are outside the subset",
+                next.name
+            )));
+        }
+        self.links += 1;
+        if self.links > MAX_ALIAS_CHAIN_DEPTH {
+            return ChainOutcome::Done(LocalAliasStep::Decline(format!(
+                "type alias '{}' targets '{target}': \
+                 alias chain is deeper than {} links: \
+                 deep alias chains are outside the subset",
+                self.head, MAX_ALIAS_CHAIN_DEPTH
+            )));
+        }
+        self.visited.push(next.name.as_str());
+        ChainOutcome::Next(next)
+    }
+}
+
+/// Expands one annotation naming a file-local alias, transitively up to
+/// [`MAX_ALIAS_CHAIN_DEPTH`] links (mirrors the P035 `expand_imported_alias`
+/// rules locally).
 ///
 /// `Keep` means no expansion applies: non-bare spellings, primitive/boundary
 /// names (those check directly — aliases can never shadow them), and names
 /// no alias claims (the existing unknown-name path applies). Primitives and
 /// boundaries rewrite to their spelling; interfaces, enums, and namespaces
-/// surface as [`LocalAliasStep::Shape`] for the caller to relink; chains
-/// (alias-to-alias), generic aliases, circular references, non-identifier
+/// surface as [`LocalAliasStep::Shape`] for the caller to relink; over-deep
+/// chains, cycles (via the visited set), generic aliases, non-identifier
 /// targets, duplicate declarations, and const-shadowed names decline — tsc
-/// resolves chains transitively and checks shadowed type meanings, so those
-/// declines are pinned divergences.
+/// resolves chains transitively and checks shadowed type meanings, so
+/// shadowing declines stay a pinned divergence.
 fn expand_local_alias(scope: &LocalAliasScope<'_, '_>, annotation: &str) -> LocalAliasStep {
     if annotation_type(annotation).is_some()
         || boundary_annotation_type(annotation).is_some()
@@ -8386,8 +8517,11 @@ fn expand_local_alias(scope: &LocalAliasScope<'_, '_>, annotation: &str) -> Loca
     classify_alias_target(scope.aliases, alias)
 }
 
-/// Classifies one claimed alias's target: generics, circularities,
-/// primitives/boundaries, complex spellings, chains, or a shape name.
+/// Follows one claimed alias's chain to its terminal target: generics
+/// decline, primitives/boundaries rewrite, bare non-alias names surface for
+/// relinking, and each live alias link advances the walk (visited-guarded,
+/// depth-bounded). Complex spellings and names no alias claims terminate the
+/// walk without forcing a verdict.
 fn classify_alias_target(aliases: &[TypeAliasShape], alias: &TypeAliasShape) -> LocalAliasStep {
     if alias.has_type_params {
         return LocalAliasStep::Decline(format!(
@@ -8395,31 +8529,14 @@ fn classify_alias_target(aliases: &[TypeAliasShape], alias: &TypeAliasShape) -> 
             alias.name
         ));
     }
-    let target = alias.target.trim();
-    if target.is_empty() || target == alias.name {
-        return LocalAliasStep::Decline(format!(
-            "type alias '{}' is circular: circular aliases are outside the subset",
-            alias.name
-        ));
+    let mut chain = AliasChain::new(aliases, alias);
+    let mut linker = alias;
+    loop {
+        match chain.step(linker.name.as_str(), linker.target.trim()) {
+            ChainOutcome::Done(step) => return step,
+            ChainOutcome::Next(next) => linker = next,
+        }
     }
-    if annotation_type(target).is_some() || boundary_annotation_type(target).is_some() {
-        return LocalAliasStep::Primitive(target.to_owned());
-    }
-    if !is_name_segment(target) {
-        return LocalAliasStep::Decline(format!(
-            "type alias '{}' targets '{target}': \
-             non-identifier alias targets are outside the subset",
-            alias.name
-        ));
-    }
-    if aliases.iter().any(|shape| shape.name == target) {
-        return LocalAliasStep::Decline(format!(
-            "type alias '{}' targets '{target}': \
-             chained aliases are outside the subset (single-level expansion only)",
-            alias.name
-        ));
-    }
-    LocalAliasStep::Shape(target.to_owned())
 }
 
 /// Decline reason for a generic-alias instantiation head (`Box` in
@@ -10673,7 +10790,7 @@ pub fn check_enums(
 /// Checks `const`/`let` declarators with local type aliases in scope,
 /// returning the sorted [`FileReport`].
 ///
-/// `aliases` feeds single-level expansion (P038): alias-to-primitive
+/// `aliases` feeds transitive expansion (P038, chains via P052): alias-to-primitive
 /// annotations rewrite and check as if written, alias-to-interface/enum
 /// annotations relink the underlying shape and check through the existing
 /// shape paths spelling the underlying name, and unexpandable targets
@@ -10731,7 +10848,7 @@ struct EnumDeclCtx<'a, 'b, 'c> {
     node: NodeId,
     decl: &'a EnumDecl,
     input: &'a EnumInput<'b>,
-    /// Local alias tables for single-level expansion (P038).
+    /// Local alias tables for transitive expansion (P038, chains via P052).
     alias_scope: &'c LocalAliasScope<'b, 'c>,
     binder: &'a Binder,
     db: &'a mut QueryDb,
@@ -10824,7 +10941,7 @@ impl EnumDeclCtx<'_, '_, '_> {
 
     /// Single names that resolve past the enum set: interfaces check with
     /// the full name, namespaces diagnose `PITH2709`, local aliases expand
-    /// one level (P038), and the rest decline.
+    /// transitively (P038, chains via P052), and the rest decline.
     fn resolve_single_non_enum(&mut self, span: Span, annotation: &str, id: SymbolId) {
         let input = self.input;
         if let Some(shape) = input
@@ -10848,11 +10965,12 @@ impl EnumDeclCtx<'_, '_, '_> {
         }
     }
 
-    /// Unclaimed single names (P038): local aliases expand one level —
-    /// primitives rewrite and check as if written, interfaces/enums relink
-    /// through the existing shape paths spelling the UNDERLYING name (alias
-    /// transparency, probed tsc 7.0.2), and unexpandable targets decline.
-    /// Anything no alias claims keeps the historical decline.
+    /// Unclaimed single names (P038, chains via P052): local aliases expand
+    /// transitively — primitives rewrite and check as if written,
+    /// interfaces/enums relink through the existing shape paths spelling the
+    /// UNDERLYING name (alias transparency, probed tsc 7.0.2), and
+    /// unexpandable targets decline. Anything no alias claims keeps the
+    /// historical decline.
     fn expand_local_single(&mut self, span: Span, annotation: &str) {
         match expand_local_alias(self.alias_scope, annotation) {
             LocalAliasStep::Keep => {
@@ -19153,20 +19271,193 @@ mod tests {
     }
 
     #[test]
-    fn local_alias_chained_declines() {
-        // Probed tsc 7.0.2 (p038-probes/d-chain.ts): tsc resolves
-        // transitively, so the single-level decline is a pinned divergence.
-        let binder = binder_with(&[("A", span(0, 1)), ("B", span(2, 3)), ("b", span(4, 14))]);
+    fn local_alias_chain_resolves_transitively() {
+        // Probed tsc 7.0.2 (p052-probes/chain2.ts): chains resolve to the
+        // terminal spelling, clean or `TS2322` — the P038 single-level
+        // decline is gone.
+        let binder = binder_with(&[
+            ("A", span(0, 1)),
+            ("B", span(2, 3)),
+            ("ok", span(4, 14)),
+            ("bad", span(15, 25)),
+        ]);
         let aliases = [alias_shape("A", "number"), alias_shape("B", "A")];
-        let decls = [decl("b", 4, 14, "B", InitKind::Number)];
+        let decls = [
+            decl("ok", 4, 14, "B", InitKind::Number),
+            decl("bad", 15, 25, "B", InitKind::String),
+        ];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_deep_chain_resolves_within_bound() {
+        // Five links sit comfortably inside [`MAX_ALIAS_CHAIN_DEPTH`]
+        // (probed tsc 7.0.2 `chain5.ts` resolves the same way).
+        let binder = binder_with(&[
+            ("A", span(0, 1)),
+            ("B", span(2, 3)),
+            ("C", span(4, 5)),
+            ("D", span(6, 7)),
+            ("E", span(8, 9)),
+            ("ok", span(10, 20)),
+        ]);
+        let aliases = [
+            alias_shape("A", "number"),
+            alias_shape("B", "A"),
+            alias_shape("C", "B"),
+            alias_shape("D", "C"),
+            alias_shape("E", "D"),
+        ];
+        let decls = [decl("ok", 10, 20, "E", InitKind::Number)];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn local_alias_mutual_cycle_declines() {
+        // Probed tsc 7.0.2 (p052-probes/mutual-cycle.ts): `TS2456` at both
+        // alias declarations, which the subset never synthesizes — the use
+        // declines instead of looping forever.
+        let binder = binder_with(&[("A", span(0, 1)), ("B", span(2, 3)), ("a", span(4, 14))]);
+        let aliases = [alias_shape("A", "B"), alias_shape("B", "A")];
+        let decls = [decl("a", 4, 14, "A", InitKind::Number)];
         let report = file_report_with_aliases(&decls, &aliases, &binder);
         assert!(report.diagnostics.is_empty());
         assert_eq!(report.unsupported.len(), 1);
         assert!(
-            report.unsupported[0].reason.contains("chained aliases"),
+            report.unsupported[0].reason.contains("circular"),
             "reason: {}",
             report.unsupported[0].reason
         );
+    }
+
+    #[test]
+    fn local_alias_over_depth_declines_distinctly() {
+        // tsc has no depth limit (p052-probes/chain12.ts resolves), so chains
+        // past [`MAX_ALIAS_CHAIN_DEPTH`] decline with their own reason —
+        // never silently, never a forced verdict.
+        let binder = binder_with(&[
+            ("A0", span(0, 2)),
+            ("A1", span(3, 5)),
+            ("A2", span(6, 8)),
+            ("A3", span(9, 11)),
+            ("A4", span(12, 14)),
+            ("A5", span(15, 17)),
+            ("A6", span(18, 20)),
+            ("A7", span(21, 23)),
+            ("A8", span(24, 26)),
+            ("A9", span(27, 29)),
+            ("deep", span(40, 50)),
+        ]);
+        let aliases = [
+            alias_shape("A0", "number"),
+            alias_shape("A1", "A0"),
+            alias_shape("A2", "A1"),
+            alias_shape("A3", "A2"),
+            alias_shape("A4", "A3"),
+            alias_shape("A5", "A4"),
+            alias_shape("A6", "A5"),
+            alias_shape("A7", "A6"),
+            alias_shape("A8", "A7"),
+            alias_shape("A9", "A8"),
+        ];
+        let decls = [decl("deep", 40, 50, "A9", InitKind::Number)];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("deep alias chains"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn local_alias_mid_chain_generic_and_complex_decline() {
+        // Chains through a generic instantiation admit in tsc
+        // (p052-probes/chain-generic.ts) but generics never instantiate;
+        // chains to unions admit too (p052-probes/chain-union.ts) but unions
+        // stay outside the subset — both links decline exactly as before.
+        let binder = binder_with(&[
+            ("Box", span(0, 3)),
+            ("U", span(4, 5)),
+            ("A", span(6, 7)),
+            ("V", span(8, 9)),
+            ("a", span(10, 20)),
+            ("v", span(30, 40)),
+        ]);
+        let aliases = [
+            generic_alias_shape("Box", "T"),
+            alias_shape("U", "number | string"),
+            alias_shape("A", "Box"),
+            alias_shape("V", "U"),
+        ];
+        let decls = [
+            decl("a", 10, 20, "A", InitKind::Number),
+            decl("v", 30, 40, "V", InitKind::Number),
+        ];
+        let report = file_report_with_aliases(&decls, &aliases, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[0].reason.contains("generic"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("non-identifier"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn local_alias_chain_to_interface_relinks_underlying() {
+        // Probed tsc 7.0.2 (p052-probes/chain-iface.ts): chained interfaces
+        // check with the UNDERLYING display, extending P038 transparency.
+        let binder = binder_with(&[
+            ("Point", span(0, 5)),
+            ("A", span(6, 7)),
+            ("B", span(8, 9)),
+            ("wrong", span(40, 50)),
+        ]);
+        let point = interface_shape(&binder, "Point", 0, vec![("x", "number"), ("y", "number")]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[point],
+            namespaces: &[],
+        };
+        let aliases = [alias_shape("A", "Point"), alias_shape("B", "A")];
+        let decls = [EnumDecl {
+            decl: object_decl(
+                "wrong",
+                40,
+                50,
+                "B",
+                vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::String),
+                ],
+            ),
+            init_text: None,
+            cross_file_deps: Vec::new(),
+        }];
+        let report = enums_report_with_aliases(&decls, &input, &aliases, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
     }
 
     #[test]

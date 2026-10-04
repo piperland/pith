@@ -38,7 +38,7 @@
 //!   clean. Failed VALUE imports keep the exact mirrors (their export space
 //!   is fully facted). Resolved type-only imports (including aliases the
 //!   graph sees) stay silent like tsc and check through the shape paths.
-//! - Re-exported interfaces and single-level aliases check with the same
+//! - Re-exported interfaces and single-link aliases check with the same
 //!   families and anchors through named chains, renames, and `export *`
 //!   barrels (P035 probes, tsc 7.0.2, `.agent/scratch/p035-probes/`): wrong
 //!   members diagnose `TS2322` at the member, missing members `TS2741`
@@ -48,9 +48,10 @@
 //!   identical to value forms. Ambiguous stars diagnose `TS2308` at the
 //!   barrel statement and cycles `TS2303` at the re-export statements — both
 //!   pinned gaps: the solver declines with reasons instead of guessing.
-//!   Chained aliases (`type B = A`, aliases over imports) resolve in tsc but
-//!   the solver expands one level only and declines the rest (pinned
-//!   divergence, e2e-pinned).
+//!   Alias chains (`type B = A`, aliases over imports) resolve transitively
+//!   up to the shared depth bound (P052 — the old single-level chained
+//!   decline is gone); over-deep chains and cycles decline distinctly
+//!   (e2e-pinned).
 //!
 //! - Missing/excess elaborations through an ALIAS spell the alias as written
 //!   (`required in type 'Alias'`) where tsc spells the underlying interface
@@ -87,13 +88,14 @@
 //!   onto the LOCAL import binding's symbol and check through [`check_enums`]
 //!   unchanged; value targets there decline via the existing not-an-enum
 //!   path (tsc's `TS2749` is the pinned gap). Annotations naming an imported
-//!   alias expand ONE level against the declaring file: alias-to-primitive
-//!   rewrites the annotation to the target spelling (checked exactly as if
-//!   written); alias-to-interface and alias-to-enum relink the declaring
-//!   shape onto the local import binding like a direct shape import.
-//!   Chained (alias-to-alias, alias-to-import), generic, and non-identifier
-//!   targets decline with reasons and skip checking (a raw check would add a
-//!   second, misleading not-an-enum note). Annotations naming a type-only
+//!   alias expand transitively (P052) against the declaring file, following
+//!   import hops across files: alias-to-primitive rewrites the annotation to
+//!   the target spelling (checked exactly as if written); alias-to-interface
+//!   and alias-to-enum relink the declaring shape onto the local import
+//!   binding like a direct shape import.
+//!   Over-deep, cyclic, generic, and non-identifier targets decline with
+//!   reasons and skip checking (a raw check would add a second, misleading
+//!   not-an-enum note). Annotations naming a type-only
 //!   import the graph cannot resolve skip checking with a recorded reason
 //!   (a failed type-only resolution may name a member exported only through
 //!   shapes the subset cannot spell — `PITH2304` there would risk a false
@@ -197,7 +199,7 @@ pub struct ProgramFile {
     pub enums: Vec<EnumShape>,
     /// Local namespace shapes in source order.
     pub namespaces: Vec<NamespaceShape>,
-    /// Local type aliases in source order (feeds single-level expansion of
+    /// Local type aliases in source order (feeds transitive expansion of
     /// imported annotations; see [`AliasShape`]).
     pub aliases: Vec<AliasShape>,
     /// Local import bindings in source order.
@@ -578,26 +580,273 @@ fn resolve_type_shape(ctx: &FileCtx<'_>, target: &str) -> Option<Result<ShapeHit
     declaring_shape(declaring, &resolved.local, relinked_symbol(ctx, target))
 }
 
-/// One single-level alias expansion step for an imported annotation.
+/// One alias expansion step for an imported annotation.
 enum AliasStep {
     /// Alias-to-primitive: the annotation rewrites to the target spelling
     /// and checks exactly as if written.
     Primitive(String),
     /// Alias-to-interface/enum: the declaring shape, relinked locally.
     Shape(ShapeHit),
-    /// Unexpandable: chained, generic, circular, or complex targets decline.
+    /// Unexpandable: over-deep, cyclic, generic, or complex targets decline.
     Decline(String),
 }
 
-/// Expands one imported annotation naming a declaring-file alias, ONE level.
+/// Terminal outcome of following one imported alias chain (P052): either
+/// a primitive spelling, a declaring file's shape claim, or a decline
+/// reason.
+enum ChainTerminal {
+    /// Alias chain ends at a primitive/boundary: the annotation rewrites to
+    /// this spelling and checks exactly as if written.
+    Primitive(String),
+    /// Alias chain ends at an interface/enum in this declaring file: the
+    /// shape, relinked onto the use-file import binding by the caller.
+    Shape(ShapeHit),
+    /// Unexpandable: over-deep, cyclic, generic, complex, or unclaimed links
+    /// decline with distinct reasons.
+    Decline(String),
+}
+
+/// Walking state for [`follow_import_chain`], bundled so the link step stays
+/// lean (pedantic arity discipline).
+struct ImportChain<'c, 'x> {
+    /// The checking file context (graph, files, binder for relinking).
+    ctx: &'c FileCtx<'x>,
+    /// `(file, name)` pairs followed so far (head first): the cycle guard.
+    visited: Vec<(FileId, String)>,
+    /// Head alias name in the head declaring file (names head-attributed
+    /// reasons: over-depth limits and unclaimed terminals).
+    head: String,
+    /// Links followed so far (alias advances and import hops alike count
+    /// one, against the shared [`super::MAX_ALIAS_CHAIN_DEPTH`]).
+    links: usize,
+}
+
+/// One [`ImportChain`] link outcome: terminal outcomes return to the caller
+/// while advances hand owned handoffs back to the loop.
+enum ImportLink<'x> {
+    /// Terminal: map to the [`AliasStep`].
+    Done(ChainTerminal),
+    /// Advance within the same declaring file: the next alias's target text
+    /// (the next linker is the name just classified).
+    Within(String),
+    /// Hop through an import to another declaring file: the file plus the
+    /// resolved name (settled by [`ImportChain::hop`] — the loop never
+    /// classifies a bare resolved name as target text, which would falsely
+    /// trip the self-cycle check).
+    Hop(&'x ProgramFile, String),
+}
+
+/// One [`ImportChain::hop`] settlement: either loop handoffs (file, linker
+/// name, target text) or a terminal outcome.
+enum HopSettled<'x> {
+    /// Keep walking: the declaring file, the alias name, its target text.
+    Continue(&'x ProgramFile, String, String),
+    /// Terminal: map to the [`AliasStep`].
+    Done(ChainTerminal),
+}
+
+impl<'x> ImportChain<'_, 'x> {
+    /// Classifies one link (`target` is the trimmed target text of the alias
+    /// named `linker` in `file`): primitives rewrite, shapes in the
+    /// declaring file terminate, and live alias/import links advance the
+    /// walk when the bound allows — anything else declines distinctly.
+    fn link(&mut self, file: &ProgramFile, linker: &str, target: &str) -> ImportLink<'x> {
+        if target.is_empty() || target == linker {
+            return ImportLink::Done(ChainTerminal::Decline(format!(
+                "type alias '{linker}' is circular: circular aliases are outside the subset"
+            )));
+        }
+        if visited_contains(&self.visited, file.file, target) {
+            return ImportLink::Done(ChainTerminal::Decline(format!(
+                "type alias '{linker}' targets '{target}': \
+                 circular alias chains are outside the subset"
+            )));
+        }
+        if super::annotation_type(target).is_some()
+            || super::boundary_annotation_type(target).is_some()
+        {
+            return ImportLink::Done(ChainTerminal::Primitive(target.to_owned()));
+        }
+        if !is_bare_identifier(target) {
+            return ImportLink::Done(ChainTerminal::Decline(format!(
+                "type alias '{linker}' targets '{target}': \
+                 non-identifier alias targets are outside the subset"
+            )));
+        }
+        if let Some(hit) = declaring_shape(file, target, None) {
+            return ImportLink::Done(match hit {
+                Ok(shape) => ChainTerminal::Shape(shape),
+                Err(reason) => ChainTerminal::Decline(reason),
+            });
+        }
+        let mut claimed = file.aliases.iter().filter(|shape| shape.name == target);
+        if let Some(next) = claimed.next() {
+            if claimed.next().is_some() {
+                return ImportLink::Done(ChainTerminal::Decline(format!(
+                    "multiple type alias declarations for '{target}': \
+                     merging is outside the subset"
+                )));
+            }
+            if next.has_type_params {
+                return ImportLink::Done(ChainTerminal::Decline(format!(
+                    "type alias '{}' is generic: generic aliases are outside the subset",
+                    next.name
+                )));
+            }
+            self.links += 1;
+            if self.links > super::MAX_ALIAS_CHAIN_DEPTH {
+                return ImportLink::Done(over_depth(&self.head, target));
+            }
+            self.visited.push((file.file, target.to_owned()));
+            return ImportLink::Within(next.target.clone());
+        }
+        if file.imports.iter().any(|entry| entry.local == target) {
+            match self.ctx.graph.resolve_import(file.file, target) {
+                Err(other) => {
+                    return ImportLink::Done(ChainTerminal::Decline(format!(
+                        "type alias '{linker}' targets imported '{target}': {}",
+                        other.reason()
+                    )));
+                }
+                Ok(resolved) => {
+                    let Some(next_file) =
+                        declaring_input(self.ctx.files, self.ctx.by_file, &resolved)
+                    else {
+                        return ImportLink::Done(ChainTerminal::Decline(format!(
+                            "declaring file for import '{target}' has no inputs: driver skew"
+                        )));
+                    };
+                    if visited_contains(&self.visited, next_file.file, &resolved.local) {
+                        return ImportLink::Done(ChainTerminal::Decline(format!(
+                            "type alias '{linker}' targets '{target}': \
+                             circular alias chains are outside the subset"
+                        )));
+                    }
+                    self.links += 1;
+                    if self.links > super::MAX_ALIAS_CHAIN_DEPTH {
+                        return ImportLink::Done(over_depth(&self.head, target));
+                    }
+                    self.visited.push((next_file.file, resolved.local.clone()));
+                    return ImportLink::Hop(next_file, resolved.local);
+                }
+            }
+        }
+        ImportLink::Done(ChainTerminal::Decline(format!(
+            "type alias '{}' targets '{target}': \
+             no interface, enum, or primitive claims it",
+            self.head
+        )))
+    }
+
+    /// Settles an import hop to (`next_file`, `next_name`): aliases continue
+    /// the walk with their own target text, shapes terminate, and anything
+    /// else declines — the loop never classifies the bare resolved name as
+    /// target text (which would falsely trip the self-cycle check).
+    fn hop(&mut self, next_file: &'x ProgramFile, next_name: &str) -> HopSettled<'x> {
+        let mut claimed = next_file
+            .aliases
+            .iter()
+            .filter(|shape| shape.name == next_name);
+        let Some(next) = claimed.next() else {
+            return match declaring_shape(next_file, next_name, None) {
+                Some(Ok(shape)) => HopSettled::Done(ChainTerminal::Shape(shape)),
+                Some(Err(reason)) => HopSettled::Done(ChainTerminal::Decline(reason)),
+                None => HopSettled::Done(ChainTerminal::Decline(format!(
+                    "type alias '{}' targets '{next_name}': \
+                     no interface, enum, or primitive claims it",
+                    self.head
+                ))),
+            };
+        };
+        if claimed.next().is_some() {
+            return HopSettled::Done(ChainTerminal::Decline(format!(
+                "multiple type alias declarations for '{next_name}': \
+                 merging is outside the subset"
+            )));
+        }
+        if next.has_type_params {
+            return HopSettled::Done(ChainTerminal::Decline(format!(
+                "type alias '{}' is generic: generic aliases are outside the subset",
+                next.name
+            )));
+        }
+        HopSettled::Continue(next_file, next.name.clone(), next.target.trim().to_owned())
+    }
+}
+
+/// Whether (`file`, `name`) is already in the walk's visited set: the cycle
+/// guard shared by the link and hop steps (each alias names at most one
+/// target, so a revisit is exactly a cycle).
+fn visited_contains(visited: &[(FileId, String)], file: FileId, name: &str) -> bool {
+    visited
+        .iter()
+        .any(|(visited_file, candidate)| *visited_file == file && candidate == name)
+}
+
+/// The over-depth decline: names the head alias (stable whatever link trips
+/// the bound) plus the link target that exceeded it.
+fn over_depth(head: &str, target: &str) -> ChainTerminal {
+    ChainTerminal::Decline(format!(
+        "type alias '{head}' targets '{target}': \
+         alias chain is deeper than {} links: \
+         deep alias chains are outside the subset",
+        super::MAX_ALIAS_CHAIN_DEPTH
+    ))
+}
+
+/// Follows one imported alias chain to its terminal target, threading the
+/// visited set and the shared depth bound across declaring files (import
+/// hops continue the walk — tsc resolves those too).
+fn follow_import_chain(
+    ctx: &FileCtx<'_>,
+    declaring: &ProgramFile,
+    alias: &AliasShape,
+) -> ChainTerminal {
+    if alias.has_type_params {
+        return ChainTerminal::Decline(format!(
+            "type alias '{}' is generic: generic aliases are outside the subset",
+            alias.name
+        ));
+    }
+    let mut chain = ImportChain {
+        ctx,
+        visited: vec![(declaring.file, alias.name.clone())],
+        head: alias.name.clone(),
+        links: 0,
+    };
+    let mut file = declaring;
+    let mut linker = alias.name.clone();
+    let mut target = alias.target.trim().to_owned();
+    loop {
+        match chain.link(file, &linker, &target) {
+            ImportLink::Done(outcome) => return outcome,
+            ImportLink::Within(next_target) => {
+                linker.clone_from(&target);
+                next_target.trim().clone_into(&mut target);
+            }
+            ImportLink::Hop(next_file, next_name) => match chain.hop(next_file, &next_name) {
+                HopSettled::Continue(hopped_file, hopped_linker, hopped_target) => {
+                    file = hopped_file;
+                    linker = hopped_linker;
+                    target = hopped_target;
+                }
+                HopSettled::Done(outcome) => return outcome,
+            },
+        }
+    }
+}
+
+/// Expands one imported annotation naming a declaring-file alias,
+/// transitively up to the shared depth bound (P052).
 ///
 /// `None` means no expansion applies: unimported names, import failures
 /// (whose records already exist), and names no declaring alias claims (the
 /// existing unknown-name path applies). Primitives rewrite to their
-/// spelling; interfaces and enums relink like direct shape imports; chains
-/// (alias-to-alias, alias-to-import), generic aliases, circular references,
-/// and non-identifier targets decline — tsc resolves chains transitively, so
-/// those declines are a pinned divergence.
+/// spelling; interfaces and enums relink like direct shape imports; the walk
+/// follows alias links within the declaring file and import hops across
+/// files (tsc resolves those too), while over-deep chains, cycles (via the
+/// visited set), generic aliases, and non-identifier targets decline —
+/// never a forced verdict.
 fn expand_imported_alias(ctx: &FileCtx<'_>, target: &str) -> Option<AliasStep> {
     if !ctx.input.imports.iter().any(|entry| entry.local == target) {
         return None;
@@ -610,54 +859,28 @@ fn expand_imported_alias(ctx: &FileCtx<'_>, target: &str) -> Option<AliasStep> {
         .aliases
         .iter()
         .find(|shape| shape.name == resolved.local)?;
-    if alias.has_type_params {
-        return Some(AliasStep::Decline(format!(
-            "type alias '{}' is generic: generic aliases are outside the subset",
-            resolved.local
-        )));
+    Some(match follow_import_chain(ctx, declaring, alias) {
+        ChainTerminal::Primitive(spelling) => AliasStep::Primitive(spelling),
+        ChainTerminal::Shape(hit) => AliasStep::Shape(relinked_hit(ctx, target, hit)),
+        ChainTerminal::Decline(reason) => AliasStep::Decline(reason),
+    })
+}
+
+/// Relinks a chain-terminal shape onto the use file's import binding symbol
+/// (the declaring-file lookup ran with no symbol; identity always comes from
+/// the checking [`Binder`)).
+fn relinked_hit(ctx: &FileCtx<'_>, target: &str, hit: ShapeHit) -> ShapeHit {
+    let symbol = relinked_symbol(ctx, target);
+    match hit {
+        ShapeHit::Interface(mut shape) => {
+            shape.symbol = symbol;
+            ShapeHit::Interface(shape)
+        }
+        ShapeHit::Enum(mut shape) => {
+            shape.symbol = symbol;
+            ShapeHit::Enum(shape)
+        }
     }
-    let expanded = alias.target.trim();
-    if expanded.is_empty() || expanded == resolved.local {
-        return Some(AliasStep::Decline(format!(
-            "type alias '{}' is circular: circular aliases are outside the subset",
-            resolved.local
-        )));
-    }
-    if super::annotation_type(expanded).is_some()
-        || super::boundary_annotation_type(expanded).is_some()
-    {
-        return Some(AliasStep::Primitive(expanded.to_owned()));
-    }
-    if !is_bare_identifier(expanded) {
-        return Some(AliasStep::Decline(format!(
-            "type alias '{}' targets '{expanded}': \
-             non-identifier alias targets are outside the subset",
-            resolved.local
-        )));
-    }
-    if let Some(hit) = declaring_shape(declaring, expanded, relinked_symbol(ctx, target)) {
-        return Some(match hit {
-            Ok(shape) => AliasStep::Shape(shape),
-            Err(reason) => AliasStep::Decline(reason),
-        });
-    }
-    if declaring.aliases.iter().any(|shape| shape.name == expanded)
-        || declaring
-            .imports
-            .iter()
-            .any(|entry| entry.local == expanded)
-    {
-        return Some(AliasStep::Decline(format!(
-            "type alias '{}' targets '{expanded}': \
-             chained aliases are outside the subset (single-level expansion only)",
-            resolved.local
-        )));
-    }
-    Some(AliasStep::Decline(format!(
-        "type alias '{}' targets '{expanded}': \
-         no interface, enum, or primitive claims it",
-        resolved.local
-    )))
 }
 
 /// The decline reason when `target` is a type-only import whose resolution
@@ -748,7 +971,7 @@ struct AliasStepCtx<'a> {
     sink: &'a mut DeclSink,
 }
 
-/// Single-level alias expansion for one imported annotation (see
+/// Transitive alias expansion for one imported annotation (see
 /// `expand_imported_alias`): primitives rewrite the annotation spelling,
 /// interfaces/enums relink through the existing shape paths, and
 /// unexpandable targets decline and skip checking like failed type-only
@@ -873,7 +1096,7 @@ fn check_const_decls(ctx: &mut FileCtx<'_>) {
                             );
                             continue;
                         }
-                        // Single-level alias expansion: an imported
+                        // Transitive alias expansion: an imported
                         // annotation naming a declaring-file alias rewrites
                         // (primitives) or relinks (interfaces/enums) through
                         // the existing paths; unexpandable targets decline
