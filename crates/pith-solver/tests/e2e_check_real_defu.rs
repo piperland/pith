@@ -16,18 +16,19 @@
 use std::time::Instant;
 
 use pith_frontend::{
-    parse_module, CallArgKind as FrontendCallArgKind, EnumValueKind as FrontendEnumValueKind,
-    FunctionBodyFact, ImportedName as FrontendImportedName, InitKind as FrontendInitKind,
-    ParsedFile, ReturnKind as FrontendReturnKind, SingleReturnFact as FrontendReturn,
+    parse_module, CallArgKind as FrontendCallArgKind, EffectCallFact as FrontendEffectCall,
+    EnumValueKind as FrontendEnumValueKind, FunctionBodyFact, ImportedName as FrontendImportedName,
+    InitKind as FrontendInitKind, ParsedFile, ReturnKind as FrontendReturnKind,
+    SingleReturnFact as FrontendReturn,
 };
 use pith_ids::{FileId, NodeId, Span, SymbolId};
 use pith_queries::{QueryDb, QueryKey, QueryKind};
 use pith_solver::{
     multifile::{check_program, AliasShape, ImportUse, ProgramFile, ProgramReport},
-    CallArg, CallSite, ConstDecl, DeclKind, EnumMember, EnumMemberValue, EnumShape, FileReport,
-    FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, InitKind, InterfaceHeritage,
-    InterfaceMember, InterfaceShape, JoinedReturns, NamespaceShape, ObjectInit, ObjectMemberInit,
-    ObjectMemberKind,
+    CallArg, CallSite, ConstDecl, DeclKind, EffectCall, EnumMember, EnumMemberValue, EnumShape,
+    FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardEffectBody,
+    InitKind, InterfaceHeritage, InterfaceMember, InterfaceShape, JoinedReturns, NamespaceShape,
+    ObjectInit, ObjectMemberInit, ObjectMemberKind,
 };
 use pith_symbols::{
     multifile::{
@@ -260,6 +261,16 @@ fn map_joined(first: &FrontendReturn, second: &FrontendReturn) -> JoinedReturns 
     }
 }
 
+/// Maps one frontend effect call to the solver's (mechanical copy of the
+/// check-functions driver).
+fn map_effect_call(call: &FrontendEffectCall) -> EffectCall {
+    EffectCall {
+        receiver: call.receiver.clone(),
+        member: call.member.clone(),
+        arg_count: call.arg_count,
+    }
+}
+
 /// The function driver: a mechanical copy of the check-calls driver.
 fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDecl> {
     parsed
@@ -289,7 +300,9 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 // suite holds one, so outcomes are unchanged; faithful
                 // mapping lives in e2e_check_functions. P039 try/catch
                 // bodies, P041 counted-`for` bodies, P043 throw bodies,
-                // and P045 else-if chains decline the same way.
+                // and P045 else-if chains decline the same way. P049
+                // void-effect bodies map faithfully (destr's
+                // `warnKeyDropped` goes silent through them).
                 FunctionBodyFact::StraightBody { .. }
                 | FunctionBodyFact::TryCatch { .. }
                 | FunctionBodyFact::TryUnsupported { .. }
@@ -302,6 +315,18 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 | FunctionBodyFact::ElseIfChain { .. }
                 | FunctionBodyFact::ElseIfUnsupported { .. }
                 | FunctionBodyFact::Complex => FunctionBody::Complex,
+                FunctionBodyFact::EffectOnly { call } => {
+                    FunctionBody::EffectOnly(map_effect_call(call))
+                }
+                FunctionBodyFact::GuardEffect { call, tail } => {
+                    FunctionBody::GuardEffect(GuardEffectBody {
+                        call: map_effect_call(call),
+                        tail: tail.as_ref().map(map_function_return),
+                    })
+                }
+                FunctionBodyFact::EffectUnsupported { reason } => FunctionBody::EffectUnsupported {
+                    reason: reason.clone(),
+                },
             };
             FunctionDecl {
                 name,
@@ -732,7 +757,11 @@ fn destr_specs() -> [FileSpec<'static>; 1] {
 /// The executed verdict on the destr graph (PITH-P028).
 ///
 /// The v2 prescan projects `jsonParseTransform` declines (a bare return
-/// plus a two-statement branch, not `GuardReturn`) and 0/9 overall. A
+/// plus a two-statement branch, not `GuardReturn`) and 0/9 overall;
+/// PITH-P049 converts one note to silence (`warnKeyDropped` checks
+/// silently as a lone allowlist effect call while `jsonParseTransform`
+/// keeps declining on its non-allowlist guard-arm call), so the live
+/// projection is 0/8 overall. A
 /// decline at the target's span confirms the projection; a silent check
 /// or a diagnostic flips it. The test passes in every case and prints
 /// `DESTR_TARGET_VERDICT` so the remote run output is the evidence — a

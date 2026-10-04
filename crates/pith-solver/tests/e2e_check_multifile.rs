@@ -338,6 +338,9 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 | FunctionBodyFact::StraightThrow { .. }
                 | FunctionBodyFact::ElseIfChain { .. }
                 | FunctionBodyFact::ElseIfUnsupported { .. }
+                | FunctionBodyFact::EffectOnly { .. }
+                | FunctionBodyFact::GuardEffect { .. }
+                | FunctionBodyFact::EffectUnsupported { .. }
                 | FunctionBodyFact::Complex => FunctionBody::Complex,
             };
             FunctionDecl {

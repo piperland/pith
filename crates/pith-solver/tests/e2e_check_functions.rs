@@ -71,6 +71,16 @@
 //! diverges by design: `throw-complex-declined` (the oracle is clean where
 //! the subset declines — pins the clean baseline plus one unsupported
 //! note).
+//! Void-effect bodies admit silently with zero positions while malformed
+//! effect shapes decline distinctly (P049): `void-effect-clean` (lone
+//! `console.warn` under `: void`) and `void-effect-guard-clean` (guard arm
+//! plus bare tail) are silent with zero notes; `void-effect-guard-wrong`
+//! matches its oracle `TS2322` on the tail (the arm emits nothing). Three
+//! more fixtures diverge by design (the oracle is clean where the subset
+//! declines — each pins the clean baseline plus one unsupported note with
+//! its distinct reason): `void-effect-guard-two-calls`,
+//! `void-effect-guard-nonallowlist`, and
+//! `void-effect-guard-valued-return`.
 //! Else-if chain bodies check per branch in source order (P045):
 //! `elseif-clean` is silent with zero notes; `elseif-branch-wrong` matches
 //! its oracle `TS2322`; `elseif-two-wrong` matches twice. Three more
@@ -97,17 +107,17 @@
 
 use pith_frontend::{
     parse_module, CastFact as FrontendCastFact, CastKind as FrontendCastKind,
-    CastOperandKind as FrontendCastOperandKind, FunctionBodyFact, InitKind as FrontendInitKind,
-    InnerDeclFact as FrontendInnerDecl, ParsedFile, ReturnKind as FrontendReturnKind,
-    SingleReturnFact as FrontendReturn,
+    CastOperandKind as FrontendCastOperandKind, EffectCallFact as FrontendEffectCall,
+    FunctionBodyFact, InitKind as FrontendInitKind, InnerDeclFact as FrontendInnerDecl, ParsedFile,
+    ReturnKind as FrontendReturnKind, SingleReturnFact as FrontendReturn,
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_functions, CastInput, CastKind, CountedForBody, DeclKind, ElseIfChainBody, FileReport,
-    FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardThrowBody, InitKind, InnerDecl,
-    JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind, StraightBody, StraightThrowBody,
-    SwitchBody, TryCatchBody,
+    check_functions, CastInput, CastKind, CountedForBody, DeclKind, EffectCall, ElseIfChainBody,
+    FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardEffectBody,
+    GuardThrowBody, InitKind, InnerDecl, JoinedReturns, ObjectInit, ObjectMemberInit,
+    ObjectMemberKind, StraightBody, StraightThrowBody, SwitchBody, TryCatchBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -208,6 +218,16 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
         // adapter emits them.
         init_array: None,
         cast: ret.cast.as_ref().map(map_cast),
+    }
+}
+
+/// Maps one frontend effect call to the solver's: names cross as facts
+/// (never sliced text), the count copies over; the solver allowlists.
+fn map_effect_call(call: &FrontendEffectCall) -> EffectCall {
+    EffectCall {
+        receiver: call.receiver.clone(),
+        member: call.member.clone(),
+        arg_count: call.arg_count,
     }
 }
 
@@ -511,6 +531,18 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> V
                 FunctionBodyFact::GuardThrow { tail } => FunctionBody::GuardThrow(GuardThrowBody {
                     tail: map_function_return(tail),
                 }),
+                FunctionBodyFact::EffectOnly { call } => {
+                    FunctionBody::EffectOnly(map_effect_call(call))
+                }
+                FunctionBodyFact::GuardEffect { call, tail } => {
+                    FunctionBody::GuardEffect(GuardEffectBody {
+                        call: map_effect_call(call),
+                        tail: tail.as_ref().map(map_function_return),
+                    })
+                }
+                FunctionBodyFact::EffectUnsupported { reason } => FunctionBody::EffectUnsupported {
+                    reason: reason.clone(),
+                },
                 FunctionBodyFact::StraightThrow { leading, tail } => FunctionBody::StraightThrow(
                     map_straight_throw(parsed, binder, leading, tail.as_ref(), source),
                 ),
@@ -852,6 +884,42 @@ fixture_test!(
     "throw-only.ts",
     "throw-only.expected.txt",
     0
+);
+fixture_test!(
+    void_effect_clean_is_silent,
+    "void-effect-clean.ts",
+    "void-effect-clean.expected.txt",
+    0
+);
+fixture_test!(
+    void_effect_guard_clean_is_silent,
+    "void-effect-guard-clean.ts",
+    "void-effect-guard-clean.expected.txt",
+    0
+);
+fixture_test!(
+    void_effect_guard_wrong_matches_ts2322,
+    "void-effect-guard-wrong.ts",
+    "void-effect-guard-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    void_effect_guard_two_calls_is_unsupported,
+    "void-effect-guard-two-calls.ts",
+    "void-effect-guard-two-calls.expected.txt",
+    1
+);
+fixture_test!(
+    void_effect_guard_nonallowlist_is_unsupported,
+    "void-effect-guard-nonallowlist.ts",
+    "void-effect-guard-nonallowlist.expected.txt",
+    1
+);
+fixture_test!(
+    void_effect_guard_valued_return_is_unsupported,
+    "void-effect-guard-valued-return.ts",
+    "void-effect-guard-valued-return.expected.txt",
+    1
 );
 fixture_test!(
     elseif_clean_is_silent,

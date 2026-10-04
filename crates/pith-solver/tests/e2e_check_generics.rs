@@ -231,6 +231,9 @@ fn generics_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<GenericDecl>
                 | FunctionBodyFact::StraightThrow { .. }
                 | FunctionBodyFact::ElseIfChain { .. }
                 | FunctionBodyFact::ElseIfUnsupported { .. }
+                | FunctionBodyFact::EffectOnly { .. }
+                | FunctionBodyFact::GuardEffect { .. }
+                | FunctionBodyFact::EffectUnsupported { .. }
                 | FunctionBodyFact::Complex => FunctionBody::Complex,
             };
             GenericDecl {
