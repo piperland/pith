@@ -256,6 +256,38 @@
 //!   `return`) stays [`FunctionBody::Complex`]: two paths, no join (the
 //!   P023 `if/else`-plus-tail precedent — clean in tsc, probed).
 //!
+//! Named (interface/alias) parameter annotations (P046, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p046-probes/`):
+//!
+//! - `function f(p: Point): number { return 1; }` is clean in tsc whether
+//!   `p` is used or not (probes `a`, `c`, `g` — the last through a skipped
+//!   unannotated inner declarator, the P031 inference rule), and a wrong
+//!   literal body still reports one `TS2322` (probe `b`). The declaration
+//!   checks with the param OPAQUE: the annotated gate already admits every
+//!   annotated param, and no value-type facts about the param flow anywhere
+//!   (H-002 — opaque means never inventing param value types).
+//! - Body positions touching the param ride the EXISTING gates, never a new
+//!   verdict: `return p` declines whole-decl through the non-literal
+//!   position-naming gate in [`function_shape`], while `const y: T = p`
+//!   declines per-position through [`check_one`]'s identifier gate (the P031
+//!   `t3` precedent — pinned oracle-error divergences, never forced
+//!   verdicts).
+//! - Call-site args against opaque (known interface/alias) params decline
+//!   DISTINCTLY per site (`parameter type 'Point' for 'p' is an opaque named
+//!   type: outside the subset`, at the callee): even a matching object arg
+//!   (`show({ x: 1 })`, clean in tsc — probe `d`, a pinned oracle-clean
+//!   divergence) cannot verify without value facts, so arity never runs
+//!   (the uncheckable-shape precedent). Wrong-shape args decline the same
+//!   way — never a forced `TS2345` (tsc spells those `TS2322` at the
+//!   argument, probed `e`).
+//! - Still decline exactly as before (never the opaque reason): generic `T`
+//!   params (probe `f`, clean in tsc), union annotations (probe `h`), and
+//!   complex shapes (qualified, indexed, applied, and object spellings).
+//!   The scope lookup runs after the union/primitive gates and only exact
+//!   bare-name matches hit it. Class constructors and multifile calls
+//!   thread [`NamedTypeScope::EMPTY`] (pinned gaps: those paths keep
+//!   today's verdicts).
+//!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
 //! corpus: tsc accepts `undefined` for `void` while the shared annotation
@@ -1059,6 +1091,9 @@ pub struct ConstDecl {
 /// `annotation` (arg-type checks) plus `optional` and `is_rest` (range
 /// arity: `min` counts the required prefix, `max` the fixed total, rest is
 /// `min`-or-more with the `T[]` element type checking the extras).
+/// Annotations naming a known interface/alias (see [`NamedTypeScope`])
+/// classify opaque at call sites: the declaration still checks, but args
+/// against the param decline distinctly instead of checking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionParam {
     /// Parameter name as written.
@@ -2625,6 +2660,29 @@ pub struct CallSite {
     pub args: Vec<CallArg>,
 }
 
+/// Known named-type names for one call-checking run, bundled so the
+/// per-call helpers stay lean (pedantic arity discipline, mirroring
+/// [`LocalAliasScope`]).
+///
+/// `names` lists the interface and alias names declared in the file
+/// (driver-collected from the adapter's interface/alias facts — opaque means
+/// only the NAME is ever read: no member or target facts flow, so args
+/// against these params decline distinctly instead of checking). Unknown,
+/// generic (`T`), union, and complex annotations never match and keep
+/// today's verdicts by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NamedTypeScope<'a> {
+    /// Interface and alias names in scope, as written.
+    pub names: &'a [&'a str],
+}
+
+impl NamedTypeScope<'static> {
+    /// Empty scope for paths that thread no named-type tables (plain
+    /// [`check_calls`], class constructors, multifile): named annotations
+    /// there keep today's verdicts.
+    pub const EMPTY: Self = Self { names: &[] };
+}
+
 /// Checks every direct call site in `calls` against the function
 /// declarations in `decls` for `file`, returning the sorted [`FileReport`].
 ///
@@ -2665,13 +2723,33 @@ pub fn check_calls(
     calls: &[CallSite],
     binder: &Binder,
 ) -> FileReport {
+    check_calls_with_named_types(file, decls, calls, binder, &NamedTypeScope::EMPTY)
+}
+
+/// Checks every direct call site in `calls` against the function
+/// declarations in `decls` for `file`, with the file's named types in
+/// `scope`, returning the sorted [`FileReport`].
+///
+/// Same per-call outcomes as [`check_calls`], except parameters whose
+/// annotation exactly names a [`NamedTypeScope`] entry classify opaque:
+/// the call declines distinctly instead of checking (see the module-level
+/// named-parameter rules). Unknown, generic, union, and complex
+/// annotations never match the scope and keep today's verdicts.
+#[must_use]
+pub fn check_calls_with_named_types(
+    file: FileId,
+    decls: &[FunctionDecl],
+    calls: &[CallSite],
+    binder: &Binder,
+    scope: &NamedTypeScope<'_>,
+) -> FileReport {
     let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, decl) in decls.iter().enumerate() {
         by_name.entry(decl.name.as_str()).or_default().push(index);
     }
     let mut report = FileReport::default();
     for call in calls {
-        check_one_call(file, decls, &by_name, call, binder, &mut report);
+        check_one_call(file, decls, &by_name, call, binder, scope, &mut report);
     }
     sort_report(&mut report);
     report
@@ -2687,6 +2765,7 @@ fn check_one_call(
     by_name: &HashMap<&str, Vec<usize>>,
     call: &CallSite,
     binder: &Binder,
+    scope: &NamedTypeScope<'_>,
     report: &mut FileReport,
 ) {
     let candidates = by_name.get(call.callee.as_str());
@@ -2715,12 +2794,13 @@ fn check_one_call(
             file,
             decls,
             call,
+            scope: *scope,
             report,
         };
         check_overload_call(&mut run, candidates);
         return;
     }
-    check_single_call(file, &decls[candidates[0]], call, report);
+    check_single_call(file, &decls[candidates[0]], call, scope, report);
 }
 
 /// Checks one call site against exactly one declaration, pushing into
@@ -2730,8 +2810,14 @@ fn check_one_call(
 /// span), then at most one diagnostic: arity (`PITH2554`, or `PITH2555`
 /// below a rest minimum) beats arg types (`PITH2345`), and only the first
 /// mismatched argument reports (all probed on tsc 7.0.2).
-fn check_single_call(file: FileId, decl: &FunctionDecl, call: &CallSite, report: &mut FileReport) {
-    let Some(resolved) = call_params(call, decl, file, report) else {
+fn check_single_call(
+    file: FileId,
+    decl: &FunctionDecl,
+    call: &CallSite,
+    scope: &NamedTypeScope<'_>,
+    report: &mut FileReport,
+) {
+    let Some(resolved) = call_params(call, decl, file, scope, report) else {
         return;
     };
     let target = owned_target(resolved);
@@ -2978,9 +3064,10 @@ fn call_params(
     call: &CallSite,
     decl: &FunctionDecl,
     file: FileId,
+    scope: &NamedTypeScope<'_>,
     report: &mut FileReport,
 ) -> Option<ResolvedCallParams> {
-    match resolve_params(decl) {
+    match resolve_params(decl, scope) {
         Ok(resolved) => Some(resolved),
         Err(reason) => {
             decline(call, file, report, &reason);
@@ -2998,8 +3085,12 @@ fn call_params(
 /// then the type text): the first failure wins, so reasons stay single and
 /// deterministic. Overload resolution reuses this per signature, so generic
 /// signatures gate separately (see [`check_overload_call`]) rather than
-/// here.
-fn resolve_params(decl: &FunctionDecl) -> Result<ResolvedCallParams, String> {
+/// here. Parameters naming a [`NamedTypeScope`] entry classify opaque and
+/// decline distinctly; every other uncheckable text keeps its old reason.
+fn resolve_params(
+    decl: &FunctionDecl,
+    scope: &NamedTypeScope<'_>,
+) -> Result<ResolvedCallParams, String> {
     if decl.params_complex {
         return Err("non-identifier parameter pattern is outside the subset".to_owned());
     }
@@ -3037,7 +3128,7 @@ fn resolve_params(decl: &FunctionDecl) -> Result<ResolvedCallParams, String> {
                 param.name
             ));
         }
-        match classify_param(param) {
+        match classify_param(param, scope) {
             Ok((expected, display)) => fixed.push((expected, display, param.optional)),
             Err(reason) => return Err(reason),
         }
@@ -3111,6 +3202,7 @@ struct OverloadRun<'a> {
     file: FileId,
     decls: &'a [FunctionDecl],
     call: &'a CallSite,
+    scope: NamedTypeScope<'a>,
     report: &'a mut FileReport,
 }
 
@@ -3177,7 +3269,7 @@ fn check_overload_call(run: &mut OverloadRun<'_>, candidates: &[usize]) {
             );
             continue;
         }
-        match resolve_params(decl) {
+        match resolve_params(decl, &run.scope) {
             Ok(resolved) => checkable.push(OverloadCandidate { resolved }),
             Err(reason) => excluded.push(reason),
         }
@@ -3583,8 +3675,14 @@ fn classify_rest_element(param: &FunctionParam) -> Result<(Option<TypeId>, Strin
 /// `any` and `unknown` parameters accept every literal (probed tsc 7.0.2:
 /// both directions silent), so they classify accept-all (`None`, the
 /// non-literal precedent); `never` keeps declining (unprobed message shape
-/// — never forced).
-fn classify_param(param: &FunctionParam) -> Result<(Option<TypeId>, String), String> {
+/// — never forced). Bare names matching the [`NamedTypeScope`] classify
+/// opaque and decline distinctly (the P046 named-parameter rule — the
+/// subset has no value facts for named types, so args never check);
+/// everything else keeps its legacy decline.
+fn classify_param(
+    param: &FunctionParam,
+    scope: &NamedTypeScope<'_>,
+) -> Result<(Option<TypeId>, String), String> {
     let text = param.annotation.as_deref().map_or("", str::trim);
     if text.contains('|') {
         return Err(format!(
@@ -3597,15 +3695,19 @@ fn classify_param(param: &FunctionParam) -> Result<(Option<TypeId>, String), Str
     ) {
         return Ok((None, text.to_owned()));
     }
-    annotation_type(text).map_or_else(
-        || {
-            Err(format!(
-                "parameter type '{text}' for '{}' is outside the subset",
-                param.name
-            ))
-        },
-        |expected| Ok((Some(expected), text.to_owned())),
-    )
+    if let Some(expected) = annotation_type(text) {
+        return Ok((Some(expected), text.to_owned()));
+    }
+    if scope.names.contains(&text) {
+        return Err(format!(
+            "parameter type '{text}' for '{}' is an opaque named type: outside the subset",
+            param.name
+        ));
+    }
+    Err(format!(
+        "parameter type '{text}' for '{}' is outside the subset",
+        param.name
+    ))
 }
 
 /// One `JSON.parse(...)`-shaped member call site to check.
@@ -4048,7 +4150,13 @@ pub fn check_classes(
             args: site.args.clone(),
         };
         check_one_call(
-            run.file, &run.synth, &by_name, &call, run.binder, run.report,
+            run.file,
+            &run.synth,
+            &by_name,
+            &call,
+            run.binder,
+            &NamedTypeScope::EMPTY,
+            run.report,
         );
     }
     sort_report(run.report);
@@ -10457,6 +10565,185 @@ mod tests {
     }
 
     #[test]
+    fn named_param_call_declines_distinctly() {
+        // Probed tsc 7.0.2 (P046 `d`): `show({ x: 1 })` against `(p: Point)`
+        // is clean; the subset holds no value facts for named types, so the
+        // call declines distinctly instead of checking — arity never runs.
+        let binder = Binder::new();
+        let scope = NamedTypeScope { names: &["Point"] };
+        let decls = [callable("show", vec![("p", "Point")])];
+        let calls = [call(
+            "show",
+            span(0, 4),
+            vec![(InitKind::Number, span(5, 6))],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("opaque named type"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        // Arity never runs past the opaque gate: zero arguments decline the
+        // same way instead of diagnosing `PITH2554`.
+        let missing = [call("show", span(0, 4), vec![])];
+        let report = check_calls_with_named_types(FILE, &decls, &missing, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn named_param_without_scope_keeps_old_reason() {
+        // The empty scope is exactly today's verdict: `Point` declines with
+        // the legacy wording, never the opaque reason.
+        let binder = Binder::new();
+        let decls = [callable("show", vec![("p", "Point")])];
+        let calls = [call(
+            "show",
+            span(0, 4),
+            vec![(InitKind::Number, span(5, 6))],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "call to 'show': parameter type 'Point' for 'p' is outside the subset"
+        );
+    }
+
+    #[test]
+    fn generic_union_and_complex_params_decline_as_before() {
+        // P046 regression guard: with a populated scope, `T`, unions, and
+        // qualified spellings never take the opaque reason.
+        let binder = Binder::new();
+        let scope = NamedTypeScope { names: &["Point"] };
+        let decls = [
+            callable("generic", vec![("x", "T")]),
+            callable("union", vec![("x", "number | string")]),
+            callable("qualified", vec![("x", "NS.Point")]),
+        ];
+        let calls = [
+            call("generic", span(0, 7), vec![(InitKind::Number, span(8, 9))]),
+            call("union", span(0, 5), vec![(InitKind::Number, span(6, 7))]),
+            call(
+                "qualified",
+                span(0, 9),
+                vec![(InitKind::Number, span(10, 11))],
+            ),
+        ];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 3);
+        let reasons: Vec<&str> = report
+            .unsupported
+            .iter()
+            .map(|note| note.reason.as_str())
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("parameter type 'T'")),
+            "reasons: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("union parameter type")),
+            "reasons: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("parameter type 'NS.Point'")),
+            "reasons: {reasons:?}"
+        );
+        for reason in reasons {
+            assert!(!reason.contains("opaque"), "reason: {reason}");
+        }
+    }
+
+    #[test]
+    fn overload_named_signature_excluded_distinctly() {
+        // The P044 exclusion path shares `resolve_params`: the named
+        // signature records the opaque reason, and with no admitting
+        // signature the call declines (never a forced `TS2769`).
+        let binder = Binder::new();
+        let scope = NamedTypeScope { names: &["Point"] };
+        let decls = [
+            signature("show", "p", "Point"),
+            signature("show", "flag", "boolean"),
+        ];
+        let calls = [call(
+            "show",
+            span(0, 4),
+            vec![(InitKind::Number, span(5, 6))],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("opaque named type"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn named_param_declaration_checks() {
+        // P046 definition side: an interface-named param admits (no
+        // whole-decl decline) and the literal body checks normally.
+        let binder = Binder::new();
+        let decls = [named_function(single(InitKind::Number))];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn named_param_wrong_body_still_diagnoses() {
+        // Probed tsc 7.0.2 (P046 `b`): the wrong literal body reports.
+        let binder = Binder::new();
+        let decls = [named_function(single(InitKind::String))];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn named_param_touch_rides_the_existing_nonliteral_gate() {
+        // No new verdict: `return p` declines whole-decl through the
+        // position-naming gate, exactly like any non-literal return.
+        let binder = Binder::new();
+        let decls = [named_function(single(InitKind::NonLiteral))];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("non-literal return"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
     fn declined_cast_argument_reports_both_families() {
         // Probed tsc 7.0.2: `sn(("hello" as number))` against `(x: string)`
         // reports `TS2345` plus `TS2352`.
@@ -11558,6 +11845,52 @@ mod tests {
             has_type_params: false,
             return_annotation: Some("number".to_owned()),
             body: single(InitKind::Number),
+        }
+    }
+
+    /// An overload signature (no body) with one annotated parameter, for
+    /// overload-resolution tests.
+    fn signature(name: &str, param: &str, ty: &str) -> FunctionDecl {
+        FunctionDecl {
+            name: name.to_owned(),
+            span: span(0, 10),
+            scope: 0,
+            symbol: None,
+            params: vec![FunctionParam {
+                name: param.to_owned(),
+                annotated: true,
+                annotation: Some(ty.to_owned()),
+                optional: false,
+                is_rest: false,
+            }],
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("number".to_owned()),
+            body: FunctionBody::NoBody { declared: false },
+        }
+    }
+
+    /// A `function locate(p: Point): number` declaration with one named
+    /// param, for opaque-param tests: the body varies per test.
+    fn named_function(body: FunctionBody) -> FunctionDecl {
+        FunctionDecl {
+            name: "locate".to_owned(),
+            span: span(0, 20),
+            scope: 0,
+            symbol: None,
+            params: vec![FunctionParam {
+                name: "p".to_owned(),
+                annotated: true,
+                annotation: Some("Point".to_owned()),
+                optional: false,
+                is_rest: false,
+            }],
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("number".to_owned()),
+            body,
         }
     }
 
