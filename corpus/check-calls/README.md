@@ -35,17 +35,27 @@ tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs` (normalized
 | member-lib-declined.ts | clean | 4x UNSUPPORTED (range/overload/variadic lib shapes) |
 | named-param-call-declined.ts | 1x TS2345 (primitive control) | 1x PITH2345 + 1 UNSUPPORTED (opaque named param declines distinctly; oracle clean there — pinned divergence) |
 | generic-param-declined.ts | clean | silent + 1 UNSUPPORTED (generic `T` declines exactly as before — pinned divergence) |
+| named-structural-clean.ts | clean | silent (object arg checks member-wise against the local shape) |
+| named-structural-wrong.ts | 3x TS2322 (1 + 2, one per wrong member) | 3x PITH2322 at the argument spans |
+| named-structural-excess.ts | 1x TS2353 (interface-name spelling) | 1x PITH2353 at the argument span |
+| named-structural-missing.ts | 1x TS2741 + 1x TS2739 | same, both spelling the interface name |
+| named-structural-imported-declined.ts (+ `-dep.ts` support file, oracle-clean) | 1x TS2322 | 1 UNSUPPORTED (imported name claims no local shape — legacy decline; pinned divergence) |
+| named-structural-methoded-declined.ts | clean | 1 UNSUPPORTED (methoded shape declines in the shared comparison; pinned divergence) |
+| named-structural-nonliteral.ts | clean | 2 UNSUPPORTED (identifier arg declines distinctly, call result keeps the opaque decline; pinned divergences) |
+| named-alias-call-declined.ts | 1x TS2322 | 1 UNSUPPORTED (no alias tables at call sites — opaque decline; pinned divergence) |
 
-Differential: 16/16 match on the checkable direct-call subset (6
-silent/clean + 10 diagnostic groups); 5/5 divergences pinned explicitly
+Differential: 20/20 match on the checkable direct-call subset (7
+silent/clean + 13 diagnostic groups); 9/9 divergences pinned explicitly
 (oracle errors while the solver declines or skips, or oracle clean while
 the solver declines) — unresolved-callee silence (tracked once, never
 double-diagnosed), required-after-optional shapes, generic overload
-signatures, opaque named-param calls, and generic `T` calls are
-acknowledged non-goals, never silent gaps. PITH-P044 converted the old
-overload decline into matches (any-match resolution, union arities, and
-the gap spelling). PITH-P037 converted the old range/variadic declines
-into matches.
+signatures, opaque named-param calls, generic `T` calls, imported-shape
+calls, methoded-shape calls, non-literal shape args, and alias-named
+calls are acknowledged non-goals, never silent gaps. PITH-P044 converted
+the old overload decline into matches (any-match resolution, union
+arities, and the gap spelling). PITH-P037 converted the old
+range/variadic declines into matches. PITH-P062 converted the local-shape
+object-arg decline into matches (shared P017 comparison).
 
 Member differential: 3/3 match on the checkable opaque subset (1 silent +
 2 diagnostic groups); 3/3 divergences pinned explicitly —
@@ -65,6 +75,34 @@ before (never the opaque reason). The call driver collects the scope
 from the adapter's interface/alias facts; class constructors and
 multifile calls thread an empty scope (pinned gaps — those paths keep
 today's verdicts). Probes in `.agent/scratch/p046-probes/`.
+
+## P062 structural admission for locally-shaped named params
+
+Object-literal args against params naming a LOCAL interface shape check
+member-wise through the shared P017 comparison (interface-name spelling,
+wrong > excess > missing priority intact): `named-structural-clean`,
+`named-structural-wrong`, `named-structural-excess`, and
+`named-structural-missing` match their oracle families with zero
+unsupported. The never-runs rule is gone for admitted shapes (arity runs
+first, diagnostics stop at the first mismatch in argument order), while
+everything else keeps declining distinctly: imported names
+(`named-structural-imported-declined`, legacy decline — the
+`-dep.ts` support file is oracle-clean), methoded shapes
+(`named-structural-methoded-declined`, complex-member decline),
+non-literal args (`named-structural-nonliteral`: identifiers
+decline distinctly, call results keep the opaque decline), and
+alias-named params (`named-alias-call-declined`, opaque decline — call
+sites thread no alias tables). Object-literal members ride per-fixture
+hand-fed driver tables (the adapter emits no call-argument member facts).
+Probes in `.agent/scratch/p062-probes/`.
+
+Structural differential: 4/4 match on the admitted subset (1 silent +
+3 diagnostic groups); 4/4 divergences pinned explicitly —
+`named-structural-imported-declined` (oracle `TS2322`, solver one
+unsupported), `named-structural-methoded-declined` (oracle clean, solver
+one unsupported), `named-structural-nonliteral` (oracle clean,
+solver two unsupported), `named-alias-call-declined` (oracle `TS2322`,
+solver one unsupported).
 
 Probe rules (tsc 7.0.2, recorded in `pith-solver` docs): one family per
 call site, arity beats arg types, only the first mismatched argument

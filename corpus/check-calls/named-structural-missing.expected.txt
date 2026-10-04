@@ -1,0 +1,2 @@
+named-structural-missing.ts:TS2741: Property 'y' is missing in type '{ x: number; }' but required in type 'Point'.
+named-structural-missing.ts:TS2739: Type '{ a: number; }' is missing the following properties from type 'Big': b, c
