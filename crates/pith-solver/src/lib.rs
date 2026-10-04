@@ -301,6 +301,58 @@
 //!   historical path (notably `return p`'s whole-decl non-literal decline,
 //!   and the used catch binding's arm gate).
 //!
+//! Conditional expressions (P051, probed on tsc 7.0.2 `--strict
+//! --pretty false`; probes in `.agent/scratch/p051-probes/`):
+//!
+//! - Positions split by syntax: a ternary in RETURN position checks PER ARM
+//!   at arm spans with plain widened spellings (probe `i`/`o`: a wrong arm
+//!   reports one `TS2322` at its own arm, both-wrong reports twice), while
+//!   a ternary in CONST position diagnoses at most ONCE at the declaration
+//!   with the UNION of the arm types (probes `b`–`d`: wrong-then and
+//!   wrong-else both spell `Type 'string | number'`, both-wrong spells the
+//!   deduplicated `Type 'string'`). Each admitted arm delegates through its
+//!   own synthetic [`ConstDecl`] with its own occurrence node, exactly like
+//!   the P023 joins (no fixpoint, single pass); any condition qualifies —
+//!   call conditions (probe `j`), member tests, and plain identifiers all
+//!   admit with no condition facts flowing (conditions never narrow).
+//! - The const join spells widened arm kinds rank-ordered (`string` before
+//!   `number` before `boolean` before `null` before `undefined`: probes `m`
+//!   `s`), deduplicated (probes `d`, `n` — an identifier beside a
+//!   same-kind literal collapses to one name). It composes across annotation
+//!   shapes exactly like tsc's first line: inline objects spell the
+//!   expansion (probe `s11`), interfaces the bare name (`s12`), arrays the
+//!   suffix form (`s14`); primitive, boundary, and `never` annotations
+//!   spell the annotation verbatim. Agreeing arms (both kinds equal, or a
+//!   single surviving arm) skip the join and check as one literal through
+//!   the existing paths, so verdicts match by construction.
+//! - Identifier arms resolve one level through the P048 table (probes `h`,
+//!   `n`): annotated sources check widened, unannotated literal sources
+//!   check as their kind, `unknown` checks as `unknown` (absorbing the
+//!   join spelling — probe `p`), `never` vanishes from the union while the
+//!   other arm still checks (probes `r1`/`r2`), and `any` silences the whole
+//!   const ternary (probe `p` — except under `never`, which diagnoses
+//!   `any`, probe `an`). Resolution declines ride through with their P048
+//!   texts (first arm wins); unresolvable names keep the historical
+//!   non-literal decline.
+//! - Declines, each with a distinct reason, never a forced verdict and
+//!   never a partial one: nested ternaries (either arm, either position),
+//!   non-identifier non-literal arms (calls, objects, arrays, assertions —
+//!   probes `g`, `k`, `q`), literal/identifier mixes of different kinds
+//!   (the oracle retains fresh spellings like `number | "oops"` — probes
+//!   `h`, `n` — which widened-only spellings refuse to fake, the P034
+//!   discipline), and differing arms against enum annotations (the oracle
+//!   spells fresh values like `"s" | 1`, probe `s13`). Nested-wrong shapes
+//!   diverge oracle-error (the oracle still checks) while call-armed shapes
+//!   diverge oracle-clean (both recorded, never silent).
+//! - Return arms diagnose at arm spans through dotted synthetic names (the
+//!   P020 unresolvable-name precedent: `f.then` never binds, so positions
+//!   fall back to their arm spans); every other return position keeps its
+//!   declaration span. Ternaries nested under joins, straights, `try`,
+//!   `switch`, loops, chains, and guard-effect tails keep their historical
+//!   whole-declaration non-literal decline (only top-level single-return
+//!   ternaries expand); leading-declarator ternaries likewise decline
+//!   per-position through the existing gate.
+//!
 //! Else-if chains (P045, probed on tsc 7.0.2 `--strict --pretty false`;
 //! probes in `.agent/scratch/p045-probes/`):
 //!
@@ -1167,6 +1219,50 @@ impl ArrayMemberKind {
     }
 }
 
+/// One `c ? A : B` arm: its literal kind plus its own span.
+///
+/// Driver-mapped from the adapter's [`TernaryArmFact`](pith_frontend::TernaryArmFact)
+/// (mechanical field copies plus the P048 seam below). Only primitive
+/// literal arms and bare-identifier arms check: object, array, assertion,
+/// and every other non-literal shape declines distinctly solver-side (never
+/// a forced verdict), as do nested ternaries (see `is_conditional`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TernaryArm {
+    /// Literal kind of the arm expression (`NonLiteral` for identifiers and
+    /// every other non-literal shape; object/array arms never carry member
+    /// facts, so they decline like any other non-literal).
+    pub kind: InitKind,
+    /// Span of the arm expression (return-position diagnostics anchor here
+    /// through dotted synthetic names; const-position diagnostics anchor at
+    /// the declaration instead, mirroring the oracle).
+    pub span: Span,
+    /// Referenced name when the arm is a bare identifier (`None`
+    /// otherwise). Driver-sliced from the arm fact span (bare identifiers
+    /// only — anything else feeds `None`) until the adapter emits
+    /// identifier facts — the same seam as [`ConstDecl::init_ident`].
+    /// [`check_one`] resolves it one level through the [`Binder`]; the
+    /// P048 reason family rides through unchanged.
+    pub init_ident: Option<String>,
+    /// Whether the parentheses-peeled arm is itself a conditional: nested
+    /// ternaries decline the whole declaration with a distinct reason
+    /// (never a partial verdict over the other arm).
+    pub is_conditional: bool,
+}
+
+/// One `c ? A : B` initializer/return: the two arms in source order.
+///
+/// The condition never narrows (any condition qualifies — a call, a member
+/// test, or a plain identifier all admit), so it carries no facts and needs
+/// no span. Arm order is source order (`then` first) everywhere diagnostics
+/// or reasons name arms, so repeated runs agree byte-for-byte.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TernaryInit {
+    /// The `then` (`?`) arm.
+    pub then_arm: TernaryArm,
+    /// The `else` (`:`) arm.
+    pub else_arm: TernaryArm,
+}
+
 /// One `const`/`let` declarator to check.
 ///
 /// `annotation`/`init`/`init_object` are hand-fed stand-ins for the missing
@@ -1213,6 +1309,14 @@ pub struct ConstDecl {
     /// from the adapter's cast facts; [`check_one`] evaluates the
     /// admit/decline rule and checks the result through the existing path.
     pub cast: Option<CastInput>,
+    /// Ternary arms when the initializer is `c ? A : B` (`None`
+    /// otherwise). Driver-mapped from the adapter's ternary facts (arm
+    /// kinds plus arm spans plus the nested flag; bare-identifier arm
+    /// names ride the same driver-sliced seam as `init_ident`). Present
+    /// only with a `NonLiteral` (or missing) `init` and no object, array,
+    /// or cast shape — anything else is contradictory input and becomes
+    /// an [`UnsupportedDecl`].
+    pub init_ternary: Option<TernaryInit>,
 }
 
 /// One function parameter: name + whether it carries a type annotation.
@@ -1271,6 +1375,15 @@ pub struct FunctionReturn {
     /// angle assertion (`None` otherwise). Rides the synthetic [`ConstDecl`]
     /// into [`check_one`], so returns share the const cast rule exactly.
     pub cast: Option<CastInput>,
+    /// Ternary arms when the return is `c ? A : B` (`None` otherwise).
+    /// Driver-mapped from the adapter's ternary facts exactly like
+    /// [`ConstDecl::init_ternary`]. A ternary return expands into two arm
+    /// positions (see [`FunctionBody::SingleReturn`]) that check
+    /// independently through the same synthetic delegation as joins — a
+    /// wrong arm diagnoses at its own span while a clean arm stays silent,
+    /// so both-wrong reports twice. Present only with a `NonLiteral`
+    /// (or missing) `kind` and no object, array, or cast shape.
+    pub ternary: Option<TernaryInit>,
 }
 
 /// One leading `const`/`let` declarator inside a straight-line body.
@@ -1354,7 +1467,14 @@ pub struct StraightBody {
 /// rest decline to [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
-    /// Exactly one statement, `return <expr>;` with an argument.
+    /// Exactly one statement, `return <expr>;` with an argument. A ternary
+    /// `c ? A : B` return expands into two arm positions (P051): each arm
+    /// checks independently through its own synthetic [`ConstDecl`] with
+    /// its own occurrence node (dotted synthetic names fall back to the
+    /// arm spans, so a wrong arm diagnoses at its own span while a clean
+    /// arm stays silent — both-wrong reports twice, probed tsc 7.0.2).
+    /// Nested ternaries and non-identifier non-literal arms decline the
+    /// whole declaration with distinct reasons (never a partial verdict).
     SingleReturn(FunctionReturn),
     /// Exactly two statements, `return <expr>;` twice: tsc checks both
     /// (unreachable or not — probed 7.0.2, see the module probe record).
@@ -1379,7 +1499,7 @@ pub enum FunctionBody {
     /// (probed 7.0.2 P039). Each position delegates through its own
     /// synthetic [`ConstDecl`] with its own occurrence node, exactly like
     /// the P023 joins (no fixpoint, single pass).
-    TryCatch(TryCatchBody),
+    TryCatch(Box<TryCatchBody>),
     /// Exactly one statement, `switch (x)` with literal case labels, each
     /// case (plus the optional default) exactly one `return <expr>;`: tsc
     /// checks each position independently (probed 7.0.2 P040). Each position
@@ -2358,8 +2478,13 @@ struct IdentParam {
 enum PropInit {
     /// A classifiable kind: literals plus admitted-cast results.
     Literal(InitKind),
-    /// An accept-all cast result (`any`/`never`): uses stay silent.
-    Silent,
+    /// An `any` source (or an `any`-result cast): uses stay silent, and a
+    /// ternary arm typed `any` silences the whole ternary (absorption).
+    SilentAny,
+    /// A `never` source (or a `never`-result cast): single uses stay
+    /// silent, but a ternary arm typed `never` only vanishes from the
+    /// union (identity) while the other arm still checks.
+    SilentNever,
     /// The entry itself initializes from an identifier: single level stops
     /// here (depth-2+), except when it names the use itself (a cycle).
     Ident {
@@ -2392,7 +2517,8 @@ fn source_init_kind(
     if let Some(cast) = cast {
         return match evaluate_cast(cast) {
             CastEvaluation::Admit(result) | CastEvaluation::Decline(result) => match result {
-                CastType::Any | CastType::Never => PropInit::Silent,
+                CastType::Any => PropInit::SilentAny,
+                CastType::Never => PropInit::SilentNever,
                 CastType::Unknown => PropInit::Literal(InitKind::Unknown),
                 CastType::Literal(kind) => PropInit::Literal(kind),
             },
@@ -2508,14 +2634,17 @@ fn ident_params_from_function(params: &[FunctionParam]) -> Vec<IdentParam> {
 }
 
 /// What one source annotation propagates (P048): primitives map to their
-/// kind, `any`/`never` admit silently, `unknown` checks as unknown;
-/// everything else (unions, shapes, aliases-to-shapes, unknown names,
-/// `void`) never propagates.
+/// kind, `any`/`never` admit silently (distinguished: `any` absorbs a
+/// ternary whole while `never` only vanishes from it), `unknown` checks as
+/// unknown; everything else (unions, shapes, aliases-to-shapes, unknown
+/// names, `void`) never propagates.
 enum SourceType {
     /// Check uses against this kind.
     Kind(InitKind),
-    /// Uses stay silent (`any`/`never`).
-    Silent,
+    /// An `any` annotation: uses stay silent.
+    SilentAny,
+    /// A `never` annotation: uses stay silent.
+    SilentNever,
     /// The annotation is unpropagatable: the caller declines.
     Unusable,
 }
@@ -2541,8 +2670,11 @@ fn source_type_from_text(text: &str) -> SourceType {
         return SourceType::Kind(kind);
     }
     if let Some(id) = boundary_annotation_type(text) {
-        if id == TypeStore::ANY || id == TypeStore::NEVER {
-            return SourceType::Silent;
+        if id == TypeStore::ANY {
+            return SourceType::SilentAny;
+        }
+        if id == TypeStore::NEVER {
+            return SourceType::SilentNever;
         }
         return SourceType::Kind(InitKind::Unknown);
     }
@@ -2569,8 +2701,13 @@ enum IdentResolution {
     Keep,
     /// Check through the existing literal paths with this kind.
     Substitute(InitKind),
-    /// Accept-all source (`any`/`never`): the use stays silent.
-    Silent,
+    /// An `any` source: the use stays silent (and a ternary arm typed
+    /// `any` silences the whole ternary — absorption, probed tsc 7.0.2).
+    SilentAny,
+    /// A `never` source: the single use stays silent, but a ternary arm
+    /// typed `never` only vanishes from the union while the other arm
+    /// still checks (identity, probed tsc 7.0.2).
+    SilentNever,
     /// The use declines with the reason.
     Decline(String),
 }
@@ -2578,7 +2715,7 @@ enum IdentResolution {
 /// Resolves one bare-identifier initializer one level (P048).
 ///
 /// `Keep` covers non-identifier shapes and unresolvable names (the existing
-/// paths apply, exactly as before); `Substitute`/`Silent` carry
+/// paths apply, exactly as before); `Substitute`/`SilentAny`/`SilentNever` carry
 /// propagatable sources into annotation routing, where they check like
 /// literals; `Decline` carries the reason. Only the primitive tail routes
 /// here: structural annotations return earlier, so object/array/interface/
@@ -2719,7 +2856,8 @@ fn resolve_visible_input(
     }
     match &input.init {
         PropInit::Literal(kind) => resolve_literal_source(scope, input, *kind, name),
-        PropInit::Silent => IdentResolution::Silent,
+        PropInit::SilentAny => IdentResolution::SilentAny,
+        PropInit::SilentNever => IdentResolution::SilentNever,
         PropInit::Ident {
             name: source,
             scope: source_scope,
@@ -2757,7 +2895,8 @@ fn resolve_literal_source(
     };
     match source_annotation_type(scope, raw) {
         SourceType::Kind(propagated) => IdentResolution::Substitute(propagated),
-        SourceType::Silent => IdentResolution::Silent,
+        SourceType::SilentAny => IdentResolution::SilentAny,
+        SourceType::SilentNever => IdentResolution::SilentNever,
         SourceType::Unusable => IdentResolution::Decline(format!(
             "identifier '{name}' is annotated with a non-primitive type: \
             only primitive-annotated consts propagate"
@@ -2792,7 +2931,8 @@ fn resolve_param_source(table: &IdentTable, name: &str) -> Option<IdentResolutio
     }
     Some(match source_type_from_text(raw.trim()) {
         SourceType::Kind(kind) => IdentResolution::Substitute(kind),
-        SourceType::Silent => IdentResolution::Silent,
+        SourceType::SilentAny => IdentResolution::SilentAny,
+        SourceType::SilentNever => IdentResolution::SilentNever,
         SourceType::Unusable => IdentResolution::Decline(format!(
             "parameter '{name}' is not primitively annotated: \
             only primitive-annotated parameters propagate"
@@ -2992,6 +3132,7 @@ fn check_shaped_function(run: &mut FunctionRun<'_>) {
             init_object: shaped_return.init_object.clone(),
             init_array: shaped_return.init_array.clone(),
             cast: shaped_return.cast.clone(),
+            init_ternary: None,
         };
         if let Some(init) = synth.init_object.as_ref() {
             run.freshness.fresh.insert((run.file, node), init.fresh);
@@ -3430,9 +3571,10 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
     };
     let effective = promise_effective_annotation(decl, annotation)?;
     let returns = match &decl.body {
-        FunctionBody::SingleReturn(body) => {
-            vec![shape_return(body, "return", return_site(decl, &effective))?]
-        }
+        FunctionBody::SingleReturn(body) => match &body.ternary {
+            Some(ternary) => shape_ternary_return(decl, ternary, &effective)?,
+            None => vec![shape_return(body, "return", return_site(decl, &effective))?],
+        },
         FunctionBody::SequenceReturns(join) => vec![
             shape_return(&join.first, "first return", return_site(decl, &effective))?,
             shape_return(&join.second, "second return", return_site(decl, &effective))?,
@@ -3589,6 +3731,73 @@ fn shape_return(
         init_array: body.init_array.clone(),
         cast: None,
     })
+}
+
+/// Shapes one ternary arm for [`shape_ternary_return`]: nested ternaries
+/// and non-identifier non-literals decline the whole declaration with
+/// distinct arm-naming reasons (never a partial verdict over the other
+/// arm); every other arm delegates through its own synthetic [`ConstDecl`]
+/// with the arm's span (dotted synthetic names never resolve, so
+/// diagnostics fall back to the arm span — the P020 class-property
+/// precedent) and the arm's identifier seam for P048 resolution in
+/// [`check_one`].
+fn shape_ternary_arm(
+    arm: &TernaryArm,
+    position: &str,
+    func: &str,
+    site: SynthSite,
+) -> Result<SynthReturn, String> {
+    if arm.is_conditional {
+        return Err(format!(
+            "nested ternary in {position} of '{func}' is outside the subset"
+        ));
+    }
+    if arm.kind == InitKind::NonLiteral && arm.init_ident.is_none() {
+        return Err(format!(
+            "non-literal {position} of '{func}' is outside the subset"
+        ));
+    }
+    Ok(SynthReturn {
+        site,
+        kind: Some(arm.kind),
+        init_ident: arm.init_ident.clone(),
+        leading_index: None,
+        init_object: None,
+        init_array: None,
+        cast: None,
+    })
+}
+
+/// Shapes one ternary `c ? A : B` return for [`function_shape`] (P051):
+/// one [`SynthReturn`] per arm in source order — like the P023 join arms
+/// (no fixpoint, single pass; the condition never narrows, so arms carry
+/// no condition facts). Positions name their arm (`then-arm return`,
+/// `else-arm return`) so declines point at their arm.
+fn shape_ternary_return(
+    decl: &FunctionDecl,
+    ternary: &TernaryInit,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    let then_site = SynthSite {
+        name: format!("{}.then", decl.name),
+        span: ternary.then_arm.span,
+        scope: decl.scope,
+        symbol: None,
+        kind: DeclKind::Function,
+        annotation: Some(effective.to_owned()),
+    };
+    let else_site = SynthSite {
+        name: format!("{}.else", decl.name),
+        span: ternary.else_arm.span,
+        scope: decl.scope,
+        symbol: None,
+        kind: DeclKind::Function,
+        annotation: Some(effective.to_owned()),
+    };
+    Ok(vec![
+        shape_ternary_arm(&ternary.then_arm, "then-arm return", &decl.name, then_site)?,
+        shape_ternary_arm(&ternary.else_arm, "else-arm return", &decl.name, else_site)?,
+    ])
 }
 
 /// One call-site argument: literal kind plus span.
@@ -5257,6 +5466,7 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             init_object: prop.init_object.clone(),
             init_array: None,
             cast: None,
+            init_ternary: None,
         };
         let mut ctx = CheckCtx {
             file: run.file,
@@ -8027,6 +8237,22 @@ fn check_contradictory_inits(
         });
         return true;
     }
+    if decl.init_ternary.is_some() {
+        let paired = decl.init_object.is_some()
+            || decl.init_array.is_some()
+            || decl.cast.is_some()
+            || matches!(decl.init, Some(kind) if kind != InitKind::NonLiteral);
+        if paired {
+            report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: "contradictory initializer facts: ternary arms with \
+                    another initializer shape"
+                    .to_owned(),
+            });
+            return true;
+        }
+    }
     false
 }
 
@@ -8354,13 +8580,491 @@ fn resolve_ident_init(step: IdentStep<'_, '_, '_, '_, '_, '_>) -> bool {
             *init = Some(kind);
             false
         }
-        IdentResolution::Silent => true,
+        IdentResolution::SilentAny | IdentResolution::SilentNever => true,
         IdentResolution::Decline(reason) => {
             report
                 .unsupported
                 .push(UnsupportedDecl { file, span, reason });
             true
         }
+    }
+}
+
+/// One ternary arm after resolution for [`check_ternary`] (P051).
+///
+/// Provenance rides the variants (not a side flag): direct literals spell
+/// widened-or-fresh by the join rule while identifier-sourced arms always
+/// spell widened, so a diagnosing literal/identifier mix of different kinds
+/// declines instead of mis-spelling (the P034 no-misspelling discipline).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinedArm {
+    /// A direct literal arm: its kind (never `NonLiteral` here — the
+    /// structural gate declines those before resolution).
+    Literal(InitKind),
+    /// A bare-identifier arm resolved one level through the P048 table:
+    /// the propagated kind (never `Unknown`/`any`/`never` — those split
+    /// into the variants below).
+    Resolved(InitKind),
+    /// An identifier arm resolving to `unknown`: checks as `unknown`,
+    /// which absorbs the join spelling (probed `unknown | X` displays
+    /// `unknown` in tsc 7.0.2).
+    Unknown,
+    /// A `never`-typed arm: the union identity — it vanishes from both
+    /// the spelling and the wrongness while the other arm still checks
+    /// (probed: `never` plus a wrong literal still diagnoses the literal).
+    Never,
+    /// An `any`-typed arm: the union absorption — the whole ternary stays
+    /// silent, except under a `never` annotation (which diagnoses `any`).
+    Any,
+}
+
+/// How [`check_ternary`] routes one declaration back into [`check_one`].
+enum TernaryRoute {
+    /// The arms agree (or a single arm survives absorption): check through
+    /// the existing literal paths with this kind, so verdicts match a
+    /// literal initializer by construction.
+    Agree(InitKind),
+    /// The ternary is fully handled (silent, declined, or join-diagnosed).
+    Done,
+}
+
+/// One ternary-arm resolution step's inputs for [`resolve_ternary_arm`],
+/// bundled so arity stays flat (the [`IdentStep`] precedent).
+struct TernaryArmStep<'a, 'b, 'c, 'd, 'e> {
+    /// The enclosing declaration (identity, scope, and annotation feed the
+    /// probe the existing [`resolve_ident`] checks).
+    decl: &'a ConstDecl,
+    /// The arm to resolve.
+    arm: &'a TernaryArm,
+    /// `'then'` or `'else'`: names the arm in decline reasons.
+    label: &'static str,
+    binder: &'b Binder,
+    scope: &'c LocalAliasScope<'d, 'e>,
+    idents: &'c IdentTable,
+    file: FileId,
+}
+
+/// Resolves one ternary arm one level (P051): direct literals classify,
+/// bare identifiers ride the existing [`resolve_ident`] through a probe
+/// declaration (so the whole P048 reason family rides through unchanged),
+/// and nested ternaries plus non-identifier non-literals decline with
+/// distinct arm-naming reasons (never a partial verdict over the other
+/// arm — the caller declines whole-declaration on the first `Err`).
+fn resolve_ternary_arm(step: &TernaryArmStep<'_, '_, '_, '_, '_>) -> Result<JoinedArm, String> {
+    let TernaryArmStep {
+        decl,
+        arm,
+        label,
+        binder,
+        scope,
+        idents,
+        file,
+    } = *step;
+    if arm.is_conditional {
+        return Err(format!(
+            "nested ternary in '{label}' arm is outside the subset"
+        ));
+    }
+    if arm.kind != InitKind::NonLiteral {
+        return Ok(JoinedArm::Literal(arm.kind));
+    }
+    let Some(name) = arm.init_ident.as_deref() else {
+        return Err(format!(
+            "non-literal '{label}' arm of ternary is outside the subset"
+        ));
+    };
+    let probe = ConstDecl {
+        name: decl.name.clone(),
+        span: arm.span,
+        scope: decl.scope,
+        symbol: decl.symbol,
+        kind: decl.kind,
+        annotation: decl.annotation.clone(),
+        init: Some(InitKind::NonLiteral),
+        init_ident: Some(name.to_owned()),
+        init_object: None,
+        init_array: None,
+        cast: None,
+        init_ternary: None,
+    };
+    match resolve_ident(&probe, binder, scope, idents, file) {
+        IdentResolution::Keep => Err(format!(
+            "identifier '{name}' names no checkable const declarator or parameter in scope: \
+            only in-scope 'const' declarators with literal initializers propagate"
+        )),
+        IdentResolution::Substitute(InitKind::Unknown) => Ok(JoinedArm::Unknown),
+        IdentResolution::Substitute(kind) => Ok(JoinedArm::Resolved(kind)),
+        IdentResolution::SilentAny => Ok(JoinedArm::Any),
+        IdentResolution::SilentNever => Ok(JoinedArm::Never),
+        IdentResolution::Decline(reason) => Err(reason),
+    }
+}
+
+/// Resolves both ternary arms in source order (P051): the first decline
+/// wins, so reasons name arms deterministically (`then` before `else`).
+fn resolve_ternary_arms(
+    ternary: &TernaryInit,
+    decl: &ConstDecl,
+    binder: &Binder,
+    scope: &LocalAliasScope<'_, '_>,
+    idents: &IdentTable,
+    file: FileId,
+) -> Result<(JoinedArm, JoinedArm), String> {
+    let then = resolve_ternary_arm(&TernaryArmStep {
+        decl,
+        arm: &ternary.then_arm,
+        label: "then",
+        binder,
+        scope,
+        idents,
+        file,
+    })?;
+    let else_arm = resolve_ternary_arm(&TernaryArmStep {
+        decl,
+        arm: &ternary.else_arm,
+        label: "else",
+        binder,
+        scope,
+        idents,
+        file,
+    })?;
+    Ok((then, else_arm))
+}
+
+/// Ranks one widened ternary-arm spelling in tsc's union display order
+/// (P051, probed tsc 7.0.2 `--strict --pretty false`): `string` sorts
+/// before `number` before `boolean` before `null` before `undefined`
+/// (`string | number`, `number | boolean`, `number | null`,
+/// `number | undefined`, `boolean | null` — each probed). Pairs outside
+/// the probed set extrapolate the same rank; fixtures pin probed pairs
+/// only, and `unknown` absorption never reaches here.
+fn ternary_spelling_rank(name: &str) -> u8 {
+    match name {
+        "string" => 0,
+        "number" => 1,
+        "boolean" => 2,
+        "null" => 3,
+        "undefined" => 4,
+        _ => 5,
+    }
+}
+
+/// Spells the union of two differing widened arm kinds (P051):
+/// deduplicated (identical spellings collapse — the oracle absorbs a
+/// literal into its widened base, probed `number` for an identifier plus a
+/// same-kind literal) and rank-ordered (never source order — the oracle
+/// sorts by type identity, probed `number | boolean` for `true : 1`).
+fn join_ternary_spellings(first: &str, second: &str) -> String {
+    if first == second {
+        return first.to_owned();
+    }
+    if ternary_spelling_rank(first) <= ternary_spelling_rank(second) {
+        format!("{first} | {second}")
+    } else {
+        format!("{second} | {first}")
+    }
+}
+
+/// Finishes a ternary holding an `any`-typed arm (P051): `any` absorbs the
+/// union, so the declaration stays silent under every annotation except a
+/// `never` one (probed `Type 'any' is not assignable to type 'never'.`) —
+/// and unknown annotation names still diagnose `TS2304` through the shared
+/// boundary path. Object, array, promise, union, and lib spellings never
+/// reach that path: `any` absorbs those unions clean in tsc, so they stay
+/// silent here too (as do alias-shape targets, which `any` likewise
+/// absorbs).
+fn check_ternary_any(
+    annotation: &str,
+    span: Span,
+    scope: &LocalAliasScope<'_, '_>,
+    ctx: &mut CheckCtx<'_>,
+) {
+    let file = ctx.file;
+    if annotation.starts_with('{')
+        || classify_array_annotation(annotation).is_some()
+        || classify_promise_annotation(annotation).is_some()
+        || annotation.contains('|')
+        || lib_decline_reason(annotation).is_some()
+    {
+        return;
+    }
+    let expanded = match expand_local_alias(scope, annotation) {
+        LocalAliasStep::Keep => None,
+        LocalAliasStep::Primitive(spelling) => Some(spelling),
+        LocalAliasStep::Shape(_) | LocalAliasStep::Decline(_) => return,
+    };
+    let effective: &str = expanded.as_deref().unwrap_or(annotation);
+    match resolve_boundary_annotation(effective, span, file, true, &mut *ctx.report) {
+        Some(ann_ty) if ann_ty == TypeStore::NEVER => {
+            let node = ctx.node;
+            let db: &mut QueryDb = &mut *ctx.db;
+            let key = QueryKey {
+                file,
+                node,
+                kind: QueryKind::TypeOf,
+            };
+            let mut deps = Vec::with_capacity(ctx.extra.len().saturating_add(1));
+            deps.push(Dep { file, node });
+            deps.extend_from_slice(ctx.extra);
+            let stored = db.type_of(key, &deps, || ann_ty);
+            debug_assert_eq!(stored, ann_ty);
+            ctx.report.diagnostics.push(PithDiagnostic {
+                code: CODE_MISMATCH.to_owned(),
+                file,
+                span,
+                message: format!("Type 'any' is not assignable to type '{effective}'."),
+            });
+        }
+        None | Some(_) => {}
+    }
+}
+
+/// Finishes a ternary join against a primitive, boundary, or `never`
+/// annotation (P051): memoizes the annotation type exactly like
+/// [`finish_primitive_check`], then diagnoses at most once — the joined
+/// spelling against the annotation — when any considered arm mismatches.
+fn finish_ternary_primitive(
+    join: &str,
+    arms: &[InitKind],
+    ann_ty: TypeId,
+    span: Span,
+    annotation: &str,
+    ctx: &mut CheckCtx<'_>,
+) {
+    let file = ctx.file;
+    let node = ctx.node;
+    let db: &mut QueryDb = &mut *ctx.db;
+    let report: &mut FileReport = &mut *ctx.report;
+    let key = QueryKey {
+        file,
+        node,
+        kind: QueryKind::TypeOf,
+    };
+    let mut deps = Vec::with_capacity(ctx.extra.len().saturating_add(1));
+    deps.push(Dep { file, node });
+    deps.extend_from_slice(ctx.extra);
+    let stored = db.type_of(key, &deps, || ann_ty);
+    debug_assert_eq!(stored, ann_ty);
+    if arms.iter().any(|kind| kind.type_id() != ann_ty) {
+        report.diagnostics.push(PithDiagnostic {
+            code: CODE_MISMATCH.to_owned(),
+            file,
+            span,
+            message: format!("Type '{join}' is not assignable to type '{annotation}'."),
+        });
+    }
+}
+
+/// Finishes a ternary join against an inline object annotation (P051):
+/// member-type failures diagnose unknown names and unparseable shapes
+/// decline through the shared classifiers, then the union diagnoses once
+/// with the joined spelling (probed `Type 'string | number' is not
+/// assignable to type '{ a: number; }'.` — unions never elaborate
+/// missing/excess members against objects).
+fn finish_ternary_object(join: &str, span: Span, annotation: &str, ctx: &mut CheckCtx<'_>) {
+    let Some(parsed) = parse_object_members(annotation, span, ctx) else {
+        return;
+    };
+    let Some(expected) = classify_expected(&parsed, span, ctx) else {
+        return;
+    };
+    let expected_text = expected_object_text(&expected);
+    memoize_object_shape(&expected, ctx);
+    ctx.report.diagnostics.push(PithDiagnostic {
+        code: CODE_MISMATCH.to_owned(),
+        file: ctx.file,
+        span,
+        message: format!("Type '{join}' is not assignable to type '{expected_text}'."),
+    });
+}
+
+/// Finishes a ternary join against an array annotation (P051): declined
+/// spellings keep their reason while admitted elements diagnose once with
+/// the joined spelling (probed `Type 'string | number' is not assignable
+/// to type 'number[]'.`). `any`/`unknown` elements admit every union
+/// silently, mirroring [`check_array_members`].
+fn finish_ternary_array(join: &str, array: &ArrayAnnotation, span: Span, ctx: &mut CheckCtx<'_>) {
+    match array {
+        ArrayAnnotation::Decline(reason) => {
+            ctx.report.unsupported.push(UnsupportedDecl {
+                file: ctx.file,
+                span,
+                reason: reason.clone(),
+            });
+        }
+        ArrayAnnotation::Admit(element) => {
+            if element.id == TypeStore::ANY || element.id == TypeStore::UNKNOWN {
+                return;
+            }
+            ctx.report.diagnostics.push(PithDiagnostic {
+                code: CODE_MISMATCH.to_owned(),
+                file: ctx.file,
+                span,
+                message: format!(
+                    "Type '{join}' is not assignable to type '{}[]'.",
+                    element.spelling
+                ),
+            });
+        }
+    }
+}
+
+/// Routes a resolved ternary join through annotation shapes (P051),
+/// mirroring [`check_one`]'s gate order so texts stay identical: inline
+/// objects, arrays, promises, unions, and lib shapes route (or decline)
+/// exactly like literals, aliases expand, and primitives check the join
+/// through [`finish_ternary_primitive`].
+fn check_ternary_join(
+    join: &str,
+    arms: &[InitKind],
+    span: Span,
+    annotation: &str,
+    scope: &LocalAliasScope<'_, '_>,
+    ctx: &mut CheckCtx<'_>,
+) {
+    let file = ctx.file;
+    if annotation.starts_with('{') {
+        finish_ternary_object(join, span, annotation, ctx);
+        return;
+    }
+    if let Some(array) = classify_array_annotation(annotation) {
+        finish_ternary_array(join, &array, span, ctx);
+        return;
+    }
+    if let Some(promise) = classify_promise_annotation(annotation) {
+        let reason = match &promise {
+            PromiseAnnotation::Admit(inner) => format!(
+                "promise annotation '{annotation}' on a const-style declaration: \
+                only async function returns carry promise values (unwraps to '{}')",
+                inner.spelling()
+            ),
+            PromiseAnnotation::Decline(reason) => reason.clone(),
+        };
+        ctx.report
+            .unsupported
+            .push(UnsupportedDecl { file, span, reason });
+        return;
+    }
+    if annotation.contains('|') {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: format!("union annotation '{annotation}' is outside the subset"),
+        });
+        return;
+    }
+    if let Some(reason) = lib_decline_reason(annotation) {
+        ctx.report
+            .unsupported
+            .push(UnsupportedDecl { file, span, reason });
+        return;
+    }
+    let rewritten = match expand_local_annotation(scope, annotation, file, span, &mut *ctx.report) {
+        LocalAnnotation::Done => return,
+        LocalAnnotation::Keep => None,
+        LocalAnnotation::Rewritten(spelling) => Some(spelling),
+    };
+    let effective: &str = rewritten.as_deref().unwrap_or(annotation);
+    let Some(ann_ty) = resolve_boundary_annotation(effective, span, file, true, &mut *ctx.report)
+    else {
+        return;
+    };
+    finish_ternary_primitive(join, arms, ann_ty, span, effective, ctx);
+}
+
+/// Checks one ternary `c ? A : B` initializer (P051): `any`/`unknown`
+/// annotations stay silent (ternary arms always bear), resolved arms route
+/// to agreement (check like a literal, so verdicts match by construction),
+/// a surviving `unknown` (absorption), or the value-level join — while
+/// nested ternaries, non-identifier non-literals, and fresh-spelling mixes
+/// decline distinctly (never a partial verdict, never a forced verdict).
+fn check_ternary(
+    ternary: &TernaryInit,
+    decl: &ConstDecl,
+    binder: &Binder,
+    scope: &LocalAliasScope<'_, '_>,
+    span: Span,
+    annotation: &str,
+    ctx: &mut CheckCtx<'_>,
+) -> TernaryRoute {
+    // `any`/`unknown` annotations admit every bearing value silently (the
+    // P048 bypass, mirrored before any arm work so resolution never notes
+    // under them).
+    if let Some(id) = boundary_annotation_type(annotation) {
+        if id == TypeStore::ANY || id == TypeStore::UNKNOWN {
+            return TernaryRoute::Done;
+        }
+    }
+    let file = ctx.file;
+    let idents: &IdentTable = ctx.idents;
+    let (then, else_arm) = match resolve_ternary_arms(ternary, decl, binder, scope, idents, file) {
+        Ok(arms) => arms,
+        Err(reason) => {
+            ctx.report
+                .unsupported
+                .push(UnsupportedDecl { file, span, reason });
+            return TernaryRoute::Done;
+        }
+    };
+    let mut any = false;
+    let mut unknown = false;
+    let mut arms: Vec<(InitKind, bool)> = Vec::with_capacity(2);
+    for arm in [then, else_arm] {
+        match arm {
+            JoinedArm::Literal(kind) => arms.push((kind, true)),
+            JoinedArm::Resolved(kind) => arms.push((kind, false)),
+            JoinedArm::Unknown => unknown = true,
+            JoinedArm::Never => {}
+            JoinedArm::Any => any = true,
+        }
+    }
+    if any {
+        check_ternary_any(annotation, span, scope, ctx);
+        return TernaryRoute::Done;
+    }
+    if unknown {
+        // `unknown` absorbs the union (probed `unknown | X` displays
+        // `unknown`): one `TS2322` spelling `unknown`, whatever the
+        // sibling is (`Unknown` mismatches every routed annotation).
+        check_ternary_join(
+            "unknown",
+            &[InitKind::Unknown],
+            span,
+            annotation,
+            scope,
+            ctx,
+        );
+        return TernaryRoute::Done;
+    }
+    match arms.as_slice() {
+        [(kind, _)] => TernaryRoute::Agree(*kind),
+        [(then_kind, _), (else_kind, _)] if then_kind == else_kind => {
+            TernaryRoute::Agree(*then_kind)
+        }
+        [(then_kind, then_direct), (else_kind, else_direct)] => {
+            if then_direct != else_direct {
+                // Exactly one direct literal beside an identifier-sourced
+                // arm of another kind: the oracle retains the fresh
+                // spelling (`number | "oops"`), which widened-only spellings
+                // cannot reproduce — decline instead of mis-spelling (the
+                // P034 discipline).
+                ctx.report.unsupported.push(UnsupportedDecl {
+                    file,
+                    span,
+                    reason: "ternary mixes a literal arm with an identifier arm of another \
+                        type: fresh-literal union spellings are outside the subset"
+                        .to_owned(),
+                });
+                return TernaryRoute::Done;
+            }
+            let join = join_ternary_spellings(then_kind.name(), else_kind.name());
+            let kinds = [*then_kind, *else_kind];
+            check_ternary_join(&join, &kinds, span, annotation, scope, ctx);
+            TernaryRoute::Done
+        }
+        // Three or more arms cannot resolve (exactly two arms feed the loop
+        // above): stay silent rather than mis-route.
+        _ => TernaryRoute::Done,
     }
 }
 
@@ -8411,6 +9115,159 @@ fn finish_annotated_check(
     finish_primitive_check(ann_ty, init, decl, span, annotation, &mut tail);
 }
 
+/// Inputs for one [`resolve_ternary_init`] step, bundled (the
+/// [`IdentStep`] precedent).
+struct TernaryUse<'a, 'b, 'c, 'd, 'e> {
+    decl: &'a ConstDecl,
+    binder: &'b Binder,
+    scope: &'c LocalAliasScope<'d, 'e>,
+    span: Span,
+    annotation: &'a str,
+}
+
+/// Ternary initializer step for [`check_one`] (P051): agreeing arms read
+/// as one literal kind (verdicts match by construction); joins diagnose
+/// once or decline whole-declaration. Returns true when the declaration
+/// is done; otherwise writes the agreed kind into `init`.
+fn resolve_ternary_init(
+    ternary: &TernaryInit,
+    use_: &TernaryUse<'_, '_, '_, '_, '_>,
+    ctx: &mut CheckCtx<'_>,
+    init: &mut Option<InitKind>,
+) -> bool {
+    let mut inner = CheckCtx {
+        file: ctx.file,
+        node: ctx.node,
+        db: &mut *ctx.db,
+        freshness: ctx.freshness,
+        report: &mut *ctx.report,
+        extra: ctx.extra,
+        idents: ctx.idents,
+    };
+    if let TernaryRoute::Agree(kind) = check_ternary(
+        ternary,
+        use_.decl,
+        use_.binder,
+        use_.scope,
+        use_.span,
+        use_.annotation,
+        &mut inner,
+    ) {
+        *init = Some(kind);
+        false
+    } else {
+        true
+    }
+}
+
+/// Object-annotation routing for [`check_one`]: array initializers take
+/// the array-missing path, everything else the shared object comparison.
+/// Split out so `check_one` stays within the line budget; behavior
+/// identical.
+fn check_object_routing(
+    decl: &ConstDecl,
+    span: Span,
+    annotation: &str,
+    init: Option<InitKind>,
+    ctx: &mut CheckCtx<'_>,
+) {
+    if let Some(init_array) = decl.init_array.as_ref() {
+        check_object_annotation_array_init(span, annotation, &init_array.members, ctx);
+        return;
+    }
+    check_object(decl, span, annotation, init, ctx);
+}
+
+/// Const-style promise annotations decline whole-declaration (P034; see
+/// [`classify_promise_annotation`]): only async function returns carry
+/// promise values. Split out so `check_one` stays within the line budget;
+/// reason text identical.
+fn decline_promise_annotation(
+    promise: &PromiseAnnotation,
+    annotation: &str,
+    span: Span,
+    ctx: &mut CheckCtx<'_>,
+) {
+    let reason = match promise {
+        PromiseAnnotation::Admit(inner) => format!(
+            "promise annotation '{annotation}' on a const-style declaration: \
+            only async function returns carry promise values (unwraps to '{}')",
+            inner.spelling()
+        ),
+        PromiseAnnotation::Decline(reason) => reason.clone(),
+    };
+    ctx.report.unsupported.push(UnsupportedDecl {
+        file: ctx.file,
+        span,
+        reason,
+    });
+}
+
+/// Union and lib-family routing for [`check_one`]: shaped spellings
+/// decline whole-declaration with their established reasons. Returns true
+/// when a note was pushed and the caller returns.
+fn decline_shaped_annotation(
+    annotation: &str,
+    file: FileId,
+    span: Span,
+    report: &mut FileReport,
+) -> bool {
+    if annotation.contains('|') {
+        report.unsupported.push(UnsupportedDecl {
+            file,
+            span,
+            reason: format!("union annotation '{annotation}' is outside the subset"),
+        });
+        return true;
+    }
+    if let Some(reason) = lib_decline_reason(annotation) {
+        report
+            .unsupported
+            .push(UnsupportedDecl { file, span, reason });
+        return true;
+    }
+    false
+}
+
+/// Prefix gates for [`check_one`]: annotation presence, contradictory
+/// initializers, then assertion evaluation. `None` means the declaration
+/// is done (decline pushed); otherwise the span, trimmed annotation, and
+/// asserted initializer kind to check.
+struct CheckPrefix<'a> {
+    span: Span,
+    annotation: &'a str,
+    init: Option<InitKind>,
+}
+
+/// Runs the [`check_one`] prefix gates (see [`CheckPrefix`]).
+fn check_prefix<'a>(
+    decl: &'a ConstDecl,
+    binder: &Binder,
+    file: FileId,
+    report: &mut FileReport,
+) -> Option<CheckPrefix<'a>> {
+    let span = binder_span(binder, file, decl);
+    let Some(raw) = decl.annotation.as_deref() else {
+        decline_unannotated(decl, span, file, report);
+        return None;
+    };
+    let annotation = raw.trim();
+    if check_contradictory_inits(decl, span, file, report) {
+        return None;
+    }
+    // Assertion evaluation runs before annotation routing (see
+    // `apply_assertion`): declined casts diagnose independently of the
+    // annotation while admitted results substitute the initializer kind.
+    match apply_assertion(decl, span, file, annotation, report) {
+        AssertedInit::Check(init) => Some(CheckPrefix {
+            span,
+            annotation,
+            init,
+        }),
+        AssertedInit::Done => None,
+    }
+}
+
 /// Takes the shared [`CheckCtx`] (file, node, memo store, freshness table,
 /// report, and extra cross-file edges) so the arity stays flat as the
 /// subset grows; `binder` and `decl` ride alongside.
@@ -8427,22 +9284,36 @@ fn check_one(
     let report: &mut FileReport = &mut *ctx.report;
     let extra = ctx.extra;
     let idents = ctx.idents;
-    let span = binder_span(binder, file, decl);
-    let Some(raw) = decl.annotation.as_deref() else {
-        decline_unannotated(decl, span, file, &mut *report);
+    let Some(prefix) = check_prefix(decl, binder, file, &mut *report) else {
         return;
     };
-    let annotation = raw.trim();
-    if check_contradictory_inits(decl, span, file, &mut *report) {
-        return;
+    let span = prefix.span;
+    let annotation = prefix.annotation;
+    let mut init = prefix.init;
+    // Ternary initializers (P051; see `resolve_ternary_init`): agreeing
+    // arms read as one literal kind, joins diagnose once, anything else
+    // declines whole-declaration.
+    if let Some(ternary) = decl.init_ternary.as_ref() {
+        let use_ = TernaryUse {
+            decl,
+            binder,
+            scope,
+            span,
+            annotation,
+        };
+        let mut ctx = CheckCtx {
+            file,
+            node,
+            db: &mut *db,
+            freshness,
+            report: &mut *report,
+            extra,
+            idents,
+        };
+        if resolve_ternary_init(ternary, &use_, &mut ctx, &mut init) {
+            return;
+        }
     }
-    // Assertion evaluation runs before annotation routing (see
-    // `apply_assertion`): declined casts diagnose independently of the
-    // annotation while admitted results substitute the initializer kind.
-    let mut init = match apply_assertion(decl, span, file, annotation, &mut *report) {
-        AssertedInit::Check(init) => init,
-        AssertedInit::Done => return,
-    };
     if annotation.starts_with('{') {
         let mut ctx = CheckCtx {
             file,
@@ -8453,11 +9324,7 @@ fn check_one(
             extra,
             idents,
         };
-        if let Some(init_array) = decl.init_array.as_ref() {
-            check_object_annotation_array_init(span, annotation, &init_array.members, &mut ctx);
-            return;
-        }
-        check_object(decl, span, annotation, init, &mut ctx);
+        check_object_routing(decl, span, annotation, init, &mut ctx);
         return;
     }
     if let Some(array) = classify_array_annotation(annotation) {
@@ -8474,31 +9341,19 @@ fn check_one(
         return;
     }
     if let Some(promise) = classify_promise_annotation(annotation) {
-        let reason = match &promise {
-            PromiseAnnotation::Admit(inner) => format!(
-                "promise annotation '{annotation}' on a const-style declaration: \
-                only async function returns carry promise values (unwraps to '{}')",
-                inner.spelling()
-            ),
-            PromiseAnnotation::Decline(reason) => reason.clone(),
-        };
-        report
-            .unsupported
-            .push(UnsupportedDecl { file, span, reason });
-        return;
-    }
-    if annotation.contains('|') {
-        report.unsupported.push(UnsupportedDecl {
+        let mut ctx = CheckCtx {
             file,
-            span,
-            reason: format!("union annotation '{annotation}' is outside the subset"),
-        });
+            node,
+            db,
+            freshness,
+            report,
+            extra,
+            idents,
+        };
+        decline_promise_annotation(&promise, annotation, span, &mut ctx);
         return;
     }
-    if let Some(reason) = lib_decline_reason(annotation) {
-        report
-            .unsupported
-            .push(UnsupportedDecl { file, span, reason });
+    if decline_shaped_annotation(annotation, file, span, &mut *report) {
         return;
     }
     // Single-level identifier propagation (P048; see
@@ -10746,6 +11601,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         }
     }
 
@@ -10777,6 +11633,7 @@ mod tests {
             }),
             init_array: None,
             cast: None,
+            init_ternary: None,
         }
     }
 
@@ -11131,6 +11988,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                init_ternary: None,
             },
             // An interface-annotated use resolves through the merged id.
             object_decl("ok", 50, 52, "Foo", vec![("a", ObjectMemberKind::Number)]),
@@ -11216,6 +12074,7 @@ mod tests {
                 operand_span: span(lo, hi),
                 kind,
             }),
+            init_ternary: None,
         }
     }
 
@@ -11282,6 +12141,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         }];
         let mut db = QueryDb::new();
         let report = check_file(FILE, &decls, &binder, &mut db);
@@ -11944,6 +12804,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                init_ternary: None,
             },
             decl("e", 18, 26, "number", InitKind::NonLiteral),
             ConstDecl {
@@ -11958,6 +12819,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                init_ternary: None,
             },
         ];
         let mut db = QueryDb::new();
@@ -12062,6 +12924,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         }
     }
 
@@ -12106,6 +12969,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[decl], &binder, &mut db);
@@ -12134,6 +12998,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[decl], &binder, &mut db);
@@ -12160,6 +13025,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         };
         let mut db = QueryDb::new();
         let other = FileId(41);
@@ -12177,11 +13043,13 @@ mod tests {
             ConstDecl {
                 kind: DeclKind::Let,
                 cast: None,
+                init_ternary: None,
                 ..decl("a", 0, 10, "number", InitKind::Number)
             },
             ConstDecl {
                 kind: DeclKind::Let,
                 cast: None,
+                init_ternary: None,
                 ..decl("b", 11, 21, "number", InitKind::String)
             },
         ];
@@ -12578,6 +13446,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[object_init, primitive_init], &binder, &mut db);
@@ -12679,6 +13548,7 @@ mod tests {
             init_object: None,
             init_array: Some(ArrayInit { members }),
             cast: None,
+            init_ternary: None,
         }
     }
 
@@ -12925,6 +13795,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            ternary: None,
         })
     }
 
@@ -13033,6 +13904,7 @@ mod tests {
             }),
             init_array: None,
             cast: None,
+            ternary: None,
         })
     }
 
@@ -13044,6 +13916,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            ternary: None,
         }
     }
 
@@ -13065,6 +13938,7 @@ mod tests {
             }),
             init_array: None,
             cast: None,
+            ternary: None,
         }
     }
 
@@ -13095,7 +13969,581 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            ternary: None,
         }
+    }
+
+    /// One literal ternary arm for ternary tests.
+    fn ternary_arm(kind: InitKind, lo: u32, hi: u32) -> TernaryArm {
+        TernaryArm {
+            kind,
+            span: span(lo, hi),
+            init_ident: None,
+            is_conditional: false,
+        }
+    }
+
+    /// One bare-identifier ternary arm for ternary tests.
+    fn ternary_ident(name: &str, lo: u32, hi: u32) -> TernaryArm {
+        TernaryArm {
+            kind: InitKind::NonLiteral,
+            span: span(lo, hi),
+            init_ident: Some(name.to_owned()),
+            is_conditional: false,
+        }
+    }
+
+    /// One non-identifier non-literal ternary arm (calls, objects, ...) for
+    /// ternary tests.
+    fn ternary_complex(lo: u32, hi: u32) -> TernaryArm {
+        TernaryArm {
+            kind: InitKind::NonLiteral,
+            span: span(lo, hi),
+            init_ident: None,
+            is_conditional: false,
+        }
+    }
+
+    /// One nested-conditional ternary arm for ternary tests.
+    fn ternary_nested(lo: u32, hi: u32) -> TernaryArm {
+        TernaryArm {
+            kind: InitKind::NonLiteral,
+            span: span(lo, hi),
+            init_ident: None,
+            is_conditional: true,
+        }
+    }
+
+    /// One ternary `const` declaration for ternary tests.
+    fn ternary_decl(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        ann: &str,
+        then_arm: TernaryArm,
+        else_arm: TernaryArm,
+    ) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: Some(ann.to_owned()),
+            init: Some(InitKind::NonLiteral),
+            init_ident: None,
+            init_object: None,
+            init_array: None,
+            cast: None,
+            init_ternary: Some(TernaryInit { then_arm, else_arm }),
+        }
+    }
+
+    /// One ternary single-return body for ternary function tests.
+    fn ternary_single(then_arm: TernaryArm, else_arm: TernaryArm) -> FunctionBody {
+        FunctionBody::SingleReturn(FunctionReturn {
+            kind: Some(InitKind::NonLiteral),
+            init_ident: None,
+            init_object: None,
+            init_array: None,
+            cast: None,
+            ternary: Some(TernaryInit { then_arm, else_arm }),
+        })
+    }
+
+    /// One function declaration with primitive params for ternary tests.
+    fn ternary_fn(params: Vec<(&str, &str)>, ret: &str, body: FunctionBody) -> FunctionDecl {
+        FunctionDecl {
+            name: "pick".to_owned(),
+            span: span(0, 20),
+            scope: 0,
+            symbol: None,
+            params: params
+                .into_iter()
+                .map(|(param, ty)| FunctionParam {
+                    name: param.to_owned(),
+                    annotated: true,
+                    annotation: Some(ty.to_owned()),
+                    optional: false,
+                    is_rest: false,
+                })
+                .collect(),
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some(ret.to_owned()),
+            body,
+        }
+    }
+
+    /// Runs [`check_functions`] on one declaration list (ternary tests).
+    fn function_report(decls: &[FunctionDecl], binder: &Binder) -> FileReport {
+        let mut db = QueryDb::new();
+        check_functions(FILE, decls, binder, &mut db)
+    }
+
+    #[test]
+    fn ternary_agreeing_arms_check_as_one_literal() {
+        // P051 agree path: identical arm kinds read as one literal through
+        // the existing paths (clean stays silent, wrong diagnoses plain).
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            ternary_decl(
+                "a",
+                0,
+                10,
+                "number",
+                ternary_arm(InitKind::Number, 21, 22),
+                ternary_arm(InitKind::Number, 26, 27),
+            ),
+            ternary_decl(
+                "b",
+                11,
+                21,
+                "number",
+                ternary_arm(InitKind::String, 31, 37),
+                ternary_arm(InitKind::String, 41, 47),
+            ),
+        ];
+        let report = file_report_with_aliases(&decls, &[], &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(11, 21));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ternary_differing_arms_diagnose_the_join_once() {
+        // P051 join path (probed b/c/d on tsc 7.0.2): wrong-then and
+        // wrong-else spell the rank-ordered union once at the declaration;
+        // both-wrong deduplicates to one name.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21)), ("c", span(22, 32))]);
+        let decls = [
+            ternary_decl(
+                "a",
+                0,
+                10,
+                "number",
+                ternary_arm(InitKind::String, 31, 37),
+                ternary_arm(InitKind::Number, 41, 42),
+            ),
+            ternary_decl(
+                "b",
+                11,
+                21,
+                "number",
+                ternary_arm(InitKind::Number, 51, 52),
+                ternary_arm(InitKind::String, 56, 62),
+            ),
+            ternary_decl(
+                "c",
+                22,
+                32,
+                "number",
+                ternary_arm(InitKind::String, 71, 75),
+                ternary_arm(InitKind::String, 79, 83),
+            ),
+        ];
+        let report = file_report_with_aliases(&decls, &[], &binder);
+        assert_eq!(report.diagnostics.len(), 3);
+        for diagnostic in &report.diagnostics {
+            assert_eq!(diagnostic.code, CODE_MISMATCH);
+        }
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string | number' is not assignable to type 'number'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'string | number' is not assignable to type 'number'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ternary_join_spelling_sorts_by_type_identity() {
+        // P051 rank rule (probed m/s on tsc 7.0.2): source order never
+        // surfaces; identical spellings collapse.
+        assert_eq!(
+            join_ternary_spellings("number", "string"),
+            "string | number"
+        );
+        assert_eq!(
+            join_ternary_spellings("boolean", "number"),
+            "number | boolean"
+        );
+        assert_eq!(join_ternary_spellings("null", "number"), "number | null");
+        assert_eq!(
+            join_ternary_spellings("undefined", "null"),
+            "null | undefined"
+        );
+        assert_eq!(join_ternary_spellings("null", "boolean"), "boolean | null");
+        assert_eq!(join_ternary_spellings("number", "number"), "number");
+    }
+
+    #[test]
+    fn ternary_nested_and_complex_arms_decline_distinctly() {
+        // P051: nested vs complex reasons differ (never a partial verdict:
+        // one note per declaration, zero diagnostics).
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let decls = [
+            ternary_decl(
+                "a",
+                0,
+                10,
+                "number",
+                ternary_nested(21, 35),
+                ternary_arm(InitKind::Number, 39, 40),
+            ),
+            ternary_decl(
+                "b",
+                11,
+                21,
+                "number",
+                ternary_arm(InitKind::Number, 41, 42),
+                ternary_complex(46, 52),
+            ),
+        ];
+        let report = file_report_with_aliases(&decls, &[], &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[0].reason.contains("nested ternary"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("non-literal"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn ternary_fresh_mix_declines_instead_of_misspelling() {
+        // P051 (probed h on tsc 7.0.2): a literal arm beside an identifier
+        // arm of another kind would need the fresh spelling
+        // (`number | "ok"`), which widened-only spellings refuse to fake —
+        // decline (a pinned oracle-error divergence, the P034 discipline).
+        let binder = binder_with(&[("x", span(0, 10)), ("t", span(11, 21))]);
+        let decls = [
+            decl("x", 0, 10, "number", InitKind::Number),
+            ternary_decl(
+                "t",
+                11,
+                21,
+                "string",
+                ternary_ident("x", 31, 32),
+                ternary_arm(InitKind::String, 36, 40),
+            ),
+        ];
+        let report = file_report_with_aliases(&decls, &[], &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("fresh-literal"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn ternary_ident_arms_resolve_like_literals() {
+        // P051 (probed h-clean/n on tsc 7.0.2): identifier arms resolve one
+        // level — agreeing uses stay silent, and same-kind literal mixes
+        // collapse through the agree path.
+        let binder = binder_with(&[("x", span(0, 10)), ("a", span(11, 21)), ("b", span(22, 32))]);
+        let decls = [
+            decl("x", 0, 10, "number", InitKind::Number),
+            ternary_decl(
+                "a",
+                11,
+                21,
+                "number",
+                ternary_ident("x", 31, 32),
+                ternary_arm(InitKind::Number, 36, 37),
+            ),
+            ternary_decl(
+                "b",
+                22,
+                32,
+                "string",
+                ternary_ident("x", 51, 52),
+                ternary_arm(InitKind::Number, 56, 57),
+            ),
+        ];
+        let report = file_report_with_aliases(&decls, &[], &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ternary_any_silences_never_vanishes_unknown_absorbs() {
+        // P051 (probed p/r on tsc 7.0.2): `any` silences the whole ternary,
+        // `never` vanishes while the sibling checks, `unknown` absorbs the
+        // spelling into one `unknown` diagnostic.
+        let binder = binder_with(&[
+            ("av", span(0, 10)),
+            ("nv", span(11, 21)),
+            ("uv", span(22, 32)),
+            ("a", span(33, 43)),
+            ("b", span(44, 54)),
+            ("c", span(55, 65)),
+            ("d", span(66, 76)),
+        ]);
+        let never_cast = CastInput {
+            operand: InitKind::String,
+            target: "never".to_owned(),
+            operand_span: span(11, 17),
+            kind: CastKind::As,
+        };
+        let decls = [
+            decl("av", 0, 10, "any", InitKind::Number),
+            ConstDecl {
+                name: "nv".to_owned(),
+                span: span(11, 21),
+                scope: 0,
+                symbol: None,
+                kind: DeclKind::Const,
+                annotation: Some("number".to_owned()),
+                init: Some(InitKind::NonLiteral),
+                init_ident: None,
+                init_object: None,
+                init_array: None,
+                cast: Some(never_cast),
+                init_ternary: None,
+            },
+            decl("uv", 22, 32, "unknown", InitKind::String),
+            ternary_decl(
+                "a",
+                33,
+                43,
+                "number",
+                ternary_ident("av", 50, 52),
+                ternary_arm(InitKind::Number, 56, 57),
+            ),
+            ternary_decl(
+                "b",
+                44,
+                54,
+                "number",
+                ternary_ident("nv", 61, 63),
+                ternary_arm(InitKind::String, 67, 73),
+            ),
+            ternary_decl(
+                "c",
+                55,
+                65,
+                "number",
+                ternary_ident("nv", 81, 83),
+                ternary_arm(InitKind::Number, 87, 88),
+            ),
+            ternary_decl(
+                "d",
+                66,
+                76,
+                "string",
+                ternary_ident("uv", 101, 103),
+                ternary_arm(InitKind::String, 107, 111),
+            ),
+        ];
+        let report = file_report_with_aliases(&decls, &[], &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(44, 54));
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'unknown' is not assignable to type 'string'."
+        );
+        assert_eq!(report.diagnostics[1].span, span(66, 76));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ternary_join_composes_across_object_and_array_annotations() {
+        // P051 (probed s11/s14 on tsc 7.0.2): differing arms against inline
+        // objects and arrays diagnose once with the joined spelling.
+        let binder = binder_with(&[("o", span(0, 10)), ("a", span(11, 21))]);
+        let decls = [
+            ternary_decl(
+                "o",
+                0,
+                10,
+                "{ a: number; }",
+                ternary_arm(InitKind::Number, 31, 32),
+                ternary_arm(InitKind::String, 36, 40),
+            ),
+            ternary_decl(
+                "a",
+                11,
+                21,
+                "number[]",
+                ternary_arm(InitKind::Number, 51, 52),
+                ternary_arm(InitKind::String, 56, 60),
+            ),
+        ];
+        let report = file_report_with_aliases(&decls, &[], &binder);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string | number' is not assignable to type '{ a: number; }'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'string | number' is not assignable to type 'number[]'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ternary_return_arms_check_per_arm_at_own_spans() {
+        // P051 (probed i/o on tsc 7.0.2): a wrong arm diagnoses at its arm
+        // span (not the declaration span) while the clean arm stays silent;
+        // both-wrong reports twice.
+        let binder = Binder::new();
+        let decls = [
+            ternary_fn(
+                vec![],
+                "number",
+                ternary_single(
+                    ternary_arm(InitKind::Number, 30, 31),
+                    ternary_arm(InitKind::String, 35, 41),
+                ),
+            ),
+            ternary_fn(
+                vec![],
+                "number",
+                ternary_single(
+                    ternary_arm(InitKind::String, 50, 56),
+                    ternary_arm(InitKind::String, 60, 66),
+                ),
+            ),
+        ];
+        let report = function_report(&decls, &binder);
+        assert_eq!(report.diagnostics.len(), 3);
+        for diagnostic in &report.diagnostics {
+            assert_eq!(diagnostic.code, CODE_MISMATCH);
+            assert_eq!(
+                diagnostic.message,
+                "Type 'string' is not assignable to type 'number'."
+            );
+        }
+        assert_eq!(report.diagnostics[0].span, span(35, 41));
+        assert_eq!(report.diagnostics[1].span, span(50, 56));
+        assert_eq!(report.diagnostics[2].span, span(60, 66));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ternary_return_nested_and_complex_decline_whole_declaration() {
+        // P051: one note per declaration, zero diagnostics (never a partial
+        // verdict over the checkable arm).
+        let binder = Binder::new();
+        let decls = [
+            ternary_fn(
+                vec![],
+                "number",
+                ternary_single(
+                    ternary_nested(30, 44),
+                    ternary_arm(InitKind::Number, 48, 49),
+                ),
+            ),
+            ternary_fn(
+                vec![],
+                "number",
+                ternary_single(
+                    ternary_arm(InitKind::Number, 60, 61),
+                    ternary_complex(65, 71),
+                ),
+            ),
+        ];
+        let report = function_report(&decls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[0].reason.contains("nested ternary"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("non-literal"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn ternary_return_ident_arm_resolves_parameter() {
+        // P051: `return flag ? p : "oops"` over a `number` parameter
+        // diagnoses the parameter arm like a literal, at the arm span.
+        let binder = Binder::new();
+        let decls = [ternary_fn(
+            vec![("p", "number")],
+            "string",
+            ternary_single(
+                ternary_ident("p", 30, 31),
+                ternary_arm(InitKind::String, 35, 41),
+            ),
+        )];
+        let report = function_report(&decls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(30, 31));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn ternary_return_never_arm_vanishes() {
+        // P051 (probed r3 on tsc 7.0.2): a `never` arm emits nothing while
+        // the sibling checks — wrong siblings diagnose, clean ones stay
+        // silent.
+        let binder = Binder::new();
+        let decls = [
+            ternary_fn(
+                vec![("nvr", "never")],
+                "number",
+                ternary_single(
+                    ternary_ident("nvr", 30, 33),
+                    ternary_arm(InitKind::String, 37, 43),
+                ),
+            ),
+            ternary_fn(
+                vec![("nvr", "never")],
+                "number",
+                ternary_single(
+                    ternary_ident("nvr", 50, 53),
+                    ternary_arm(InitKind::Number, 57, 58),
+                ),
+            ),
+        ];
+        let report = function_report(&decls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(37, 43));
+        assert!(report.unsupported.is_empty());
     }
 
     /// An if/else branch join for join tests.
@@ -13113,11 +14561,11 @@ mod tests {
         catch_branch: FunctionReturn,
         tail: Option<FunctionReturn>,
     ) -> FunctionBody {
-        FunctionBody::TryCatch(TryCatchBody {
+        FunctionBody::TryCatch(Box::new(TryCatchBody {
             try_branch,
             catch_branch,
             tail,
-        })
+        }))
     }
 
     /// A switch body for switch tests: one return per case plus an
@@ -14763,6 +16211,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         }
     }
 
@@ -14779,6 +16228,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         }
     }
 
@@ -15272,6 +16722,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                init_ternary: None,
             },
         ];
         let uses = [narrowing_use("a", 40, 50, "string", "x", 48, 49)];
@@ -15573,6 +17024,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                init_ternary: None,
             },
         ];
         let uses = [narrowing_use("h", 40, 50, "string", "g", 48, 49)];
@@ -15693,6 +17145,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                ternary: None,
             }),
         )
     }
@@ -15865,6 +17318,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                ternary: None,
             }),
         )];
         let calls = [generic_call_args(
@@ -15909,6 +17363,7 @@ mod tests {
                 }),
                 init_array: None,
                 cast: None,
+                ternary: None,
             }),
         )];
         let report = generics_report(&decls, &[], &binder);
@@ -15937,6 +17392,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                ternary: None,
             }),
         )];
         let report = generics_report(&decls, &[], &binder);
@@ -15995,6 +17451,7 @@ mod tests {
                     init_object: None,
                     init_array: None,
                     cast: None,
+                    ternary: None,
                 }),
             },
             type_params: vec!["T".to_owned(), "U".to_owned()],
@@ -16386,6 +17843,7 @@ mod tests {
                     init_object: None,
                     init_array: None,
                     cast: None,
+                    ternary: None,
                 }),
             },
             type_params: vec!["A".to_owned(), "B".to_owned(), "C".to_owned()],
@@ -16581,6 +18039,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                ternary: None,
             }),
         );
         decl.bounds[0].constraint = constraint.map(str::to_owned);
@@ -16789,6 +18248,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                ternary: None,
             })
         };
         let mut infer_named = generic_decl_named("k", 63, 83, &["T"], Some("T"), Some("T"), body());
@@ -16857,6 +18317,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                ternary: None,
             })
         };
         let decls = [
@@ -17071,6 +18532,7 @@ mod tests {
                 init_object: None,
                 init_array: None,
                 cast: None,
+                init_ternary: None,
             },
             init_text: text.map(str::to_owned),
             cross_file_deps: Vec::new(),
@@ -18071,6 +19533,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         }
     }
 
@@ -18089,6 +19552,7 @@ mod tests {
             init_object: None,
             init_array: None,
             cast: None,
+            init_ternary: None,
         }
     }
 
@@ -18308,6 +19772,7 @@ mod tests {
         let source = ConstDecl {
             kind: DeclKind::Let,
             annotation: Some("number".to_owned()),
+            init_ternary: None,
             ..literal_source("a", 0, 10, InitKind::Number)
         };
         let decls = [source, ident_use("b", 11, 21, "number", "a")];
@@ -18365,6 +19830,7 @@ mod tests {
         let binder = binder_with(&[("a", span(0, 10)), ("c", span(22, 32))]);
         let use_decl = ConstDecl {
             annotation: None,
+            init_ternary: None,
             ..ident_use("c", 22, 32, "number", "a")
         };
         let decls = [decl("a", 0, 10, "number", InitKind::Number), use_decl];
@@ -18457,11 +19923,11 @@ mod tests {
         );
         assert_eq!(
             resolve_param_source(&table, "au"),
-            Some(IdentResolution::Silent)
+            Some(IdentResolution::SilentAny)
         );
         assert_eq!(
             resolve_param_source(&table, "nv"),
-            Some(IdentResolution::Silent)
+            Some(IdentResolution::SilentNever)
         );
         assert_eq!(
             resolve_param_source(&table, "uu"),
@@ -18540,6 +20006,7 @@ mod tests {
                 operand_span: span(6, 12),
                 kind: CastKind::As,
             }),
+            init_ternary: None,
             ..literal_source("a", 0, 10, InitKind::Number)
         };
         let decls = [source, ident_use("b", 11, 21, "string", "a")];
