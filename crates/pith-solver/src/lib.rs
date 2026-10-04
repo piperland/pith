@@ -549,6 +549,34 @@
 //!   uses the result kind (`m14`); complex casts skip per-argument, exactly
 //!   like non-literals.
 //!
+//! Ambient declarations (P063, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p063-probes/`):
+//!
+//! - A single `declare function` checks exactly like a lone bodied
+//!   declaration: `amb(1)` clean (probe `a`), `amb("s")` one `TS2345` at the
+//!   argument (probe `b`), `amb(1)` against two params `TS2554` at the callee
+//!   (probe `c`), `amb(1, 2)` against one param `TS2554` at the first excess
+//!   argument (probe `d`). No declaration diagnostic fires for the missing
+//!   body — the subset spells none.
+//! - Ambient overload groups resolve by the same P044 any-match: `ov(1)` and
+//!   `ov("s")` clean (probe `e`), `ov(true)` one `TS2769` elaborating the
+//!   last signature at the argument (probe `f`), and a between-ranges count
+//!   `TS2575` at the callee (probe `g`).
+//! - Missing implementations stay declined declaration-side: non-`declare`
+//!   signatures without a body diagnose `TS2391` at the last signature
+//!   (probes `h`, `n` — the subset spells no declaration diagnostics, so
+//!   [`check_functions`] records one note per signature), while calls over
+//!   those groups still resolve by any-match. The implementation signature
+//!   never participates: `im(true)` spells the compatible signature's
+//!   `TS2345` (probe `i`), never an impl-shaped verdict.
+//! - Generic ambient signatures ride the existing exclusion (probe `l` clean
+//!   in tsc — a pinned oracle-clean divergence), union ambient params the
+//!   existing union decline (probe `m` diagnoses `TS2345` spelling
+//!   `'string | number'` in tsc — a pinned oracle-error divergence), and
+//!   calls to bound non-functions (`declare const nc: number; nc(1)`, probes
+//!   `j`/`k`) decline distinctly (tsc spells `TS2349` plus `Type 'Number'
+//!   has no call signatures.` — lib wrapper names the subset never spells).
+//!
 //! Member calls on known values (P024, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p024-probes/`)):
 //! - The adapter emits member facts only for static member calls on a closed
@@ -4219,9 +4247,11 @@ impl NamedTypeScope<'static> {
 /// - No declaration bears the name: the call is skipped, never diagnosed.
 ///   A genuinely undeclared callee is already tracked as an unresolved
 ///   reference (see [`Binder::unresolved`]) — diagnosing would double-report
-///   one signal. A name that is neither declared nor unresolved-tracked is
-///   driver skew, recorded as [`UnsupportedDecl`] rather than silently
-///   dropped.
+///   one signal. A name the file binds but no declaration bears (a `declare
+///   const`, a class, or any other non-function meaning — P063) declines
+///   distinctly instead of joining the skew below. A name that is neither
+///   declared nor unresolved-tracked is driver skew, recorded as
+///   [`UnsupportedDecl`] rather than silently dropped.
 /// - Several declarations bear the name: more than one body means shadowing
 ///   (one [`UnsupportedDecl`] — implementations cannot be disambiguated),
 ///   else every `NoBody` signature resolves by any-match (see
@@ -4306,6 +4336,18 @@ fn check_one_call(
             // double-diagnose.
             return;
         }
+        if callee_bound_without_signature(binder, file, call.callee.as_str()) {
+            report.unsupported.push(UnsupportedDecl {
+                file,
+                span: call.callee_span,
+                reason: format!(
+                    "call to '{}': the name declares no function signature: \
+                    outside the subset",
+                    call.callee
+                ),
+            });
+            return;
+        }
         report.unsupported.push(UnsupportedDecl {
             file,
             span: call.callee_span,
@@ -4328,6 +4370,23 @@ fn check_one_call(
         return;
     }
     check_single_call(file, &decls[candidates[0]], call, scope, binder, report);
+}
+
+/// Whether `file` binds `callee` to a meaning with no function signature
+/// (P063): a `declare const`, a class, an import, or any other non-function
+/// binding a call cannot resolve against (tsc spells `TS2349`, which the
+/// subset never spells — so the site declines distinctly instead of joining
+/// the undeclared-name skew below). File-level, never scope-sensitive: the
+/// no-candidate path already guarantees no [`FunctionDecl`] bears the name
+/// anywhere in the file, so any same-named binding is a non-function
+/// meaning (the P024 shadowing-fold precedent — a decline reason, never a
+/// verdict). Structural symbol-set membership only (H-002: no occurrence
+/// state, no string-searching).
+fn callee_bound_without_signature(binder: &Binder, file: FileId, callee: &str) -> bool {
+    binder
+        .store()
+        .iter()
+        .any(|symbol| symbol.file == file && symbol.name == callee)
 }
 
 /// Checks one call site against exactly one declaration, pushing into
