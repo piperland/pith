@@ -177,6 +177,17 @@
 //! assertion arms classify `NonLiteral` with no member/cast facts: those
 //! arms decline distinctly solver-side instead of mis-checking.
 //!
+//! Member-reference facts (P053): [`InitFact`] and [`SingleReturnFact`]
+//! each carry an optional [`MemberRefFact`] for `Enum.Member` and
+//! `Enum["Member"]` (probed tsc 7.0.2; probes in
+//! `.agent/scratch/p053-probes/`). The fact records the head as written
+//! (`Color`, or dotted `NS.Color`), the member name (unescaped for string
+//! keys, so `Color["Red"]` records like `Color.Red`), the member-name span
+//! (the oracle's `TS2339` anchor), and the whole-expression span. Calls,
+//! numeric or dynamic keys, optional chains, private fields, and
+//! non-identifier heads record nothing: those positions keep their
+//! historical `NonLiteral` decline instead of mis-checking.
+//!
 //! Parameter enabling (P014, entailed by the call checker): each
 //! [`FunctionParamFact`] additionally carries its annotation text plus
 //! `optional`/`is_rest` markers. Range-arity checking reads them directly:
@@ -533,6 +544,11 @@ pub struct InitFact {
     /// `None` otherwise. The kind stays [`InitKind::NonLiteral` either
     /// way — the solver evaluates the ternary fact instead of the kind.
     pub ternary: Option<TernaryFact>,
+    /// Member-reference facts when the initializer is `Enum.Member` or
+    /// `Enum["Member"]` (P053); `None` otherwise. The kind stays
+    /// [`InitKind::NonLiteral`] either way — the solver resolves the head
+    /// through its enum tables instead of the kind.
+    pub member_ref: Option<MemberRefFact>,
 }
 
 /// One `const` declarator's declaration facts, keyed to its symbol.
@@ -707,6 +723,29 @@ pub struct TernaryFact {
     pub else_arm: TernaryArmFact,
 }
 
+/// Member-reference facts for one initializer or return expression (P053).
+///
+/// Present iff the expression is `Enum.Member` (a non-optional static member
+/// access over a plain-identifier or dotted-identifier head) or
+/// `Enum["Member"]` (a non-optional element access with a string-literal
+/// key over the same heads). The kind stays [`InitKind::NonLiteral`] /
+/// [`ReturnKind::NonLiteral` either way — the solver resolves the head
+/// through its enum tables and checks through the existing enum paths.
+/// Everything else (calls, numeric or dynamic keys, optional chains,
+/// private fields, deeper receivers) carries no fact: those positions keep
+/// their historical decline instead of mis-checking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberRefFact {
+    /// Head as written (`Color`, or dotted `NS.Color` for qualified refs).
+    pub head: String,
+    /// Member name as written (`Red`; the unescaped key for `["Red"]`).
+    pub member: String,
+    /// Span of the member name (the oracle's `TS2339` anchor).
+    pub member_span: Span,
+    /// Span of the whole member-access expression.
+    pub span: Span,
+}
+
 /// A straight-line `return <expr>;`: literal kind + span, plus member facts
 /// when the returned expression is an object literal (literal order).
 ///
@@ -730,6 +769,11 @@ pub struct SingleReturnFact {
     /// [`ReturnKind::NonLiteral`] either way — the solver evaluates the
     /// ternary fact instead of the kind.
     pub ternary: Option<TernaryFact>,
+    /// Member-reference facts when the returned expression is
+    /// `Enum.Member` or `Enum["Member"]` (P053); `None` otherwise. The
+    /// kind stays [`ReturnKind::NonLiteral`] either way — the solver
+    /// resolves the head through its enum tables instead of the kind.
+    pub member_ref: Option<MemberRefFact>,
 }
 
 /// One leading `const`/`let` declarator inside a straight-line body.
@@ -2166,6 +2210,89 @@ fn ternary_fact(source: &str, file: FileId, expression: &Expression<'_>) -> Opti
     })
 }
 
+/// Records member-reference facts for one initializer or return
+/// expression (P053): `Some` for `Enum.Member` and `Enum["Member"]` over
+/// plain-identifier or dotted-identifier heads, else `None`.
+///
+/// Heads unwind through nested non-optional static member accesses
+/// (`NS.Color.Red` records head `NS.Color`, member `Red`); element access
+/// needs a string-literal key (its unescaped value names the member, so
+/// `Color["Red"]` records exactly like `Color.Red`). Calls, numeric or
+/// dynamic keys, optional chains, private fields, parenthesized shapes, and
+/// non-identifier heads record nothing — the caller keeps its historical
+/// `NonLiteral` decline instead of mis-checking.
+#[must_use]
+fn member_ref_fact(file: FileId, expression: &Expression<'_>) -> Option<MemberRefFact> {
+    match expression {
+        Expression::StaticMemberExpression(member) => {
+            if member.optional {
+                return None;
+            }
+            let head = member_ref_head(&member.object)?;
+            let span = expression.span();
+            Some(MemberRefFact {
+                head,
+                member: member.property.name.to_string(),
+                member_span: Span {
+                    file,
+                    lo: member.property.span.start,
+                    hi: member.property.span.end,
+                },
+                span: Span {
+                    file,
+                    lo: span.start,
+                    hi: span.end,
+                },
+            })
+        }
+        Expression::ComputedMemberExpression(member) => {
+            if member.optional {
+                return None;
+            }
+            let Expression::StringLiteral(key) = &member.expression else {
+                return None;
+            };
+            let head = member_ref_head(&member.object)?;
+            let span = expression.span();
+            let key_span = member.expression.span();
+            Some(MemberRefFact {
+                head,
+                member: key.value.as_str().to_owned(),
+                member_span: Span {
+                    file,
+                    lo: key_span.start,
+                    hi: key_span.end,
+                },
+                span: Span {
+                    file,
+                    lo: span.start,
+                    hi: span.end,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Unwinds one member-reference head to its dotted name: a plain identifier
+/// names itself, a non-optional static member access extends its object's
+/// head (`NS.Color`); anything else (calls, element access, parentheses,
+/// optional chains) is `None`.
+fn member_ref_head(expression: &Expression<'_>) -> Option<String> {
+    match expression {
+        Expression::Identifier(ident) => Some(ident.name.to_string()),
+        Expression::StaticMemberExpression(member) => {
+            if member.optional {
+                return None;
+            }
+            let head = member_ref_head(&member.object)?;
+            let prop = member.property.name.as_str();
+            Some(format!("{head}.{prop}"))
+        }
+        _ => None,
+    }
+}
+
 /// Whether a member-call receiver names a known value with opaque lib
 /// signatures solver-side (`JSON`, `Object`, `Array`, `console`, `Math`).
 ///
@@ -2542,6 +2669,7 @@ fn single_return_fact(
             members: Some(members),
             cast: None,
             ternary: None,
+            member_ref: None,
         })
     } else {
         Some(SingleReturnFact {
@@ -2550,6 +2678,7 @@ fn single_return_fact(
             members: None,
             cast: cast_fact(source, file, argument),
             ternary: ternary_fact(source, file, argument),
+            member_ref: member_ref_fact(file, argument),
         })
     }
 }
@@ -2795,6 +2924,7 @@ fn straight_declarator(
             },
             cast: cast_fact(collector.source, collector.file, expression),
             ternary: ternary_fact(collector.source, collector.file, expression),
+            member_ref: member_ref_fact(collector.file, expression),
         }
     });
     let members = match declarator.init.as_ref() {
@@ -3925,6 +4055,7 @@ impl DeclCollector<'_> {
                 },
                 cast: cast_fact(self.source, self.file, expression),
                 ternary: ternary_fact(self.source, self.file, expression),
+                member_ref: member_ref_fact(self.file, expression),
             }
         });
 
@@ -5951,6 +6082,79 @@ export function f(a: string): string { return a + b; }
         let cast = second.cast.as_ref().expect("cast");
         assert_eq!(cast.operand_kind, CastOperandKind::NonLiteral);
         assert_eq!(cast.target_text.as_deref(), Some("number"));
+    }
+
+    #[test]
+    fn member_ref_facts_record_dot_and_bracket_heads() {
+        // P053: `Color.Red`, `Color["Red"]`, and `NS.Color.Red` record
+        // head/member/member-span/whole-span facts while the kind stays
+        // `NonLiteral`; calls, numeric or dynamic keys, and plain literals
+        // record nothing (slices cross-checked, never searched).
+        let src = "const a = Color.Red;\n\
+            const b = Color[\"Red\"];\n\
+            const c = NS.Color.Red;\n\
+            const d = Color.Red();\n\
+            const e = Color[0];\n\
+            const k = \"Red\";\n\
+            const f = Color[k];\n";
+        let pf = parse_module(FileId(6), "m.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.decls.len(), 7);
+        let first = pf.decls[0].init.as_ref().expect("initialized");
+        assert_eq!(first.kind, InitKind::NonLiteral);
+        let member = first.member_ref.as_ref().expect("member ref");
+        assert_eq!(member.head, "Color");
+        assert_eq!(member.member, "Red");
+        assert_eq!(slice_of(src, member.member_span), "Red");
+        assert_eq!(slice_of(src, member.span), "Color.Red");
+        let second = pf.decls[1].init.as_ref().expect("initialized");
+        assert_eq!(second.kind, InitKind::NonLiteral);
+        let member = second.member_ref.as_ref().expect("member ref");
+        assert_eq!(member.head, "Color");
+        assert_eq!(member.member, "Red");
+        assert_eq!(slice_of(src, member.member_span), "\"Red\"");
+        assert_eq!(slice_of(src, member.span), "Color[\"Red\"]");
+        let third = pf.decls[2].init.as_ref().expect("initialized");
+        let member = third.member_ref.as_ref().expect("member ref");
+        assert_eq!(member.head, "NS.Color");
+        assert_eq!(member.member, "Red");
+        assert_eq!(slice_of(src, member.span), "NS.Color.Red");
+        let kinds = [
+            InitKind::NonLiteral,
+            InitKind::NonLiteral,
+            InitKind::String,
+            InitKind::NonLiteral,
+        ];
+        for (decl, kind) in pf.decls.iter().skip(3).zip(kinds) {
+            let init = decl.init.as_ref().expect("initialized");
+            assert_eq!(init.kind, kind);
+            assert!(init.member_ref.is_none());
+        }
+    }
+
+    #[test]
+    fn member_ref_facts_record_return_positions() {
+        // P053: returned `Color.Red` records the same fact shape as const
+        // initializers; a literal return records nothing.
+        let src = "function f(): number {\n  return Color.Red;\n}\n\
+            function g(): number {\n  return 1;\n}\n";
+        let pf = parse_module(FileId(7), "r.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let FunctionBodyFact::SingleReturn(first) = &pf.functions[0].body else {
+            panic!("single return")
+        };
+        assert_eq!(first.kind, ReturnKind::NonLiteral);
+        let member = first.member_ref.as_ref().expect("member ref");
+        assert_eq!(member.head, "Color");
+        assert_eq!(member.member, "Red");
+        assert_eq!(slice_of(src, member.member_span), "Red");
+        assert_eq!(slice_of(src, member.span), "Color.Red");
+        let FunctionBodyFact::SingleReturn(second) = &pf.functions[1].body else {
+            panic!("single return")
+        };
+        assert_eq!(second.kind, ReturnKind::Number);
+        assert!(second.member_ref.is_none());
     }
 
     #[test]
