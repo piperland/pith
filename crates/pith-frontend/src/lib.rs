@@ -46,9 +46,14 @@
 //! ([`FunctionBodyFact::SequenceReturns`]), an `if`-without-`else`
 //! divergent return plus a tail return ([`FunctionBodyFact::GuardReturn`]),
 //! and a lone `if/else` with a return in each branch
-//! ([`FunctionBodyFact::BranchReturns`]). Their literal kind + span (plus
-//! member facts for returned `{ ... }` literals) feed the solver, as do the
-//! P031 straight bodies ([`FunctionBodyFact::StraightBody`]): leading
+//! ([`FunctionBodyFact::BranchReturns`]). P045 else-if chains (one or more
+//! `else if` links plus a terminal plain `else`, each branch exactly one
+//! `return <expr>;`) classify into [`FunctionBodyFact::ElseIfChain`]; a
+//! missing terminal `else`, a branch holding a nested `if`, and any other
+//! non-single-return branch classify into
+//! [`FunctionBodyFact::ElseIfUnsupported`] with the recorded reason. Their
+//! literal kind + span (plus member facts for returned `{ ... }` literals)
+//! feed the solver, as do the P031 straight bodies ([`FunctionBodyFact::StraightBody`]): leading
 //! `const`/`let` declarators (per-declarator identity, annotation, and
 //! initializer facts, plus member facts for `{ ... }` initializers) with a
 //! terminal literal `return`, single-level blocks flattened — each position
@@ -688,7 +693,8 @@ pub struct InnerDeclFact {
 ///
 /// Only [`FunctionBodyFact::SingleReturn`], the P023 joins
 /// ([`FunctionBodyFact::SequenceReturns`], [`FunctionBodyFact::GuardReturn`],
-/// [`FunctionBodyFact::BranchReturns`]), the P031 straight bodies
+/// [`FunctionBodyFact::BranchReturns`]), the P045 else-if chains
+/// ([`FunctionBodyFact::ElseIfChain`]), the P031 straight bodies
 /// ([`FunctionBodyFact::StraightBody`]), the P039 try/catch bodies
 /// ([`FunctionBodyFact::TryCatch`]), the P040 switch bodies
 /// ([`FunctionBodyFact::Switch`]), the P041 counted-`for` bodies
@@ -722,13 +728,33 @@ pub enum FunctionBodyFact {
     },
     /// Exactly one statement, `if (c) { return A; } else { return B; }`:
     /// tsc checks each branch return independently (probed 7.0.2 P023).
-    /// `else if` chains never reach facts (the whole statement declines
-    /// like any other non-simple guard shape).
+    /// `else if` chains classify separately (see [`FunctionBodyFact::ElseIfChain`]).
     BranchReturns {
         /// The `then` branch's `return` expression facts.
         then_branch: SingleReturnFact,
         /// The plain-`else` branch's `return` expression facts.
         else_branch: SingleReturnFact,
+    },
+    /// Exactly one statement, `if (c) { return A; } else if (d) { return B; }
+    /// else { return C; }` (one or more `else if` links plus a terminal
+    /// plain `else`, each branch exactly one `return <expr>;`, unwrapped
+    /// from single-statement blocks): tsc checks each branch return
+    /// independently (probed 7.0.2 P045). Any condition qualifies — returns
+    /// check independently of narrowing, so no guard fact is required (the
+    /// P023 condition precedent).
+    ElseIfChain {
+        /// One `return` fact per branch (the `if`, each `else if`, then the
+        /// terminal `else`), in source order.
+        branches: Vec<SingleReturnFact>,
+    },
+    /// An `else-if` shape outside the checkable
+    /// [`FunctionBodyFact::ElseIfChain`] form. The solver declines with
+    /// `reason` verbatim — never a partial verdict over the remaining
+    /// branches.
+    ElseIfUnsupported {
+        /// Why the `else-if` shape is outside the subset (missing terminal
+        /// `else`, nested chain, or a complex branch).
+        reason: String,
     },
     /// No body node: `declared` tells `declare function` apart from an
     /// overload signature.
@@ -2212,7 +2238,10 @@ fn return_members(
 /// three P023 joins classify (each return checks independently solver-side,
 /// probed tsc 7.0.2): two sequential returns, an `if`-without-`else`
 /// divergent return plus a tail return, and a lone `if/else` with a return
-/// in each branch. P031 straight bodies (leading `const`/`let` declarators
+/// in each branch. P045 else-if chains (one or more `else if` links plus a
+/// terminal plain `else`, each branch exactly one `return <expr>;`) classify
+/// into [`FunctionBodyFact::ElseIfChain`] or
+/// [`FunctionBodyFact::ElseIfUnsupported`]. P031 straight bodies (leading `const`/`let` declarators
 /// plus a terminal literal return, single-level blocks flattened) classify
 /// into [`FunctionBodyFact::StraightBody`]. P043 throw bodies classify two
 /// ways: an `if`-without-`else` guard throw plus a tail return (the tail
@@ -2243,7 +2272,7 @@ fn function_body_fact(
         [] => FunctionBodyFact::Empty,
         [Statement::ReturnStatement(ret)] => single_statement_return(collector, ret),
         [Statement::IfStatement(it)] => {
-            branch_returns(collector, it).unwrap_or(FunctionBodyFact::Complex)
+            branch_returns(collector, it).unwrap_or_else(|| else_if_chain(collector, it))
         }
         [Statement::TryStatement(candidate)] => try_catch_body(collector, candidate, None),
         [Statement::SwitchStatement(candidate)] => switch_body(collector, candidate),
@@ -2690,9 +2719,10 @@ fn guard_throw_tail(
 }
 
 /// A lone `if (c) { return A; } else { return B; }`: tsc checks each branch
-/// return independently (probed 7.0.2 P023). `else if` chains, `throw`/bare
-/// branches, and missing arguments yield `None` (the caller marks the body
-/// [`FunctionBodyFact::Complex`]).
+/// return independently (probed 7.0.2 P023). `else if` chains yield `None`
+/// (the caller tries [`else_if_chain`]); `throw`/bare branches and missing
+/// arguments yield `None` (the caller classifies the chain shape, which
+/// keeps [`FunctionBodyFact::Complex`] for plain non-chain bodies).
 #[must_use]
 fn branch_returns(collector: &DeclCollector<'_>, it: &IfStatement<'_>) -> Option<FunctionBodyFact> {
     let alternate: &Statement<'_> = it.alternate.as_ref()?;
@@ -2705,6 +2735,102 @@ fn branch_returns(collector: &DeclCollector<'_>, it: &IfStatement<'_>) -> Option
         then_branch: single_return_fact(collector, then_arg)?,
         else_branch: single_return_fact(collector, else_arg)?,
     })
+}
+
+/// An `if` statement the P023 [`branch_returns`] join declined: either an
+/// `else-if` chain (one or more `else if` links) or a plain shape the chain
+/// classifier also refuses. A chain whose every branch is exactly one
+/// `return <expr>;` with a terminal plain `else` admits as
+/// [`FunctionBodyFact::ElseIfChain`]; a missing terminal `else`, a branch
+/// holding a nested `if`, and any other non-single-return branch decline
+/// with distinct reasons (never a partial verdict). Plain non-chain shapes
+/// keep [`FunctionBodyFact::Complex`] — except a plain `if/else` holding a
+/// nested `if`, which earns the nested-chain reason.
+fn else_if_chain(collector: &DeclCollector<'_>, it: &IfStatement<'_>) -> FunctionBodyFact {
+    let unsupported = |reason: String| FunctionBodyFact::ElseIfUnsupported { reason };
+    let mut branches: Vec<&Statement<'_>> = vec![&it.consequent];
+    let mut current: &IfStatement<'_> = it;
+    let mut chained = false;
+    loop {
+        match current.alternate.as_ref() {
+            Some(Statement::IfStatement(next)) => {
+                chained = true;
+                branches.push(&next.consequent);
+                let link: &IfStatement<'_> = next;
+                current = link;
+            }
+            Some(terminal) => {
+                branches.push(terminal);
+                break;
+            }
+            None => break,
+        }
+    }
+    if current.alternate.is_none() {
+        // The spine ended without a terminal `else`: a lone `if` keeps
+        // `Complex`, while a chain of `else if`s declines as non-exhaustive
+        // (tsc's `TS2366` exhaustiveness error is a pinned gap — the subset
+        // has no declaration-completeness family).
+        if chained {
+            return unsupported("missing else in else-if chain is outside the subset".to_owned());
+        }
+        return FunctionBodyFact::Complex;
+    }
+    if !chained {
+        // A plain `if/else` that [`branch_returns`] refused: only a nested
+        // `if` earns its own reason — everything else keeps `Complex`.
+        if branches.iter().any(|branch| branch_has_nested_if(branch)) {
+            return unsupported("nested else-if chain is outside the subset".to_owned());
+        }
+        return FunctionBodyFact::Complex;
+    }
+    let mut facts = Vec::with_capacity(branches.len());
+    for branch in branches {
+        match else_if_branch(collector, branch) {
+            Ok(fact) => facts.push(fact),
+            Err(reason) => return unsupported(reason),
+        }
+    }
+    FunctionBodyFact::ElseIfChain { branches: facts }
+}
+
+/// Classifies one else-if-chain branch: exactly one `return <expr>;`
+/// (block-transparent, mirroring [`divergent_return_arg`]). A branch holding
+/// a nested `if` declines as a nested chain; every other non-single-return
+/// shape (`throw`, bare return, multi-statement, unrepresentable members)
+/// declines as a complex branch — each with its own reason.
+fn else_if_branch(
+    collector: &DeclCollector<'_>,
+    branch: &Statement<'_>,
+) -> Result<SingleReturnFact, String> {
+    if let Some(argument) = divergent_return_arg(branch) {
+        return single_return_fact(collector, argument)
+            .ok_or_else(|| "complex else-if branch is outside the subset".to_owned());
+    }
+    if branch_has_nested_if(branch) {
+        return Err("nested else-if chain is outside the subset".to_owned());
+    }
+    Err("complex else-if branch is outside the subset".to_owned())
+}
+
+/// Whether one chain branch holds a nested `if`: the statement itself, or
+/// the single statement of a (possibly nested) block wrapper. Deeper mixes
+/// (an `if` beside other statements) fail [`divergent_return_arg`] anyway
+/// and land on the complex-branch reason.
+#[must_use]
+fn branch_has_nested_if(mut branch: &Statement<'_>) -> bool {
+    loop {
+        match branch {
+            Statement::IfStatement(_) => return true,
+            Statement::BlockStatement(block) => {
+                let [only] = block.body.as_slice() else {
+                    return false;
+                };
+                branch = only;
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// A `try` statement plus a trailing `return <expr>;`: the tail checks as
@@ -5717,10 +5843,22 @@ export function f(a: string): string { return a + b; }
         let pf = parse_module(FileId(0), "u.ts", src);
         assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
         assert_eq!(pf.functions.len(), 7);
+        // The else-if chain admits now (P045): three branch positions in
+        // source order with exact expression spans.
+        let FunctionBodyFact::ElseIfChain { branches } = &pf.functions[0].body else {
+            panic!("expected else-if chain, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(branches.len(), 3);
+        assert_eq!(branches[0].kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, branches[0].span), "1");
+        assert_eq!(branches[1].kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, branches[1].span), "2");
+        assert_eq!(branches[2].kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, branches[2].span), "3");
         // Non-loop shapes stay complex, as does a `switch` paired with a
         // tail return; loops decline with their kind reason (a lone
         // infinite `for(;;)`, a `while` plus a tail return).
-        for fact in pf.functions.iter().take(4) {
+        for fact in pf.functions.iter().skip(1).take(3) {
             assert_eq!(fact.body, FunctionBodyFact::Complex);
         }
         assert_eq!(pf.functions[5].body, FunctionBodyFact::Complex);
@@ -5735,6 +5873,49 @@ export function f(a: string): string { return a + b; }
             FunctionBodyFact::LoopUnsupported {
                 reason: "while loop is outside the subset".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn function_facts_else_if_chain_admits_and_declines() {
+        let src = "function tight(a: boolean, b: boolean): number {\n  if (a) return 1;\n\
+                    else if (b) return 2;\n  else return 3;\n}\n\
+                    function open(a: boolean, b: boolean): number {\n  if (a) {\n    return 1;\n\
+                    } else if (b) {\n    return 2;\n  }\n}\n\
+                    function nested(a: boolean, b: boolean, c: boolean): number {\n  if (a) {\n\
+                    if (b) {\n      return 1;\n    } else if (c) {\n      return 2;\n    } else {\n\
+                    return 3;\n    }\n  } else {\n    return 4;\n  }\n}\n\
+                    function throwing(a: boolean, b: boolean): number {\n  if (a) {\n    return 1;\n\
+                    } else if (b) {\n    throw new Error(\"x\");\n  } else {\n    return 3;\n  }\n}\n";
+        let pf = parse_module(FileId(0), "e.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 4);
+        // Unbraced chain branches classify identically (three positions).
+        let FunctionBodyFact::ElseIfChain { branches } = &pf.functions[0].body else {
+            panic!("expected else-if chain, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(branches.len(), 3);
+        assert_eq!(slice_of(src, branches[1].span), "2");
+        // A missing terminal `else`, a nested chain, and a complex branch
+        // each decline with their own reason.
+        let reasons: Vec<&str> = pf
+            .functions
+            .iter()
+            .skip(1)
+            .map(|fact| {
+                let FunctionBodyFact::ElseIfUnsupported { reason } = &fact.body else {
+                    panic!("expected else-if decline, got {:?}", fact.body);
+                };
+                reason.as_str()
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "missing else in else-if chain is outside the subset",
+                "nested else-if chain is outside the subset",
+                "complex else-if branch is outside the subset",
+            ]
         );
     }
 
