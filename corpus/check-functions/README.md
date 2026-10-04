@@ -220,3 +220,29 @@ exact-arity breaches, arm `throw`s, several effect calls, and valued arm
 returns (unit-pinned); every other effect shape keeps `Complex`, so
 `isPlainObject` and destr's main `destr` keep their exact reasons.
 Probes in `.agent/scratch/p049-probes/`.
+
+## P050 sequential guard-return chains
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| guard-chain-clean.ts | clean | silent, 0 notes (3 guards + tail per position) |
+| guard-chain-wrong-guard.ts | 1x TS2322 (2nd guard) | 1x PITH2322 |
+| guard-chain-wrong-tail.ts | 1x TS2322 (tail) | 1x PITH2322 |
+| guard-chain-missing-tail.ts | 1x TS2366 | silent + 1 UNSUPPORTED (pinned divergence) |
+| guard-chain-interleaved-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| void-effect-guard-ident-tail.ts | 1x TS2322 (tail) | 1x PITH2322 (P048 resolution — V049 gap) |
+
+Differential: 6/6 match-or-pin (4 diagnostic/silent pairs + 1 pinned
+oracle-error divergence — guards without a tail report `TS2366` while the
+subset has no declaration-completeness family — + 1 pinned oracle-clean
+divergence: a `const` breaking the guard run needs flow facts the subset
+refuses). N consecutive `if (c) return X;` guards (at least two — a lone
+guard plus straight-line code keeps `Complex`) plus a terminal valued
+`return` check independently through the same synthetic delegation as
+joins (no fixpoint, single pass — any condition qualifies, the P023
+precedent); complex guards and bare tails decline with distinct recorded
+reasons (unit-pinned), never a partial verdict. Bare-identifier
+guard-effect tails resolve one level through P048 and check like
+literals (the V049 composition gap — `: void` diagnoses exactly like tsc
+while `: any` stays silent). Probes in
+`.agent/scratch/p050-probes/`.

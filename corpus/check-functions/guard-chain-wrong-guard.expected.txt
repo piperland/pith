@@ -1,0 +1,1 @@
+guard-chain-wrong-guard.ts:TS2322: Type 'string' is not assignable to type 'number'.
