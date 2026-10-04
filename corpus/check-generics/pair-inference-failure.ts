@@ -1,4 +1,4 @@
-// Solver verdict: 2 UNSUPPORTED (pass-through body + no inference candidate for `T`); oracle clean.
+// Solver verdict: 2 UNSUPPORTED (pass-through body + non-literal-source decline for `T`); oracle clean.
 function pair<T, U>(x: T, y: U): T {
   return x;
 }

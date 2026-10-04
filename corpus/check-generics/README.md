@@ -1,4 +1,12 @@
-# check-generics corpus (PITH-P016, multi-parameter PITH-P036)
+# check-generics corpus (PITH-P016, multi-parameter PITH-P036, identifier-argument PITH-P061)
+
+Generic identity-style functions `function id<T>(x: T): T` with explicit
+type arguments AND single-candidate inference from argument literals,
+extended to two or three independent type parameters (`function pair<T,
+U>(x: T, y: U): T`) with per-parameter inference, explicit lists, and
+per-position mismatch diagnostics — plus identifier-argument instantiation
+(one level through the P048 table: literal or P060-inferred const kinds and
+enclosing-function parameters bind per position; anything else declines).
 
 Generic identity-style functions `function id<T>(x: T): T` with explicit
 type arguments AND single-candidate inference from argument literals,
@@ -15,7 +23,7 @@ kept in the baselines and folded by the differential, like check-narrowing).
 | explicit-wrong.ts | 1x TS2345 (`Argument of type 'string' …`) | 1x PITH2345 at the argument + 1 UNSUPPORTED |
 | inferred-correct.ts | clean | silent calls (T binds per literal) + 1 UNSUPPORTED |
 | inferred-wrong.ts | 1x TS2322 (`Type 'string' … 'T'`) | 1x PITH2322 on the body (first line) + inference recorded |
-| inference-failure.ts | clean | 2 UNSUPPORTED (body + no candidate for `u`) |
+| inference-failure.ts | clean | 2 UNSUPPORTED (body + non-literal-source decline for `u`) |
 | multi-param-declined.ts | clean | silent calls (T, U bind per literal) + 1 UNSUPPORTED (body) |
 | constrained-declined.ts | clean | 1 UNSUPPORTED |
 | defaulted-declined.ts | clean | 1 UNSUPPORTED |
@@ -35,21 +43,26 @@ kept in the baselines and folded by the differential, like check-narrowing).
 | pair-explicit-wrong.ts | 1x TS2345 (explicit second argument vs `string`) | 1x PITH2345 at the argument + 1 UNSUPPORTED |
 | pair-explicit-count.ts | 2x TS2558 (`Expected 2 type arguments, but got 1/3.`) | 2x PITH2558 at each callee + 1 UNSUPPORTED |
 | triple-correct.ts | clean | silent calls (A, B, C bind per literal) + 1 UNSUPPORTED (body) |
-| pair-inference-failure.ts | clean | 2 UNSUPPORTED (body + no candidate for `T`) |
+| pair-inference-failure.ts | clean | 2 UNSUPPORTED (body + non-literal-source decline for `T`) |
+| ident-arg-clean.ts | clean | silent calls (T binds per identifier: inferred and annotated kinds) + 1 UNSUPPORTED (body) |
+| ident-arg-wrong.ts | 1x TS2345 (inferred `number` from the annotated source vs constraint) | 1x PITH2345 at the argument + 1 UNSUPPORTED (body) |
+| inferred-kind-arg.ts | 1x TS2345 (inferred `number` from the unannotated source vs constraint) | 1x PITH2345 at the argument + 1 UNSUPPORTED (body) |
+| param-sourced-arg.ts | clean | silent call (T binds from the enclosing parameter) + 1 UNSUPPORTED (body) |
+| cross-ident-pair.ts | clean | silent call (T, U bind per identifier position) + 1 UNSUPPORTED (body) |
+| unresolvable-declined.ts | 1x TS2304 (`Cannot find name 'nope'.`) | 2 UNSUPPORTED (distinct identifier decline + body) |
 
-Differential: 9 diagnostic pairs match (explicit-wrong TS2345,
+Differential: 11 diagnostic pairs match (explicit-wrong TS2345,
 inferred-wrong TS2322-first-line, constrained-wrong TS2345 + TS2344,
 defaulted-override TS2345, pair-wrong-first/second TS2345,
-pair-explicit-wrong TS2345, pair-explicit-count 2x TS2558); 8 clean
+pair-explicit-wrong TS2345, pair-explicit-count 2x TS2558,
+ident-arg-wrong TS2345, inferred-kind-arg TS2345); 11 clean
 admission matches (explicit/inferred/constrained/defaulted-correct,
 multi-param-declined, pair-correct, pair-explicit-correct,
-triple-correct); 8 declined fixtures pin their divergence explicitly
-(inference-failure, pair-inference-failure,
+triple-correct, ident-arg-clean, param-sourced-arg, cross-ident-pair);
+9 declined fixtures pin their divergence explicitly
+(inference-failure, pair-inference-failure, unresolvable-declined,
 constrained/defaulted-declined, union, object, keyof, conditional,
 mapped). No generic declaration is ever decl-silent, by tsc's own
-rule: literal bodies always fail against bare `T`, and pass-through
-(`return x`) bodies need expression facts the adapter does not emit — so
-every oracle-clean fixture pins a decline, never a false match.
 
 Probe rules (tsc 7.0.2, recorded in `pith-solver` docs): inferred call
 sites never error (each parameter binds from its own argument; uses error
@@ -66,5 +79,10 @@ Out of scope (declined with reasons, unit-pinned where no corpus fixture
 exists): more than three type parameters, required parameters after
 optional ones (tsc `TS2706`), nested `T` positions beyond union/object
 members (`T[]`, shaped type arguments), `in`/`out`/`const` modifiers,
-non-literal inference candidates, empty angle-bracket lists (tsc
-`TS1099`).
+non-identifier non-literal inference candidates, identifier sources beyond
+single-level literal/parameter propagation (`let` bindings, depth-2+
+chains, use-before-declaration, cross-file meanings — the P048 gates ride
+through), duplicate bare names sharing one slot (tsc binds the literal
+type — the P036 divergence), explicit type arguments over identifier
+arguments (the explicit path skips per-argument as before), empty
+angle-bracket lists (tsc `TS1099`).
