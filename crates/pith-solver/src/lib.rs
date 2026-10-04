@@ -94,10 +94,13 @@
 //!   independently of narrowing, so any condition qualifies.
 //! - A non-literal position declines the whole declaration with a
 //!   position-naming reason (never a partial verdict); loops,
-//!   `else-if` chains, `if/else` plus a tail return, `throw`/bare
+//!   `if/else` plus a tail return, `throw`/bare
 //!   branches outside admitted throw positions (P043), `continue`, and bare
 //!   returns stay [`FunctionBody::Complex`]
-//!   with the control-flow reason. `switch` bodies classify P040 (each
+//!   with the control-flow reason. `else-if` chains classify P045 (each
+//!   branch plus the terminal `else` exactly one `return <expr>;`): missing
+//!   terminal `else`, nested chains, and complex branches decline with
+//!   distinct recorded reasons instead. `switch` bodies classify P040 (each
 //!   `case` plus the optional `default` exactly one `return <expr>;`):
 //!   fallthrough, complex cases, case-level declarations, non-literal
 //!   discriminants or labels, and duplicate defaults decline with distinct
@@ -230,6 +233,28 @@
 //!   `SwitchUnsupported`), and any other multi-path body
 //!   ([`FunctionBody::Complex`]) — never a partial verdict over the
 //!   remaining positions.
+//!
+//! Else-if chains (P045, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p045-probes/`):
+//!
+//! - `if (a) return 1; else if (b) return 2; else return 3;` against
+//!   `: number` is clean; a wrong middle or `else` branch reports one
+//!   `TS2322` at its own position, and two wrong branches report twice —
+//!   each branch checks independently through the same synthetic delegation
+//!   as joins (no fixpoint, single pass). Any condition qualifies (the P023
+//!   precedent); single-statement blocks unwrap exactly like join branches.
+//! - A missing terminal `else` declines (`TS2366` in tsc — the subset has no
+//!   declaration-completeness family, so the checkable branches stay silent
+//!   plus one note: a pinned oracle-error divergence, like the missing
+//!   `default`). A branch holding a nested `if` declines as a nested chain
+//!   (clean in tsc — a pinned oracle-clean divergence), and any other
+//!   non-single-return branch (`throw`, bare return, multi-statement,
+//!   unrepresentable members) declines as a complex branch (throw arms are
+//!   clean in tsc — same pinned divergence as the P043 throw decline). Each
+//!   declines with a distinct reason, never a partial verdict.
+//! - An `else-if` chain paired with any other statement (e.g. a trailing
+//!   `return`) stays [`FunctionBody::Complex`]: two paths, no join (the
+//!   P023 `if/else`-plus-tail precedent — clean in tsc, probed).
 //!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
@@ -1140,8 +1165,10 @@ pub struct StraightBody {
 /// [`FunctionBody::TryCatch`] per arm (plus the optional tail), the P040
 /// [`FunctionBody::Switch`] per case (plus the optional default), the P041
 /// [`FunctionBody::CountedFor`] per position (loop body plus the optional
-/// tail), the P043 [`FunctionBody::GuardThrow`] tail, and the P043
-/// [`FunctionBody::StraightThrow`] leadings (plus the optional tail); the
+/// tail), the P043 [`FunctionBody::GuardThrow`] tail, the P043
+/// [`FunctionBody::StraightThrow`] leadings (plus the optional tail), and
+/// the P045 [`FunctionBody::ElseIfChain`] per branch (the `if`, each
+/// `else if`, then the terminal `else`); the
 /// rest decline to [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
@@ -1197,6 +1224,14 @@ pub enum FunctionBody {
     /// [`ConstDecl`] exactly like [`FunctionBody::StraightBody`] (a lone
     /// `throw` is the empty, tail-less form and checks silently).
     StraightThrow(StraightThrowBody),
+    /// Exactly one statement, `if (c) { return A; } else if (d) { return B; }
+    /// else { return C; }` (one or more `else if` links plus a terminal
+    /// plain `else`, each branch exactly one `return <expr>;`): tsc checks
+    /// each branch return independently (probed 7.0.2 P045). Each position
+    /// delegates through its own synthetic [`ConstDecl`] with its own
+    /// occurrence node, exactly like the P023 joins (no fixpoint, single
+    /// pass).
+    ElseIfChain(ElseIfChainBody),
     /// No body node: `declared` tells `declare function` apart from an
     /// overload signature.
     NoBody {
@@ -1231,10 +1266,18 @@ pub enum FunctionBody {
         /// Frontend-recorded decline reason.
         reason: String,
     },
+    /// An `else-if` chain outside the checkable [`FunctionBody::ElseIfChain`]
+    /// shape: the frontend recorded why (missing terminal `else`, nested
+    /// chain, or a complex branch). Shaping declines with the reason
+    /// verbatim — never a partial verdict.
+    ElseIfUnsupported {
+        /// Frontend-recorded decline reason.
+        reason: String,
+    },
     /// Anything else: longer/multi-path bodies (including a loop or `switch`
-    /// statement paired with a non-return statement), `else-if` chains,
-    /// `if/else` plus a tail return, `throw`/bare branches outside admitted
-    /// throw positions, `continue`, bare or missing `return`.
+    /// statement paired with a non-return statement), `if/else` plus a tail
+    /// return, an `else-if` chain plus a tail return, `throw`/bare branches
+    /// outside admitted throw positions, `continue`, bare or missing `return`.
     Complex,
 }
 
@@ -1341,6 +1384,24 @@ pub struct StraightThrowBody {
     pub tail: Option<FunctionReturn>,
 }
 
+/// A checkable `else-if` chain body (P045): one return per branch in source
+/// order (the `if`, each `else if`, then the terminal `else`), each checked
+/// independently.
+///
+/// Driver-mapped from the adapter's else-if fact variant (mechanical field
+/// copies, each position exactly like [`FunctionReturn`]). Each position
+/// delegates through its own synthetic [`ConstDecl`] with its own
+/// occurrence node (see [`check_functions`]), so per-occurrence state stays
+/// in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002, and
+/// counts/messages match tsc's per-position verdicts (no fixpoint, single
+/// pass — the P023 join semantics).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElseIfChainBody {
+    /// One `return` position per branch (the `if`, each `else if`, then the
+    /// terminal `else`), in source order.
+    pub branches: Vec<FunctionReturn>,
+}
+
 /// One `function name(params): ret` declaration to check.
 ///
 /// `name`/`span`/`scope`/`symbol` locate the declaration exactly like
@@ -1379,7 +1440,7 @@ pub struct FunctionDecl {
     pub return_annotation: Option<String>,
     /// Body shape; single returns, the three P023 joins, P031 straight
     /// bodies, P039 try/catch bodies, P040 switch bodies, P041 counted-`for`
-    /// bodies, and P043 throw bodies are checkable.
+    /// bodies, P043 throw bodies, and P045 else-if chains are checkable.
     pub body: FunctionBody,
 }
 
@@ -2167,7 +2228,8 @@ struct SynthReturn {
 /// (one for straight-line single returns, two for P023 joins, leading
 /// declarators plus the tail return for P031 straight bodies, arms plus the
 /// tail for P039 try/catch, cases plus the default for P040 switch, the
-/// loop body plus the tail for P041 counted-`for` — all in
+/// loop body plus the tail for P041 counted-`for`, one per branch for P045
+/// else-if chains — all in
 /// source order).
 #[derive(Debug)]
 struct ShapedBody {
@@ -2297,6 +2359,27 @@ fn shape_counted_for(
     Ok(positions)
 }
 
+/// Shapes one `else-if` chain body for [`function_shape`]: one
+/// [`SynthReturn`] per branch in source order — like the P023 join arms (no
+/// fixpoint, single pass; see the module-level else-if rules). Positions
+/// name their 1-based branch so a non-literal decline points at its branch.
+fn shape_else_if(
+    decl: &FunctionDecl,
+    body: &ElseIfChainBody,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    let mut positions = Vec::with_capacity(body.branches.len());
+    for (index, branch) in body.branches.iter().enumerate() {
+        let position = format!("branch {} return", index.saturating_add(1));
+        positions.push(shape_return(
+            branch,
+            &position,
+            return_site(decl, effective),
+        )?);
+    }
+    Ok(positions)
+}
+
 /// Shapes one guard-throw body for [`function_shape`]: the tail return —
 /// one [`SynthReturn`] through the same synthetic delegation as the P023
 /// guard tail (the guard throw emits no verdict and carries no facts — see
@@ -2386,6 +2469,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         FunctionBody::TryCatch(body) => shape_try_catch(decl, body, &effective)?,
         FunctionBody::Switch(body) => shape_switch(decl, body, &effective)?,
         FunctionBody::CountedFor(body) => shape_counted_for(decl, body, &effective)?,
+        FunctionBody::ElseIfChain(body) => shape_else_if(decl, body, &effective)?,
         FunctionBody::GuardThrow(body) => shape_guard_throw(decl, body, &effective)?,
         FunctionBody::StraightThrow(body) => shape_straight_throw(decl, body, &effective)?,
         FunctionBody::StraightBody(straight) => {
@@ -2422,7 +2506,8 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         }
         FunctionBody::TryUnsupported { reason }
         | FunctionBody::SwitchUnsupported { reason }
-        | FunctionBody::LoopUnsupported { reason } => {
+        | FunctionBody::LoopUnsupported { reason }
+        | FunctionBody::ElseIfUnsupported { reason } => {
             return Err(reason.clone());
         }
         FunctionBody::Complex => {
@@ -4582,6 +4667,8 @@ fn check_generic_decl(
         | FunctionBody::CountedFor(_)
         | FunctionBody::LoopUnsupported { .. }
         | FunctionBody::GuardThrow(_)
+        | FunctionBody::ElseIfChain(_)
+        | FunctionBody::ElseIfUnsupported { .. }
         | FunctionBody::StraightThrow(_) => {
             // Joined and straight returns over a bare type parameter need
             // per-position instantiation the subset refuses: decline like
