@@ -138,6 +138,7 @@ fn decls_from_handfed(
                 }),
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
             }
         })
         .collect()
@@ -176,6 +177,7 @@ fn functions_from_handfed(
                     }),
                     cast: None,
                     ternary: None,
+                    member_ref: None,
                 }),
             }
         })

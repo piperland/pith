@@ -120,6 +120,7 @@ fn decls_from_handfed(
                 init_array: None,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
             }
         })
         .collect()

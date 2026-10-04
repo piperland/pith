@@ -234,6 +234,10 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<C
                     .as_ref()
                     .and_then(|init| init.ternary.as_ref())
                     .map(|ternary| map_ternary(source, ternary)),
+                // No member-reference facts yet (the legacy const entry
+                // threads no enum tables, so those positions keep today's
+                // whole-declaration non-literal decline).
+                init_member_ref: None,
             }
         })
         .collect()

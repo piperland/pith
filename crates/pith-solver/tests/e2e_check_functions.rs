@@ -262,6 +262,10 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
             .ternary
             .as_ref()
             .map(|ternary| map_ternary(ternary, None)),
+        // No member-reference facts yet (the legacy function entry threads
+        // no enum tables, so those positions keep today's whole-declaration
+        // non-literal decline via `shape_return`).
+        member_ref: None,
     }
 }
 
@@ -474,6 +478,9 @@ fn map_inner_decl(
             .as_ref()
             .and_then(|init| init.cast.as_ref())
             .map(map_cast),
+        // No member-reference facts yet (the legacy function entry threads
+        // no enum tables — see `map_function_return`).
+        member_ref: None,
     }
 }
 

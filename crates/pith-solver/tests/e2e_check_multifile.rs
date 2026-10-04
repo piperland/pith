@@ -252,6 +252,7 @@ fn consts_from_facts(
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         });
         idents.push(ident.map(str::to_owned));
         texts.push(text);
@@ -289,6 +290,7 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
         init_array: None,
         cast: None,
         ternary: None,
+        member_ref: None,
     }
 }
 

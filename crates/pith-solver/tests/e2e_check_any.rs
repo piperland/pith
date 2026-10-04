@@ -226,6 +226,7 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<ConstDecl> {
                     .and_then(|init| init.cast.as_ref())
                     .map(map_cast),
                 init_ternary: None,
+                init_member_ref: None,
             }
         })
         .collect()
@@ -275,6 +276,7 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
         init_array: None,
         cast: ret.cast.as_ref().map(map_cast),
         ternary: None,
+        member_ref: None,
     }
 }
 

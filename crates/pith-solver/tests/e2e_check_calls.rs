@@ -179,6 +179,7 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
         init_array: None,
         cast: None,
         ternary: None,
+        member_ref: None,
     }
 }
 

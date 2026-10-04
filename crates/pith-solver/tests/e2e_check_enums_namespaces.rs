@@ -25,13 +25,14 @@
 //! The unresolved-head skip (`NS2.Foo`: tsc `TS2503`, solver silent) cannot
 //! differential-match by design and gets a dedicated skip test instead.
 
-use pith_frontend::{parse_module, EnumValueKind, ParsedFile};
+use pith_frontend::{parse_module, EnumValueKind, FunctionBodyFact, ParsedFile, ReturnKind};
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_enums_with_aliases, ConstDecl, DeclKind, EnumDecl, EnumInput, EnumMember,
-    EnumMemberValue, EnumShape, FileReport, InitKind, InterfaceHeritage, InterfaceMember,
-    InterfaceShape, NamespaceShape, ObjectInit, ObjectMemberInit, ObjectMemberKind, TypeAliasShape,
+    check_enums_with_aliases, check_functions_with_enums, ConstDecl, DeclKind, EnumDecl, EnumInput,
+    EnumMember, EnumMemberValue, EnumShape, FileReport, FunctionBody, FunctionDecl, FunctionReturn,
+    InitKind, InterfaceHeritage, InterfaceMember, InterfaceShape, MemberRef, NamespaceShape,
+    ObjectInit, ObjectMemberInit, ObjectMemberKind, TypeAliasShape,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -109,6 +110,21 @@ fn decls_from_handfed(
                 .and_then(|id| binder.store().get(id))
                 .map_or(symbol.span, |found| found.span);
             ground_init_text(parsed, source, symbol.index, spec);
+            // Member references ride the adapter's facts (P053): names and
+            // spans copy mechanically — never sliced text — so plain member
+            // initializers resolve through the enum tables.
+            let init_member_ref = parsed
+                .decls
+                .iter()
+                .find(|decl| decl.symbol == symbol.index)
+                .and_then(|decl| decl.init.as_ref())
+                .and_then(|init| init.member_ref.as_ref())
+                .map(|member| MemberRef {
+                    head: member.head.clone(),
+                    member: member.member.clone(),
+                    member_span: member.member_span,
+                    span: member.span,
+                });
             EnumDecl {
                 decl: ConstDecl {
                     name: symbol.name.clone(),
@@ -133,6 +149,7 @@ fn decls_from_handfed(
                     init_array: None,
                     cast: None,
                     init_ternary: None,
+                    init_member_ref,
                 },
                 init_text: spec.init_text.map(str::to_owned),
                 cross_file_deps: Vec::new(),
@@ -501,7 +518,7 @@ fn enum_string_literals_never_match() {
             },
         ],
         include_str!("../../../corpus/check-enums-namespaces/enum-string.expected.txt"),
-        1,
+        0,
     );
 }
 
@@ -537,7 +554,7 @@ fn enum_const_checks_identically() {
             },
         ],
         include_str!("../../../corpus/check-enums-namespaces/enum-const.expected.txt"),
-        1,
+        0,
     );
 }
 
@@ -645,6 +662,334 @@ fn ns_enum_qualified_checks_with_short_name() {
             },
         ],
         include_str!("../../../corpus/check-enums-namespaces/ns-enum.expected.txt"),
+        1,
+    );
+}
+
+/// Maps one frontend return kind to the solver's (mechanical, mirroring
+/// the check-functions driver's kind map).
+fn map_member_return_kind(kind: ReturnKind) -> InitKind {
+    match kind {
+        ReturnKind::Number => InitKind::Number,
+        ReturnKind::String => InitKind::String,
+        ReturnKind::Boolean(_) => InitKind::Boolean,
+        ReturnKind::Null => InitKind::Null,
+        ReturnKind::Undefined => InitKind::Undefined,
+        ReturnKind::NonLiteral => InitKind::NonLiteral,
+    }
+}
+
+/// Runs the function pipeline on one fixture source: every single-return
+/// function maps mechanically (names, scopes, and spans from adapter
+/// facts; kinds and member references copied) and checks through
+/// [`check_functions_with_enums`], so enum member-reference returns
+/// differential-match exactly like const initializers. Only
+/// [`FunctionBodyFact::SingleReturn`] bodies map — the fixture holds no
+/// other shape.
+fn run_function_pipeline(source: &str) -> FileReport {
+    let parsed = parse_module(FILE, "fixture.ts", source);
+    let frontend_errors = &parsed.errors;
+    assert!(
+        parsed.errors.is_empty(),
+        "frontend errors: {frontend_errors:?}"
+    );
+    let binder = build_binder(&parsed);
+    let decls: Vec<FunctionDecl> = parsed
+        .functions
+        .iter()
+        .map(|func| {
+            let index = usize::try_from(func.symbol).expect("dense symbol index");
+            let symbol = &parsed.symbols[index];
+            let id: Option<SymbolId> = binder.resolve(parsed.file, func.scope, &symbol.name);
+            let span: Span = id
+                .and_then(|id| binder.store().get(id))
+                .map_or(symbol.span, |found| found.span);
+            let FunctionBodyFact::SingleReturn(ret) = &func.body else {
+                panic!("fixture holds only single returns");
+            };
+            FunctionDecl {
+                name: symbol.name.clone(),
+                span,
+                scope: func.scope,
+                symbol: id,
+                params: Vec::new(),
+                params_complex: false,
+                is_async: false,
+                has_type_params: false,
+                return_annotation: func.return_annotation.as_ref().map(|ann| ann.text.clone()),
+                body: FunctionBody::SingleReturn(FunctionReturn {
+                    kind: Some(map_member_return_kind(ret.kind)),
+                    init_ident: None,
+                    init_object: None,
+                    init_array: None,
+                    cast: None,
+                    ternary: None,
+                    member_ref: ret.member_ref.as_ref().map(|member| MemberRef {
+                        head: member.head.clone(),
+                        member: member.member.clone(),
+                        member_span: member.member_span,
+                        span: member.span,
+                    }),
+                }),
+            }
+        })
+        .collect();
+    let enums = enums_from_facts(&parsed, &binder);
+    let interfaces = interfaces_from_facts(&parsed, &binder);
+    let namespaces = namespaces_from_facts(&parsed, &binder);
+    let input = EnumInput {
+        enums: &enums,
+        interfaces: &interfaces,
+        namespaces: &namespaces,
+    };
+    let mut db = QueryDb::new();
+    check_functions_with_enums(FILE, &decls, &input, &binder, &mut db)
+}
+
+/// Asserts the function pipeline verdict differentially equals the recorded
+/// baseline: same `(code-family, message)` multiset plus the expected
+/// unsupported count, with sane anchored spans throughout (mirrors
+/// [`expect_differential`] for function positions).
+fn expect_function_differential(name: &str, source: &str, expected: &str, unsupported: usize) {
+    let report = run_function_pipeline(source);
+    let mut actual: Vec<(String, String)> = report
+        .diagnostics
+        .iter()
+        .map(|diag| {
+            let family = diag
+                .code
+                .strip_prefix("PITH")
+                .unwrap_or(diag.code.as_str())
+                .to_owned();
+            (format!("TS{family}"), diag.message.clone())
+        })
+        .collect();
+    actual.sort();
+    let want = parse_baseline(expected);
+    assert_eq!(
+        actual, want,
+        "{name}: pipeline diagnostics diverge from oracle baseline"
+    );
+    let unsupported_notes = &report.unsupported;
+    assert_eq!(
+        report.unsupported.len(),
+        unsupported,
+        "{name}: unsupported count: {unsupported_notes:?}"
+    );
+    for diag in &report.diagnostics {
+        assert_eq!(diag.file, FILE, "{name}: diagnostic file");
+        assert!(diag.span.lo < diag.span.hi, "{name}: degenerate span");
+    }
+    for note in &report.unsupported {
+        assert_eq!(note.file, FILE, "{name}: unsupported file");
+        assert!(note.span.lo < note.span.hi, "{name}: degenerate span");
+    }
+}
+
+#[test]
+fn enum_member_refs_resolve_by_identity() {
+    expect_differential(
+        "enum_member_refs_resolve_by_identity",
+        include_str!("../../../corpus/check-enums-namespaces/enum-member-refs.ts"),
+        &[
+            HandFed {
+                name: "a",
+                kind: DeclKind::Const,
+                annotation: Some("Color"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "b",
+                kind: DeclKind::Const,
+                annotation: Some("Color"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "c",
+                kind: DeclKind::Const,
+                annotation: Some("Color"),
+                init: Some(InitKind::Number),
+                members: None,
+                init_text: Some("5"),
+            },
+            HandFed {
+                name: "d",
+                kind: DeclKind::Const,
+                annotation: Some("Other"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "e",
+                kind: DeclKind::Const,
+                annotation: Some("Other"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "f",
+                kind: DeclKind::Const,
+                annotation: Some("Str"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "g",
+                kind: DeclKind::Const,
+                annotation: Some("Str"),
+                init: Some(InitKind::String),
+                members: None,
+                init_text: Some("\"a\""),
+            },
+            HandFed {
+                name: "h",
+                kind: DeclKind::Const,
+                annotation: Some("Color"),
+                init: Some(InitKind::Boolean),
+                members: None,
+                init_text: Some("true"),
+            },
+        ],
+        include_str!("../../../corpus/check-enums-namespaces/enum-member-refs.expected.txt"),
+        0,
+    );
+}
+
+#[test]
+fn enum_member_ref_singleton_source_spells_enum() {
+    expect_differential(
+        "enum_member_ref_singleton_source_spells_enum",
+        include_str!("../../../corpus/check-enums-namespaces/enum-member-singleton-source.ts"),
+        &[
+            HandFed {
+                name: "a",
+                kind: DeclKind::Const,
+                annotation: Some("Other"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "b",
+                kind: DeclKind::Const,
+                annotation: Some("Color"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "c",
+                kind: DeclKind::Const,
+                annotation: Some("Color"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "d",
+                kind: DeclKind::Const,
+                annotation: Some("Other"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+        ],
+        include_str!(
+            "../../../corpus/check-enums-namespaces/enum-member-singleton-source.expected.txt"
+        ),
+        0,
+    );
+}
+
+#[test]
+fn enum_member_refs_into_computed_decline() {
+    expect_differential(
+        "enum_member_refs_into_computed_decline",
+        include_str!("../../../corpus/check-enums-namespaces/enum-member-computed-declined.ts"),
+        &[
+            HandFed {
+                name: "p",
+                kind: DeclKind::Const,
+                annotation: Some("Comp"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "q",
+                kind: DeclKind::Const,
+                annotation: Some("Comp"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "r",
+                kind: DeclKind::Const,
+                annotation: Some("Cross"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "s",
+                kind: DeclKind::Const,
+                annotation: Some("Cross"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+        ],
+        include_str!(
+            "../../../corpus/check-enums-namespaces/enum-member-computed-declined.expected.txt"
+        ),
+        4,
+    );
+}
+
+#[test]
+fn enum_member_refs_into_ambient_decline() {
+    expect_differential(
+        "enum_member_refs_into_ambient_decline",
+        include_str!("../../../corpus/check-enums-namespaces/enum-member-ambient-declined.ts"),
+        &[
+            HandFed {
+                name: "a",
+                kind: DeclKind::Const,
+                annotation: Some("Amb"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+            HandFed {
+                name: "b",
+                kind: DeclKind::Const,
+                annotation: Some("Amb"),
+                init: Some(InitKind::NonLiteral),
+                members: None,
+                init_text: None,
+            },
+        ],
+        include_str!(
+            "../../../corpus/check-enums-namespaces/enum-member-ambient-declined.expected.txt"
+        ),
+        2,
+    );
+}
+
+#[test]
+fn enum_member_ref_returns_check_per_position() {
+    expect_function_differential(
+        "enum_member_ref_returns_check_per_position",
+        include_str!("../../../corpus/check-enums-namespaces/enum-member-returns.ts"),
+        include_str!("../../../corpus/check-enums-namespaces/enum-member-returns.expected.txt"),
         2,
     );
 }
