@@ -93,6 +93,13 @@
 //! 7.0.2). Malformed effect arms (a `throw`, several effect calls, a valued
 //! arm return) are [`FunctionBodyFact::EffectUnsupported`] with the recorded
 //! reason; every other effect shape keeps [`FunctionBodyFact::Complex`].
+//! P050 guard chains ([`FunctionBodyFact::GuardChain`]): N consecutive
+//! `if`-without-`else` guard returns (at least two — a lone guard plus
+//! straight-line code keeps [`FunctionBodyFact::Complex`]) plus a terminal
+//! valued `return`, each checking independently solver-side (probed tsc
+//! 7.0.2) — while guard pairs without a tail, non-guard statements breaking
+//! the run, complex guards, and bare tails are
+//! [`FunctionBodyFact::GuardChainUnsupported`] with the recorded reason.
 //! Bodies without a node are
 //! [`FunctionBodyFact::NoBody`], statement-less bodies are
 //! [`FunctionBodyFact::Empty`], and everything else (longer/multi-path
@@ -727,7 +734,8 @@ pub struct EffectCallFact {
 ///
 /// Only [`FunctionBodyFact::SingleReturn`], the P023 joins
 /// ([`FunctionBodyFact::SequenceReturns`], [`FunctionBodyFact::GuardReturn`],
-/// [`FunctionBodyFact::BranchReturns`]), the P045 else-if chains
+/// [`FunctionBodyFact::BranchReturns`]), the P050 guard chains
+/// ([`FunctionBodyFact::GuardChain`]), the P045 else-if chains
 /// ([`FunctionBodyFact::ElseIfChain`]), the P031 straight bodies
 /// ([`FunctionBodyFact::StraightBody`]), the P039 try/catch bodies
 /// ([`FunctionBodyFact::TryCatch`]), the P040 switch bodies
@@ -761,6 +769,28 @@ pub enum FunctionBodyFact {
         guard: SingleReturnFact,
         /// The trailing `return`'s expression facts.
         tail: SingleReturnFact,
+    },
+    /// N consecutive `if (c) return <expr>;` guards with no `else` (at least
+    /// two — a lone guard plus straight-line code keeps
+    /// [`FunctionBodyFact::Complex`]) plus a terminal `return <expr>;`: tsc
+    /// checks each position independently (probed 7.0.2 P050). Any condition
+    /// qualifies — returns check independently of narrowing, so no guard
+    /// fact is required (the P023 condition precedent).
+    GuardChain {
+        /// One `return` fact per guard, in source order.
+        guards: Vec<SingleReturnFact>,
+        /// The terminal `return`'s expression facts.
+        tail: SingleReturnFact,
+    },
+    /// A guard-chain shape outside the checkable
+    /// [`FunctionBodyFact::GuardChain`] form. The solver declines with
+    /// `reason` verbatim — never a partial verdict over the remaining
+    /// positions.
+    GuardChainUnsupported {
+        /// Why the guard chain is outside the subset (a missing tail return,
+        /// a non-guard statement between the guards, a complex guard, or a
+        /// bare tail).
+        reason: String,
     },
     /// Exactly one statement, `if (c) { return A; } else { return B; }`:
     /// tsc checks each branch return independently (probed 7.0.2 P023).
@@ -2363,7 +2393,9 @@ fn function_body_fact(
             .or_else(|| loop_tail_pair(first, second))
             .or_else(|| straight_body(collector, body.statements.as_slice()))
             .unwrap_or(FunctionBodyFact::Complex),
-        statements => straight_body(collector, statements).unwrap_or(FunctionBodyFact::Complex),
+        statements => guard_chain_body(collector, statements)
+            .or_else(|| straight_body(collector, statements))
+            .unwrap_or(FunctionBodyFact::Complex),
     }
 }
 
@@ -2689,8 +2721,8 @@ fn straight_declarator(
 
 /// Two-statement bodies beyond straight-line single returns: two sequential
 /// returns, then guard-then-tail, then guard-throw-then-tail, then
-/// guard-effect-then-tail. Anything else yields `None` (the caller marks
-/// the body [`FunctionBodyFact::Complex`]).
+/// guard-effect-then-tail, then a guard pair with no tail. Anything else
+/// yields `None` (the caller marks the body [`FunctionBodyFact::Complex`]).
 #[must_use]
 fn joined_pair(
     collector: &DeclCollector<'_>,
@@ -2701,6 +2733,7 @@ fn joined_pair(
         .or_else(|| guard_tail_returns(collector, first, second))
         .or_else(|| guard_throw_tail(collector, first, second))
         .or_else(|| guard_effect_tail(collector, first, second))
+        .or_else(|| guard_pair_missing_tail(collector, first, second))
 }
 
 /// Two top-level `return <expr>;` statements: tsc checks both, unreachable
@@ -2957,6 +2990,104 @@ fn guard_effect_tail(
         call: call.clone(),
         tail,
     })
+}
+
+/// One guard-return position of a guard chain (P050): an `if` without `else`
+/// whose consequent is exactly one `return <expr>;` (block-transparent,
+/// mirroring [`divergent_return_arg`]). Any condition qualifies (the P023
+/// precedent — conditions never narrow, so member-call and `in`-operator
+/// tests guard exactly like plain ones); `else` branches, non-return
+/// consequents, and unrepresentable arms yield `None`.
+#[must_use]
+fn chain_guard_fact(
+    collector: &DeclCollector<'_>,
+    statement: &Statement<'_>,
+) -> Option<SingleReturnFact> {
+    let Statement::IfStatement(it) = statement else {
+        return None;
+    };
+    if it.alternate.is_some() {
+        return None;
+    }
+    let argument = divergent_return_arg(&it.consequent)?;
+    single_return_fact(collector, argument)
+}
+
+/// Two consecutive guard returns with no tail (P050): tsc reports `TS2366`
+/// (the declaration-completeness family the subset refuses — probed 7.0.2),
+/// so the body declines with the missing-tail reason instead of verdicting
+/// partially. Anything else yields `None` (the caller keeps
+/// [`FunctionBodyFact::Complex`] — today's behavior).
+#[must_use]
+fn guard_pair_missing_tail(
+    collector: &DeclCollector<'_>,
+    first: &Statement<'_>,
+    second: &Statement<'_>,
+) -> Option<FunctionBodyFact> {
+    chain_guard_fact(collector, first)?;
+    chain_guard_fact(collector, second)?;
+    Some(FunctionBodyFact::GuardChainUnsupported {
+        reason: "missing tail return after guard returns is outside the subset".to_owned(),
+    })
+}
+
+/// N consecutive guard returns plus a terminal `return` (P050): each guard
+/// checks independently solver-side (probed tsc 7.0.2). The chain signal is
+/// two consecutive guards — a lone guard plus straight-line code yields
+/// `None` (the caller falls through to the straight body, then
+/// [`FunctionBodyFact::Complex`]: today's behavior, so the gate steals
+/// nothing).
+///
+/// Breaks decline with distinct reasons instead of verdicting partially: an
+/// `if` past the second guard is a complex guard, any other mid-run
+/// statement interleaves the run, a body ending without a tail return (or
+/// with a bare tail) declines as missing/bare. A tail the facts cannot
+/// represent (unrepresentable object members) yields `None` — the caller
+/// falls through to [`FunctionBodyFact::Complex`], like every other
+/// unrepresentable tail.
+#[must_use]
+fn guard_chain_body(
+    collector: &DeclCollector<'_>,
+    statements: &[Statement<'_>],
+) -> Option<FunctionBodyFact> {
+    let unsupported = |reason: String| FunctionBodyFact::GuardChainUnsupported { reason };
+    let last = statements.len().checked_sub(1)?;
+    if last < 2 {
+        return None;
+    }
+    let mut guards = Vec::with_capacity(last);
+    for statement in &statements[..last] {
+        if let Some(guard) = chain_guard_fact(collector, statement) {
+            guards.push(guard);
+        } else {
+            if guards.len() < 2 {
+                return None;
+            }
+            if matches!(statement, Statement::IfStatement(_)) {
+                return Some(unsupported(
+                    "complex guard in guard chain is outside the subset".to_owned(),
+                ));
+            }
+            return Some(unsupported(
+                "non-guard statement between guard returns is outside the subset".to_owned(),
+            ));
+        }
+    }
+    match &statements[last] {
+        Statement::ReturnStatement(ret) => match ret.argument.as_ref() {
+            Some(argument) => single_return_fact(collector, argument)
+                .map(|tail| FunctionBodyFact::GuardChain { guards, tail }),
+            None => Some(unsupported(
+                "bare tail return in guard chain is outside the subset".to_owned(),
+            )),
+        },
+        Statement::IfStatement(_) => Some(unsupported(
+            "complex guard in guard chain is outside the subset".to_owned(),
+        )),
+        _ => Some(unsupported(
+            "missing tail return after guard returns is outside the subset".to_owned(),
+        )),
+    }
 }
 
 /// A lone `if (c) { return A; } else { return B; }`: tsc checks each branch
@@ -6167,6 +6298,66 @@ export function f(a: string): string { return a + b; }
                 "complex else-if branch is outside the subset",
             ]
         );
+    }
+
+    #[test]
+    fn function_facts_guard_chain_admits_and_declines() {
+        // Three guards plus a tail admit with per-position facts; guard
+        // pairs without a tail, mid-run statements, complex guards, and bare
+        // tails each decline with their own reason (probed tsc 7.0.2 P050).
+        // A lone guard plus straight-line code is not a chain: it keeps
+        // `Complex`.
+        let src =
+            "function chained(a: boolean, b: boolean, c: boolean): number {\n  if (a) return 1;\n\
+                    if (b) return 2;\n  if (c) return 3;\n  return 4;\n}\n\
+                    function pair(a: boolean, b: boolean): number {\n  if (a) return 1;\n\
+                    if (b) return 2;\n}\n\
+                    function mixed(a: boolean, b: boolean): number {\n  if (a) return 1;\n\
+                    if (b) return 2;\n  const x: number = 3;\n  return 4;\n}\n\
+                    function ragged(a: boolean, b: boolean): number {\n  if (a) return 1;\n\
+                    if (b) return 2;\n  if (a) {\n    return 3;\n  } else {\n    return 4;\n  }\n\
+                    return 5;\n}\n\
+                    function bare(a: boolean, b: boolean): number {\n  if (a) return 1;\n\
+                    if (b) return 2;\n  return;\n}\n\
+                    function single(a: boolean): number {\n  if (a) return 1;\n\
+                    const x: number = 2;\n  return 3;\n}\n";
+        let pf = parse_module(FileId(0), "g.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 6);
+        // Three guards plus the tail classify with exact expression spans.
+        let FunctionBodyFact::GuardChain { guards, tail } = &pf.functions[0].body else {
+            panic!("expected guard chain, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(guards.len(), 3);
+        assert_eq!(slice_of(src, guards[0].span), "1");
+        assert_eq!(slice_of(src, guards[1].span), "2");
+        assert_eq!(slice_of(src, guards[2].span), "3");
+        assert_eq!(slice_of(src, tail.span), "4");
+        // A missing tail, a mid-run statement, a complex guard, and a bare
+        // tail each decline with their own reason.
+        let reasons: Vec<&str> = pf
+            .functions
+            .iter()
+            .skip(1)
+            .take(4)
+            .map(|fact| {
+                let FunctionBodyFact::GuardChainUnsupported { reason } = &fact.body else {
+                    panic!("expected guard-chain decline, got {:?}", fact.body);
+                };
+                reason.as_str()
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "missing tail return after guard returns is outside the subset",
+                "non-guard statement between guard returns is outside the subset",
+                "complex guard in guard chain is outside the subset",
+                "bare tail return in guard chain is outside the subset",
+            ]
+        );
+        // A lone guard never starts a chain.
+        assert_eq!(pf.functions[5].body, FunctionBodyFact::Complex);
     }
 
     #[test]
