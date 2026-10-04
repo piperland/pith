@@ -702,9 +702,11 @@
 //!   diagnoses `TS2322: Type '"a"' is not assignable to type 'Str'.`
 //!   (double-quote spelling — fixtures stay double-quoted). Booleans spell
 //!   literally (`Type 'true'`); `null`/`undefined` spell widened.
-//! - Member accesses (`Color.Red`, `Color["Red"]`) are clean in tsc but
-//!   inexpressible without expression facts: non-literal initializers
-//!   decline (the largest pinned oracle-clean divergence here).
+//! - Member accesses (`Color.Red`, `Color["Red"]`) are clean in tsc:
+//!   plain `Enum.Member` / `Enum["Member"]` initializers and returns now
+//!   resolve through the P053 member-reference facts below; computed,
+//!   dynamic, and unknown members still decline (no expression facts
+//!   beyond the reference shape).
 //! - Object literals diagnose compositionally (`Type '{}' is not assignable
 //!   to type 'Color'.`); missing initializers decline with the usual reason.
 //! - `const enum` behaves identically (probed: `0` clean, `7` errors) —
@@ -748,9 +750,11 @@
 //! - An unresolvable head already tracked as an unresolved reference skips
 //!   silently (the [`check_calls`] precedent: tracked once, never
 //!   double-diagnosed — tsc's `TS2503` is the folded differential).
-//! - Value positions (`NS.VAL` initializers, `NS.Dir.Up` uses) are clean in
-//!   tsc but inexpressible without expression facts: non-literal declines
-//!   (pinned oracle-clean divergences).
+//! - Value positions (`NS.VAL` initializers) are clean in tsc but
+//!   inexpressible without expression facts: non-literal declines (pinned
+//!   oracle-clean divergences) — except qualified enum member uses
+//!   (`NS.Dir.Up`), which now resolve through the P053 member-reference
+//!   facts below.
 //!
 //! [`check_enums`] routes each declaration: `{...}`/primitive/union
 //! spellings delegate to [`check_one`] unchanged; other names resolve to
@@ -830,6 +834,55 @@
 //!   exactly as before. Terminal primitives rewrite the spelling, terminal
 //!   interfaces/enums relink with the underlying display — one family per
 //!   site, bounded iteration, never unbounded recursion.
+//!
+//! Enum member value references (P053, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p053-probes/`,
+//! extending the P018 probe record by reference):
+//!
+//! - Identity, not value: a known member of the SAME enum is clean even
+//!   when its literal never matches (`Str.A` against `Str` is clean while
+//!   `"a"` diagnoses — probes `m2`), while a member of ANOTHER enum always
+//!   diagnoses `TS2322` even when values coincide (`Other.One` against
+//!   `Color` diagnoses despite `1` matching — probe `m7`).
+//! - Source-cardinality spelling (verifier flip of the uniform-`Enum.Member`
+//!   rule, probed tsc 7.0.2): a single-member source enum spells the enum
+//!   alone (`Other.Zero` against `Color` spells `Type 'Other'` — the crux
+//!   probe `enum A{X=1} enum B{X=1} const b:B=A.X`; string singletons too:
+//!   `S.A` against `T` spells `Type 'S'` — edge probe `e1`), while a
+//!   multi-member source spells `Enum.Member` (`Color.Red` against `Other`
+//!   spells `Type 'Color.Red'` — probes `m7`/`m8`). The earlier
+//!   numeric-vs-string attribution was wrong: `m8`'s `Color` held one member
+//!   and `Str` held two, so cardinality explains both spellings.
+//!   Namespace-qualified singleton sources spell the stripped name
+//!   (`NS.Solo.Only` spells `Type 'Solo'` — edge probe `e5`). Ambient
+//!   (`Amb1` — `e5`) and computed (`C1` — `e6`) singleton sources follow the
+//!   same tsc rule for the record, but stay declined here (the P018 gates
+//!   fire first — pinned oracle-clean divergences).
+//! - `Enum["Member"]` checks exactly like `Enum.Member` (probes `m1`,
+//!   `m14`, `m16` — cross-enum bracket refs spell the cardinality form), as
+//!   do `const` enums (probe `m12` — `is_const` still never forks) and
+//!   namespace-qualified heads (`NS.Color.Red` clean, multi-member
+//!   mismatches spell the stripped `Color.Red` — probes `m13`, `m17`).
+//! - Return positions check the same way at return spans (probe `m16`:
+//!   cross-enum returns diagnose `TS2322` spelling `Color.Red` at the
+//!   returned expression; same-enum returns stay silent).
+//! - Unknown members diagnose `TS2339` at the member (`Color.Nope` —
+//!   probes `m6`, `m9`, pinned: the subset spells no `TS2339`, so those
+//!   decline distinctly); numeric indices reverse-map to `string`
+//!   (`Color[0]` spells `Type 'string'` — probe `m9`, declined: keys carry
+//!   no member facts); dynamic indices diagnose `TS7015` (probe `m11`,
+//!   declined); calls diagnose at the call (`Color.Red()` spells `TS2349` —
+//!   probe `m10`, declined); deeper accesses diagnose `TS2339`
+//!   (`Color.Red.Green` — probe `m9`, declined); unknown heads diagnose
+//!   `TS2304` (probe `m10`, skipped-or-declined per the tracked-name rule).
+//! - Computed members fold in tsc (`Comp.B`, `Cross.Y` clean — probes `m4`,
+//!   `m15`) but stay declined here (no const-eval beyond recorded values —
+//!   the P018 whole-enum gate fires first). Ambient member refs are clean
+//!   in tsc (`Amb.A` — probes `m5`, `m15`) but stay declined here (the P018
+//!   ambient gate fires first — pinned oracle-clean divergences).
+//! - Boolean enums need no rule: tsc rejects boolean member initializers
+//!   with `TS18033` at the declaration (probe `m3`), so no shape ever holds
+//!   one; boolean literals keep the existing P018 literal spelling.
 //!
 //! Single-level identifier literal propagation (P048, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p048-probes/`):
@@ -1292,6 +1345,30 @@ pub struct TernaryInit {
     pub else_arm: TernaryArm,
 }
 
+/// One `Enum.Member` / `Enum["Member"]` initializer or return (P053).
+///
+/// Driver-mapped from the adapter's [`MemberRefFact`](pith_frontend::MemberRefFact)
+/// (mechanical field copies: names cross as facts, spans cross as spans —
+/// never sliced text). Present only with a `NonLiteral` (or missing) `init`
+/// and no object, array, cast, or ternary shape — anything else is
+/// contradictory input and becomes an [`UnsupportedDecl`]. The enum paths
+/// resolve `head` through the [`Binder`] against the [`EnumShape`] tables
+/// (single or namespace-qualified) and check member identity: same-enum
+/// known members stay silent while cross-enum members diagnose through the
+/// existing enum spelling. Every other path ignores this seam and keeps its
+/// historical `NonLiteral` decline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberRef {
+    /// Head as written (`Color`, or dotted `NS.Color` for qualified refs).
+    pub head: String,
+    /// Member name as written (`Red`; unescaped for `["Red"]` keys).
+    pub member: String,
+    /// Span of the member name (the oracle's `TS2339` anchor).
+    pub member_span: Span,
+    /// Span of the whole member-access expression.
+    pub span: Span,
+}
+
 /// One `const`/`let` declarator to check.
 ///
 /// `annotation`/`init`/`init_object` are hand-fed stand-ins for the missing
@@ -1346,6 +1423,13 @@ pub struct ConstDecl {
     /// or cast shape — anything else is contradictory input and becomes
     /// an [`UnsupportedDecl`].
     pub init_ternary: Option<TernaryInit>,
+    /// Member-reference facts when the initializer is `Enum.Member` or
+    /// `Enum["Member"]` (`None` otherwise). Driver-mapped from the
+    /// adapter's member-reference facts. Present only with a `NonLiteral`
+    /// (or missing) `init` and no object, array, cast, or ternary shape —
+    /// anything else is contradictory input and becomes an
+    /// [`UnsupportedDecl`].
+    pub init_member_ref: Option<MemberRef>,
 }
 
 /// One function parameter: name + whether it carries a type annotation.
@@ -1413,6 +1497,15 @@ pub struct FunctionReturn {
     /// so both-wrong reports twice. Present only with a `NonLiteral`
     /// (or missing) `kind` and no object, array, or cast shape.
     pub ternary: Option<TernaryInit>,
+    /// Member-reference facts when the return is `Enum.Member` or
+    /// `Enum["Member"]` (`None` otherwise). Driver-mapped from the
+    /// adapter's member-reference facts exactly like
+    /// [`ConstDecl::init_member_ref`]. Rides the synthetic [`ConstDecl`]
+    /// into the enum member-reference check when the return annotation
+    /// names an enum (every other annotation keeps its historical path).
+    /// Present only with a `NonLiteral` (or missing) `kind` and no
+    /// object, array, cast, or ternary shape.
+    pub member_ref: Option<MemberRef>,
 }
 
 /// One leading `const`/`let` declarator inside a straight-line body.
@@ -1458,6 +1551,12 @@ pub struct InnerDecl {
     /// [`ConstDecl`] into [`check_one`], so leading positions share the
     /// const cast rule exactly.
     pub cast: Option<CastInput>,
+    /// Member-reference facts when the initializer is `Enum.Member` or
+    /// `Enum["Member"]` (`None` otherwise). Same driver seam as
+    /// [`ConstDecl::init_member_ref`]: the synthetic [`ConstDecl`] carries
+    /// it into the enum member-reference check, so leading positions
+    /// resolve exactly like top-level consts.
+    pub member_ref: Option<MemberRef>,
 }
 
 /// A straight-line body: leading declarators plus the terminal return.
@@ -3083,6 +3182,34 @@ pub fn check_functions(
     binder: &Binder,
     db: &mut QueryDb,
 ) -> FileReport {
+    let empty = EnumInput {
+        enums: &[],
+        interfaces: &[],
+        namespaces: &[],
+    };
+    check_functions_with_enums(file, decls, &empty, binder, db)
+}
+
+/// Checks function declarations with enum shape tables (P053).
+///
+/// Same [`FunctionDecl`] seam as [`check_functions`], plus `enums`
+/// driver-mapped from the adapter's enum/interface/namespace facts (shapes
+/// ARE adapter-fed here — only the function side stays as before). Bare
+/// `Enum.Member` / `Enum["Member"]` positions (a `NonLiteral` kind carrying
+/// member-reference facts) whose annotation routes to the enum tables check
+/// through the existing enum member-reference paths with per-position spans;
+/// every other position keeps [`check_one`]'s verdicts by construction. The
+/// base [`check_functions`] entry threads empty tables and keeps today's
+/// verdicts (drivers feeding it no member-reference facts see no change —
+/// the shaping gate still declines those whole-declaration first).
+#[must_use]
+pub fn check_functions_with_enums(
+    file: FileId,
+    decls: &[FunctionDecl],
+    enums: &EnumInput<'_>,
+    binder: &Binder,
+    db: &mut QueryDb,
+) -> FileReport {
     let mut report = FileReport::default();
     let mut freshness = FreshnessTable::default();
     let mut occurrence = 0usize;
@@ -3094,6 +3221,7 @@ pub fn check_functions(
                     file,
                     decl,
                     shaped: &shaped,
+                    enums,
                     binder,
                     db: &mut *db,
                     freshness: &mut freshness,
@@ -3114,10 +3242,13 @@ pub fn check_functions(
 /// Mutable checking state for one [`check_functions`] declaration, bundled
 /// so the per-position loop stays lean (pedantic arity discipline,
 /// mirroring [`MemberRun`]).
-struct FunctionRun<'a> {
+struct FunctionRun<'a, 'b> {
     file: FileId,
     decl: &'a FunctionDecl,
     shaped: &'a ShapedBody,
+    /// Enum shape tables (empty on the legacy entry — pinned gap: those
+    /// declarations keep today's verdicts).
+    enums: &'a EnumInput<'b>,
     binder: &'a Binder,
     db: &'a mut QueryDb,
     freshness: &'a mut FreshnessTable,
@@ -3139,8 +3270,10 @@ fn function_leadings(decl: &FunctionDecl) -> &[InnerDecl] {
 /// [`IdentTable`] (leadings in order plus params), assigns disjoint
 /// occurrence nodes from the shared counter, and delegates each position
 /// through the shared [`check_one`] path with the visibility cursor set
-/// (leadings see earlier leadings; returns see all leadings).
-fn check_shaped_function(run: &mut FunctionRun<'_>) {
+/// (leadings see earlier leadings; returns see all leadings) — except bare
+/// member-reference positions, which route through the enum tables (see
+/// [`check_enum_member_position`]).
+fn check_shaped_function(run: &mut FunctionRun<'_, '_>) {
     let mut idents = IdentTable {
         inputs: ident_inputs_from_leadings(run.binder, run.file, function_leadings(run.decl)),
         params: ident_params_from_function(&run.decl.params),
@@ -3162,11 +3295,15 @@ fn check_shaped_function(run: &mut FunctionRun<'_>) {
             init_array: shaped_return.init_array.clone(),
             cast: shaped_return.cast.clone(),
             init_ternary: None,
+            init_member_ref: shaped_return.member_ref.clone(),
         };
         if let Some(init) = synth.init_object.as_ref() {
             run.freshness.fresh.insert((run.file, node), init.fresh);
         }
         idents.checked = shaped_return.leading_index.unwrap_or(idents.inputs.len());
+        if check_enum_member_position(run, node, &synth, &idents) {
+            continue;
+        }
         let mut ctx = CheckCtx {
             file: run.file,
             node,
@@ -3180,6 +3317,44 @@ fn check_shaped_function(run: &mut FunctionRun<'_>) {
         // annotations naming aliases keep today's verdicts).
         check_one(&synth, run.binder, &mut ctx, &LocalAliasScope::EMPTY);
     }
+}
+
+/// Routes one synthetic function position carrying member-reference facts
+/// through the enum tables (P053): the position rides a scratch
+/// [`EnumDecl`] into [`route_enum_declaration`], so enum annotations check
+/// exactly like const initializers (same-enum silence, cross-enum
+/// `TS2322`, distinct declines) while every other annotation keeps
+/// [`check_one`]'s verdicts by construction (the route delegates there).
+/// Positions without member-reference facts keep the [`check_one`] path.
+/// Returns true when the position was routed.
+fn check_enum_member_position(
+    run: &mut FunctionRun<'_, '_>,
+    node: NodeId,
+    synth: &ConstDecl,
+    idents: &IdentTable,
+) -> bool {
+    if synth.init_member_ref.is_none() {
+        return false;
+    }
+    let decl = EnumDecl {
+        decl: synth.clone(),
+        init_text: None,
+        cross_file_deps: Vec::new(),
+    };
+    let mut route = EnumDeclCtx {
+        file: run.file,
+        node,
+        decl: &decl,
+        input: run.enums,
+        alias_scope: &LocalAliasScope::EMPTY,
+        binder: run.binder,
+        db: &mut *run.db,
+        freshness: &*run.freshness,
+        report: &mut *run.report,
+        idents,
+    };
+    route_enum_declaration(&mut route);
+    true
 }
 
 /// Identity plus annotation for one synthetic checkable position:
@@ -3232,6 +3407,9 @@ struct SynthReturn {
     init_array: Option<ArrayInit>,
     /// Assertion facts riding into the synthetic [`ConstDecl`].
     cast: Option<CastInput>,
+    /// Member-reference facts riding into the synthetic [`ConstDecl`]
+    /// (return and leading positions alike).
+    member_ref: Option<MemberRef>,
 }
 
 /// A checkable function shape: one [`SynthReturn`] per checkable position
@@ -3710,6 +3888,7 @@ fn shape_leading(inner: &InnerDecl, leading_index: usize) -> Option<SynthReturn>
         init_object: inner.init_object.clone(),
         init_array: inner.init_array.clone(),
         cast: inner.cast.clone(),
+        member_ref: inner.member_ref.clone(),
     })
 }
 
@@ -3720,7 +3899,9 @@ fn shape_leading(inner: &InnerDecl, leading_index: usize) -> Option<SynthReturn>
 /// [`check_one`], so the gate must not swallow them — as do P050
 /// guard-effect ident tails, whose names resolve one level through the P048
 /// table in [`check_one`] (only those tails feed `init_ident`; every other
-/// position feeds `None` and keeps the historical gate). Object and array
+/// position feeds `None` and keeps the historical gate), and P053
+/// member-reference tails, whose facts resolve through the enum tables
+/// (only those tails feed `member_ref`). Object and array
 /// returns carry their shapes alongside (a bare `NonLiteral` kind with a
 /// shape rides into the shared contradictory path in [`check_one`]). The
 /// impossible kind/member pairs (`Some` + `Some`, `None` + `None`) pass
@@ -3731,7 +3912,7 @@ fn shape_return(
     position: &str,
     site: SynthSite,
 ) -> Result<SynthReturn, String> {
-    if body.cast.is_some() || body.init_ident.is_some() {
+    if body.cast.is_some() || body.init_ident.is_some() || body.member_ref.is_some() {
         return Ok(SynthReturn {
             site,
             kind: body.kind,
@@ -3740,6 +3921,7 @@ fn shape_return(
             init_object: body.init_object.clone(),
             init_array: body.init_array.clone(),
             cast: body.cast.clone(),
+            member_ref: body.member_ref.clone(),
         });
     }
     if body.kind == Some(InitKind::NonLiteral)
@@ -3759,6 +3941,7 @@ fn shape_return(
         init_object: body.init_object.clone(),
         init_array: body.init_array.clone(),
         cast: None,
+        member_ref: None,
     })
 }
 
@@ -3794,6 +3977,7 @@ fn shape_ternary_arm(
         init_object: None,
         init_array: None,
         cast: None,
+        member_ref: None,
     })
 }
 
@@ -5496,6 +5680,7 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         };
         let mut ctx = CheckCtx {
             file: run.file,
@@ -8238,6 +8423,39 @@ fn resolve_boundary_annotation(
     Some(ann_ty)
 }
 
+/// Rejects member-reference facts paired with another initializer shape:
+/// a member reference rides only a bare `NonLiteral` (or missing) `init`
+/// (the adapter emits it for member accesses, which never classify as
+/// literals). Shared by [`check_one`] (via [`check_contradictory_inits`])
+/// and the enum shape path, so driver skew is recorded, never silent.
+/// Returns true when a note was pushed and the declaration is done.
+fn check_contradictory_member_ref(
+    decl: &ConstDecl,
+    span: Span,
+    file: FileId,
+    report: &mut FileReport,
+) -> bool {
+    if decl.init_member_ref.is_none() {
+        return false;
+    }
+    let paired = decl.init_object.is_some()
+        || decl.init_array.is_some()
+        || decl.cast.is_some()
+        || decl.init_ternary.is_some()
+        || matches!(decl.init, Some(kind) if kind != InitKind::NonLiteral);
+    if !paired {
+        return false;
+    }
+    report.unsupported.push(UnsupportedDecl {
+        file,
+        span,
+        reason: "contradictory initializer facts: member reference with \
+            another initializer shape"
+            .to_owned(),
+    });
+    true
+}
+
 /// Rejects contradictory initializer facts for [`check_one`]: at most one
 /// of primitive kind, object members, and array members may be present.
 /// Returns true when a note was pushed and the declaration is done.
@@ -8247,6 +8465,9 @@ fn check_contradictory_inits(
     file: FileId,
     report: &mut FileReport,
 ) -> bool {
+    if check_contradictory_member_ref(decl, span, file, report) {
+        return true;
+    }
     if decl.init.is_some() && decl.init_object.is_some() {
         report.unsupported.push(UnsupportedDecl {
             file,
@@ -8803,6 +9024,7 @@ fn resolve_ternary_arm(step: &TernaryArmStep<'_, '_, '_, '_, '_>) -> Result<Join
         init_array: None,
         cast: None,
         init_ternary: None,
+        init_member_ref: None,
     };
     match resolve_ident(&probe, binder, scope, idents, file) {
         IdentResolution::Keep => Err(format!(
@@ -11369,16 +11591,21 @@ impl EnumDeclCtx<'_, '_, '_> {
 
     /// Checks one enum-annotated declaration against its shape.
     ///
-    /// Gate order is structural-first (contradictory facts, ambient enums,
+    /// Gate order is structural-first (contradictory facts — including
+    /// member references paired with another shape — ambient enums,
     /// computed members — the first computed member in source order wins so
     /// reasons stay single), then the initializer shape: objects diagnose
-    /// compositionally against the display name, missing and non-literal
-    /// initializers decline, and literals check membership (see
+    /// compositionally against the display name, member references resolve
+    /// through [`EnumDeclCtx::check_enum_member_ref`], missing and other
+    /// non-literal initializers decline, and literals check membership (see
     /// [`check_enum_literal`]).
     fn check_enum_shape(&mut self, span: Span, display: &str, shape: &EnumShape) {
         let file = self.file;
         let decl = &self.decl.decl;
         let text = self.decl.init_text.as_deref();
+        if check_contradictory_member_ref(decl, span, file, self.report) {
+            return;
+        }
         if decl.init.is_some() && decl.init_object.is_some() {
             self.unsupported(
                 span,
@@ -11453,6 +11680,10 @@ impl EnumDeclCtx<'_, '_, '_> {
             return;
         };
         if init == InitKind::NonLiteral {
+            if let Some(member_ref) = decl.init_member_ref.as_ref() {
+                self.check_enum_member_ref(span, display, shape, member_ref);
+                return;
+            }
             self.unsupported(
                 span,
                 "non-literal initializer is outside the subset".to_owned(),
@@ -11547,6 +11778,270 @@ impl EnumDeclCtx<'_, '_, '_> {
             }
         }
     }
+
+    /// Checks one `Enum.Member` / `Enum["Member"]` initializer against its
+    /// annotation enum (P053, probed on tsc 7.0.2 `--strict --pretty false`;
+    /// probes in `.agent/scratch/p053-probes/`):
+    ///
+    /// - The head resolves through the [`Binder`] against the [`EnumShape`]
+    ///   tables (single or namespace-qualified, reusing the annotation
+    ///   claim rules): unresolvable tracked heads skip silently, anything
+    ///   else unresolvable or non-enum declines distinctly.
+    /// - Ambient and computed referenced enums decline with the existing
+    ///   whole-enum reasons (the oracle folds both — pinned divergences);
+    ///   unknown members decline distinctly (the oracle spells `TS2339` —
+    ///   pinned, never forced).
+    /// - Identity, not value: a known member of the SAME enum stays silent
+    ///   (even string members, which never match as literals — probed), so
+    ///   numeric, string, mixed, `const`, and qualified same-enum refs all
+    ///   resolve; a known member of ANOTHER enum diagnoses `TS2322`
+    ///   spelling the source per [`spell_cross_enum_source`] (dot form even
+    ///   for `["Member"]` refs, and namespace-stripped for qualified heads —
+    ///   each probed).
+    /// - Boolean enums need no rule: tsc rejects boolean member
+    ///   initializers with `TS18033` at the declaration (probed), so no
+    ///   shape ever holds one; boolean literals keep the P018 spelling.
+    fn check_enum_member_ref(
+        &mut self,
+        span: Span,
+        display: &str,
+        shape: &EnumShape,
+        member_ref: &MemberRef,
+    ) {
+        match self.resolve_ref_enum(&member_ref.head, &member_ref.member) {
+            RefEnum::Skip => {}
+            RefEnum::Decline(reason) => {
+                self.unsupported(span, reason);
+            }
+            RefEnum::Found(index) => {
+                let input = self.input;
+                self.check_resolved_member_ref(
+                    span,
+                    display,
+                    shape,
+                    member_ref,
+                    &input.enums[index],
+                );
+            }
+        }
+    }
+
+    /// Checks a head-resolved member reference: ambient and computed
+    /// referenced enums decline with the existing whole-enum reasons,
+    /// unknown members decline distinctly, same-enum members stay silent,
+    /// and cross-enum members diagnose `TS2322` spelling the source per
+    /// [`spell_cross_enum_source`].
+    fn check_resolved_member_ref(
+        &mut self,
+        span: Span,
+        display: &str,
+        shape: &EnumShape,
+        member_ref: &MemberRef,
+        target: &EnumShape,
+    ) {
+        if target.declared {
+            self.unsupported(
+                span,
+                format!(
+                    "ambient enum '{}' has unknown member values: outside the subset",
+                    target.name
+                ),
+            );
+            return;
+        }
+        if let Some(member) = target
+            .members
+            .iter()
+            .find(|member| matches!(&member.value, EnumMemberValue::Computed { .. }))
+        {
+            let detail = match &member.value {
+                EnumMemberValue::Computed { reason } => reason.clone(),
+                EnumMemberValue::Number(_) | EnumMemberValue::String(_) => {
+                    "outside the subset".to_owned()
+                }
+            };
+            self.unsupported(
+                span,
+                format!("enum '{}': member '{}': {detail}", target.name, member.name),
+            );
+            return;
+        }
+        if !target
+            .members
+            .iter()
+            .any(|member| member.name == member_ref.member)
+        {
+            self.unsupported(
+                span,
+                format!(
+                    "unknown member '{}' of enum '{}': member expressions diagnose \
+                    TS2339 in tsc, which needs expression facts outside the subset",
+                    member_ref.member, target.name
+                ),
+            );
+            return;
+        }
+        if target.symbol.is_some() && target.symbol == shape.symbol {
+            return;
+        }
+        self.diagnose(
+            span,
+            CODE_MISMATCH,
+            format!(
+                "Type '{}' is not assignable to type '{display}'.",
+                spell_cross_enum_source(target, &member_ref.member),
+            ),
+        );
+    }
+
+    /// Resolves one member-reference head to its enum table index: single
+    /// heads claim an enum directly, qualified heads walk namespaces;
+    /// anything else declines distinctly (never a forced verdict).
+    fn resolve_ref_enum(&self, head: &str, member: &str) -> RefEnum {
+        let segments: Vec<&str> = head.split('.').collect();
+        if segments.iter().any(|segment| !is_name_segment(segment)) {
+            return RefEnum::Decline(format!(
+                "member reference head '{head}' is outside the subset"
+            ));
+        }
+        let scope = self.decl.decl.scope;
+        let Some(id) = self.binder.resolve(self.file, scope, segments[0]) else {
+            if self
+                .binder
+                .unresolved()
+                .iter()
+                .any(|entry| entry.file == self.file && entry.name == segments[0])
+            {
+                return RefEnum::Skip;
+            }
+            return RefEnum::Decline(format!(
+                "member reference head '{}' resolves to nothing: driver skew",
+                segments[0]
+            ));
+        };
+        if segments.len() == 1 {
+            return self.claim_ref_head(head, id);
+        }
+        self.walk_ref_head(head, member, &segments, id)
+    }
+
+    /// Claims a single-segment head: exactly one enum shape must hold its
+    /// identity (the annotation merge precedent); interfaces, namespaces,
+    /// and unclaimed names decline with kind-specific reasons.
+    fn claim_ref_head(&self, head: &str, id: SymbolId) -> RefEnum {
+        let input = self.input;
+        let mut found = input
+            .enums
+            .iter()
+            .enumerate()
+            .filter(|(_, shape)| shape.symbol == Some(id));
+        let Some((index, _)) = found.next() else {
+            if input
+                .interfaces
+                .iter()
+                .any(|shape| shape.symbol == Some(id))
+            {
+                return RefEnum::Decline(format!(
+                    "member reference head '{head}' is an interface, not an enum: \
+                    outside the subset"
+                ));
+            }
+            if input
+                .namespaces
+                .iter()
+                .any(|shape| shape.symbol == Some(id))
+            {
+                return RefEnum::Decline(format!(
+                    "member reference head '{head}' is a namespace: enum member \
+                    references need an enum head"
+                ));
+            }
+            return RefEnum::Decline(format!(
+                "member reference head '{head}' is not an enum: outside the subset"
+            ));
+        };
+        if found.next().is_some() {
+            return RefEnum::Decline(format!(
+                "multiple enum declarations for '{head}': merging is outside the subset"
+            ));
+        }
+        RefEnum::Found(index)
+    }
+
+    /// Walks a qualified head (`NS.Color` in `NS.Color.Red`) from its
+    /// namespace head through [`EnumDeclCtx::lookup_member`]: nested
+    /// namespaces descend, the first claimed enum wins (with the annotation
+    /// merge precedent), and interfaces, unclaimed members, misses, enum
+    /// heads (`Color.Red.Green` — probed `TS2339`), and trailing namespaces
+    /// each decline distinctly.
+    fn walk_ref_head(&self, head: &str, member: &str, segments: &[&str], id: SymbolId) -> RefEnum {
+        let input = self.input;
+        if input.enums.iter().any(|shape| shape.symbol == Some(id)) {
+            return RefEnum::Decline(format!(
+                "member reference '{head}.{member}' indexes past an enum member: \
+                outside the subset"
+            ));
+        }
+        if !input
+            .namespaces
+            .iter()
+            .any(|shape| shape.symbol == Some(id))
+        {
+            return RefEnum::Decline(format!(
+                "member reference head '{}' is not a namespace: qualified member \
+                references need a namespace head",
+                segments[0]
+            ));
+        }
+        let mut current = id;
+        for segment in &segments[1..] {
+            match self.lookup_member(current, segment) {
+                MemberLookup::Absent => {
+                    return RefEnum::Decline(format!(
+                        "member reference head '{head}' has no exported member \
+                        '{segment}': outside the subset"
+                    ));
+                }
+                MemberLookup::Unclaimed => {
+                    return RefEnum::Decline(format!(
+                        "member '{segment}' of '{head}' is not an enum: outside the subset"
+                    ));
+                }
+                MemberLookup::Found { id: next, claimed } => match claimed {
+                    Claimed::Enum(index) => {
+                        let shape = &input.enums[index];
+                        if input
+                            .enums
+                            .iter()
+                            .filter(|candidate| candidate.symbol == shape.symbol)
+                            .count()
+                            > 1
+                        {
+                            return RefEnum::Decline(format!(
+                                "multiple enum declarations for '{}': merging is outside \
+                                the subset",
+                                shape.name
+                            ));
+                        }
+                        return RefEnum::Found(index);
+                    }
+                    Claimed::Namespace => {
+                        current = next;
+                    }
+                    Claimed::Interface(_) => {
+                        return RefEnum::Decline(format!(
+                            "member '{segment}' of '{head}' is an interface, not an enum: \
+                            outside the subset"
+                        ));
+                    }
+                },
+            }
+        }
+        RefEnum::Decline(format!(
+            "member reference head '{head}' names namespaces, not an enum: \
+            outside the subset"
+        ))
+    }
 }
 
 /// Routes one declaration: unannotated and plain-spelling annotations
@@ -11602,6 +12097,38 @@ enum Claimed {
     Interface(usize),
     /// A namespace shape (index unneeded: names come from segments).
     Namespace,
+}
+
+/// Outcome of resolving one member-reference head (P053): a table index
+/// into [`EnumInput::enums`], a recorded decline, or a silent skip for
+/// already-tracked unresolved heads. Indices (never references) cross here
+/// so callers hold no borrow while reporting.
+enum RefEnum {
+    /// The referenced enum shape (index into [`EnumInput::enums`]).
+    Found(usize),
+    /// Out of subset with a recorded reason (never a forced verdict).
+    Decline(String),
+    /// Unresolvable head already tracked as an unresolved reference: skip
+    /// silently (the [`check_calls`] precedent — tracked once, never
+    /// double-diagnosed).
+    Skip,
+}
+
+/// Spells one cross-enum member source the way tsc 7.0.2 does (probed
+/// `--strict --pretty false --noEmit`; edge probes `e1`–`e6` recorded in
+/// `.agent/scratch/p053-probes/`): a source enum holding exactly one member
+/// spells the enum name alone (`Other`), otherwise `Enum.Member`
+/// (`Color.Red`). The count reads the existing [`EnumShape`] member table —
+/// no new facts, no source slicing. Namespace-qualified singleton sources
+/// spell the stripped shape name (`Solo`, never `NS.Solo` — probe `e5`);
+/// ambient and computed sources follow the same tsc rule but never reach
+/// this spelling — the whole-enum decline gates fire first.
+fn spell_cross_enum_source(target: &EnumShape, member: &str) -> String {
+    if target.members.len() == 1 {
+        target.name.clone()
+    } else {
+        format!("{}.{}", target.name, member)
+    }
 }
 
 /// Splits `NS.Dir` into segments, or `None` for unparseable qualification
@@ -11720,6 +12247,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -11752,6 +12280,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -12107,6 +12636,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
             },
             // An interface-annotated use resolves through the merged id.
             object_decl("ok", 50, 52, "Foo", vec![("a", ObjectMemberKind::Number)]),
@@ -12193,6 +12723,7 @@ mod tests {
                 kind,
             }),
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -12260,6 +12791,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }];
         let mut db = QueryDb::new();
         let report = check_file(FILE, &decls, &binder, &mut db);
@@ -12923,6 +13455,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
             },
             decl("e", 18, 26, "number", InitKind::NonLiteral),
             ConstDecl {
@@ -12938,6 +13471,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
             },
         ];
         let mut db = QueryDb::new();
@@ -13043,6 +13577,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -13088,6 +13623,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[decl], &binder, &mut db);
@@ -13117,6 +13653,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[decl], &binder, &mut db);
@@ -13144,6 +13681,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         };
         let mut db = QueryDb::new();
         let other = FileId(41);
@@ -13162,12 +13700,14 @@ mod tests {
                 kind: DeclKind::Let,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
                 ..decl("a", 0, 10, "number", InitKind::Number)
             },
             ConstDecl {
                 kind: DeclKind::Let,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
                 ..decl("b", 11, 21, "number", InitKind::String)
             },
         ];
@@ -13565,6 +14105,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[object_init, primitive_init], &binder, &mut db);
@@ -13667,6 +14208,7 @@ mod tests {
             init_array: Some(ArrayInit { members }),
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -13914,6 +14456,7 @@ mod tests {
             init_array: None,
             cast: None,
             ternary: None,
+            member_ref: None,
         })
     }
 
@@ -14023,6 +14566,7 @@ mod tests {
             init_array: None,
             cast: None,
             ternary: None,
+            member_ref: None,
         })
     }
 
@@ -14035,6 +14579,7 @@ mod tests {
             init_array: None,
             cast: None,
             ternary: None,
+            member_ref: None,
         }
     }
 
@@ -14057,6 +14602,7 @@ mod tests {
             init_array: None,
             cast: None,
             ternary: None,
+            member_ref: None,
         }
     }
 
@@ -14088,6 +14634,7 @@ mod tests {
             init_array: None,
             cast: None,
             ternary: None,
+            member_ref: None,
         }
     }
 
@@ -14154,6 +14701,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: Some(TernaryInit { then_arm, else_arm }),
+            init_member_ref: None,
         }
     }
 
@@ -14166,6 +14714,7 @@ mod tests {
             init_array: None,
             cast: None,
             ternary: Some(TernaryInit { then_arm, else_arm }),
+            member_ref: None,
         })
     }
 
@@ -14443,6 +14992,7 @@ mod tests {
                 init_array: None,
                 cast: Some(never_cast),
                 init_ternary: None,
+                init_member_ref: None,
             },
             decl("uv", 22, 32, "unknown", InitKind::String),
             ternary_decl(
@@ -16330,6 +16880,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -16347,6 +16898,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -16841,6 +17393,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
             },
         ];
         let uses = [narrowing_use("a", 40, 50, "string", "x", 48, 49)];
@@ -17143,6 +17696,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
             },
         ];
         let uses = [narrowing_use("h", 40, 50, "string", "g", 48, 49)];
@@ -17264,6 +17818,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 ternary: None,
+                member_ref: None,
             }),
         )
     }
@@ -17437,6 +17992,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 ternary: None,
+                member_ref: None,
             }),
         )];
         let calls = [generic_call_args(
@@ -17482,6 +18038,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 ternary: None,
+                member_ref: None,
             }),
         )];
         let report = generics_report(&decls, &[], &binder);
@@ -17511,6 +18068,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 ternary: None,
+                member_ref: None,
             }),
         )];
         let report = generics_report(&decls, &[], &binder);
@@ -17570,6 +18128,7 @@ mod tests {
                     init_array: None,
                     cast: None,
                     ternary: None,
+                    member_ref: None,
                 }),
             },
             type_params: vec!["T".to_owned(), "U".to_owned()],
@@ -17962,6 +18521,7 @@ mod tests {
                     init_array: None,
                     cast: None,
                     ternary: None,
+                    member_ref: None,
                 }),
             },
             type_params: vec!["A".to_owned(), "B".to_owned(), "C".to_owned()],
@@ -18158,6 +18718,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 ternary: None,
+                member_ref: None,
             }),
         );
         decl.bounds[0].constraint = constraint.map(str::to_owned);
@@ -18367,6 +18928,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 ternary: None,
+                member_ref: None,
             })
         };
         let mut infer_named = generic_decl_named("k", 63, 83, &["T"], Some("T"), Some("T"), body());
@@ -18436,6 +18998,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 ternary: None,
+                member_ref: None,
             })
         };
         let decls = [
@@ -18651,6 +19214,7 @@ mod tests {
                 init_array: None,
                 cast: None,
                 init_ternary: None,
+                init_member_ref: None,
             },
             init_text: text.map(str::to_owned),
             cross_file_deps: Vec::new(),
@@ -18893,6 +19457,277 @@ mod tests {
         assert_eq!(report.unsupported.len(), 1);
         assert!(
             report.unsupported[0].reason.contains("missing initializer"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    /// One member-reference declaration: a bare `NonLiteral` init carrying
+    /// head/member facts (dot and bracket forms are identical solver-side).
+    fn enum_member_decl_for(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        annotation: &str,
+        head: &str,
+        member: &str,
+    ) -> EnumDecl {
+        let mut decl = enum_decl_for(name, lo, hi, annotation, InitKind::NonLiteral, None);
+        decl.decl.init_member_ref = Some(MemberRef {
+            head: head.to_owned(),
+            member: member.to_owned(),
+            member_span: span(lo, hi),
+            span: span(lo, hi),
+        });
+        decl
+    }
+
+    /// One member-reference return position for function tests.
+    fn member_return(head: &str, member: &str) -> FunctionReturn {
+        FunctionReturn {
+            kind: Some(InitKind::NonLiteral),
+            init_ident: None,
+            init_object: None,
+            init_array: None,
+            cast: None,
+            ternary: None,
+            member_ref: Some(MemberRef {
+                head: head.to_owned(),
+                member: member.to_owned(),
+                member_span: span(0, 1),
+                span: span(0, 1),
+            }),
+        }
+    }
+
+    #[test]
+    fn enum_member_refs_resolve_by_identity() {
+        let binder = binder_with(&[
+            ("Color", span(0, 5)),
+            ("Other", span(6, 11)),
+            ("Str", span(12, 15)),
+            ("a", span(16, 26)),
+            ("b", span(27, 37)),
+            ("c", span(38, 48)),
+            ("d", span(49, 59)),
+            ("e", span(60, 70)),
+        ]);
+        let color = check_enum_shape_for(
+            &binder,
+            "Color",
+            0,
+            vec![
+                enum_member_named("Red", EnumMemberValue::Number(0.0)),
+                enum_member_named("Green", EnumMemberValue::Number(1.0)),
+            ],
+        );
+        let other = check_enum_shape_for(
+            &binder,
+            "Other",
+            0,
+            vec![enum_member_named("Zero", EnumMemberValue::Number(0.0))],
+        );
+        let string = check_enum_shape_for(
+            &binder,
+            "Str",
+            0,
+            vec![enum_member_named(
+                "A",
+                EnumMemberValue::String("a".to_owned()),
+            )],
+        );
+        let input = EnumInput {
+            enums: &[color, other, string],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let decls = [
+            enum_member_decl_for("a", 16, 26, "Color", "Color", "Red"),
+            enum_member_decl_for("b", 27, 37, "Str", "Str", "A"),
+            enum_member_decl_for("c", 38, 48, "Other", "Color", "Red"),
+            enum_member_decl_for("d", 49, 59, "Color", "Other", "Zero"),
+            enum_member_decl_for("e", 60, 70, "Other", "Color", "Green"),
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 3);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'Color.Red' is not assignable to type 'Other'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(38, 48));
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'Other' is not assignable to type 'Color'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "Type 'Color.Green' is not assignable to type 'Other'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn enum_member_refs_decline_distinctly() {
+        let binder = binder_with(&[
+            ("Color", span(0, 5)),
+            ("Comp", span(6, 10)),
+            ("Amb", span(11, 14)),
+            ("a", span(15, 25)),
+            ("b", span(26, 36)),
+            ("c", span(37, 47)),
+            ("d", span(48, 58)),
+            ("f", span(70, 80)),
+        ]);
+        let color = check_enum_shape_for(
+            &binder,
+            "Color",
+            0,
+            vec![enum_member_named("Red", EnumMemberValue::Number(0.0))],
+        );
+        let computed = check_enum_shape_for(
+            &binder,
+            "Comp",
+            0,
+            vec![enum_member_named(
+                "A",
+                EnumMemberValue::Computed {
+                    reason: "non-literal initializer is outside the subset".to_owned(),
+                },
+            )],
+        );
+        let mut ambient = check_enum_shape_for(
+            &binder,
+            "Amb",
+            0,
+            vec![enum_member_named("A", EnumMemberValue::Number(0.0))],
+        );
+        ambient.declared = true;
+        let input = EnumInput {
+            enums: &[color, computed, ambient],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let mut contradictory = enum_member_decl_for("f", 70, 80, "Color", "Color", "Red");
+        contradictory.decl.init = Some(InitKind::Number);
+        let decls = [
+            enum_member_decl_for("a", 15, 25, "Color", "Color", "Nope"),
+            enum_member_decl_for("b", 26, 36, "Color", "Comp", "A"),
+            enum_member_decl_for("c", 37, 47, "Color", "Amb", "A"),
+            enum_member_decl_for("d", 48, 58, "Color", "Nope", "Red"),
+            contradictory,
+        ];
+        let report = enums_report(&decls, &input, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 5);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("unknown member 'Nope'"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("member 'A'"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+        assert!(
+            report.unsupported[2].reason.contains("ambient enum"),
+            "reason: {}",
+            report.unsupported[2].reason
+        );
+        assert!(
+            report.unsupported[3].reason.contains("driver skew"),
+            "reason: {}",
+            report.unsupported[3].reason
+        );
+        assert!(
+            report.unsupported[4].reason.contains("contradictory"),
+            "reason: {}",
+            report.unsupported[4].reason
+        );
+    }
+
+    #[test]
+    fn enum_member_ref_tracked_head_skips_silently() {
+        let binder = calls_binder(&[("Color", span(0, 5)), ("a", span(6, 16))], &["Nope"]);
+        let shape = color_shape(&binder);
+        let input = EnumInput {
+            enums: &[shape],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let decls = [enum_member_decl_for("a", 6, 16, "Color", "Nope", "Red")];
+        let report = enums_report(&decls, &input, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn enum_member_ref_returns_check_per_position() {
+        let binder = binder_with(&[
+            ("Color", span(0, 5)),
+            ("Other", span(6, 11)),
+            ("f", span(12, 22)),
+            ("g", span(23, 33)),
+            ("h", span(34, 44)),
+        ]);
+        let color = check_enum_shape_for(
+            &binder,
+            "Color",
+            0,
+            vec![enum_member_named("Red", EnumMemberValue::Number(0.0))],
+        );
+        let other = check_enum_shape_for(
+            &binder,
+            "Other",
+            0,
+            vec![enum_member_named("Zero", EnumMemberValue::Number(0.0))],
+        );
+        let input = EnumInput {
+            enums: &[color, other],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let decls = [
+            function(
+                "f",
+                12,
+                22,
+                Vec::new(),
+                Some("Color"),
+                FunctionBody::SingleReturn(member_return("Color", "Red")),
+            ),
+            function(
+                "g",
+                23,
+                33,
+                Vec::new(),
+                Some("Other"),
+                FunctionBody::SingleReturn(member_return("Color", "Red")),
+            ),
+            function(
+                "h",
+                34,
+                44,
+                Vec::new(),
+                Some("Color"),
+                FunctionBody::SingleReturn(member_return("Color", "Nope")),
+            ),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_functions_with_enums(FILE, &decls, &input, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'Color' is not assignable to type 'Other'."
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("unknown member 'Nope'"),
             "reason: {}",
             report.unsupported[0].reason
         );
@@ -19825,6 +20660,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -19844,6 +20680,7 @@ mod tests {
             init_array: None,
             cast: None,
             init_ternary: None,
+            init_member_ref: None,
         }
     }
 
@@ -20064,6 +20901,7 @@ mod tests {
             kind: DeclKind::Let,
             annotation: Some("number".to_owned()),
             init_ternary: None,
+            init_member_ref: None,
             ..literal_source("a", 0, 10, InitKind::Number)
         };
         let decls = [source, ident_use("b", 11, 21, "number", "a")];
@@ -20122,6 +20960,7 @@ mod tests {
         let use_decl = ConstDecl {
             annotation: None,
             init_ternary: None,
+            init_member_ref: None,
             ..ident_use("c", 22, 32, "number", "a")
         };
         let decls = [decl("a", 0, 10, "number", InitKind::Number), use_decl];
@@ -20298,6 +21137,7 @@ mod tests {
                 kind: CastKind::As,
             }),
             init_ternary: None,
+            init_member_ref: None,
             ..literal_source("a", 0, 10, InitKind::Number)
         };
         let decls = [source, ident_use("b", 11, 21, "string", "a")];
