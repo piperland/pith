@@ -1,0 +1,2 @@
+alias-chain-mutual-declined.ts:TS2456: Type alias 'A' circularly references itself.
+alias-chain-mutual-declined.ts:TS2456: Type alias 'B' circularly references itself.

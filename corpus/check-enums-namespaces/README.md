@@ -15,8 +15,9 @@ baselines are tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs`
 | ns-enum.ts | 1x TS2322 | 1x PITH2322 (short name `Dir`) + 2x UNSUPPORTED (member access, qualified value) |
 | ns-interface.ts | TS2741 + TS2353 + TS2322 | same families spelling `Point` + 1x UNSUPPORTED (qualified value) |
 | ns-missing.ts | 2x TS2694 + TS2709 + TS2749 + TS2713 | all five mirrored |
+| alias-chain-interface.ts | 1x TS2322 | 1x PITH2322 at the wrong member (two-link chain checks with the UNDERLYING display) |
 
-Differential: 8/8 match on (code-family, message) multisets; declined
+Differential: 9/9 match on (code-family, message) multisets; declined
 fixtures recorded as UNSUPPORTED with reasons, never silent, never forced.
 
 Probed tsc rules pinned here: numeric literals check by VALUE (`1.0`

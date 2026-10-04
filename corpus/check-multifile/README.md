@@ -36,8 +36,9 @@ Out of scope (declined with reasons, unit-pinned in
 namespace re-exports, ambiguous star exports, non-relative
 specifiers (node_modules, tsconfig-paths), value uses of imported types
 (oracle `TS2693`), function-typed value uses, non-literal cross-file
-initializers, chained/generic/complex alias targets (single-level expansion
-only — a pinned divergence where tsc resolves transitively), and failed
+initializers, over-deep/cyclic/generic/complex alias targets (chains resolve
+transitively up to the shared depth bound — a pinned divergence where tsc,
+which has no limit, keeps resolving), and failed
 `import type` resolutions (diagnosing would risk false verdicts where tsc
 stays clean — a pinned divergence; value imports keep the exact
 `PITH2305`/`PITH2307` mirrors). Re-export cycles keep corpus fixtures
