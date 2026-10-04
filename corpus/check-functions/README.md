@@ -193,3 +193,30 @@ unit-pinned, never forced verdicts). Call-site
 args against named params decline distinctly per site (corpus-pinned in
 check-calls). Generic `T`, union, and complex param annotations decline
 exactly as before. Probes in `.agent/scratch/p046-probes/`.
+
+## P049 void-effect bodies
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| void-effect-clean.ts | clean | silent, 0 notes (lone allowlist effect; zero positions) |
+| void-effect-guard-clean.ts | clean | silent, 0 notes (arm emits nothing; bare tail trivial) |
+| void-effect-guard-wrong.ts | 1x TS2322 (tail) | 1x PITH2322 (tail checks normally) |
+| void-effect-guard-two-calls.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| void-effect-guard-nonallowlist.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| void-effect-guard-valued-return.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+
+Differential: 6/6 match-or-pin (3 diagnostic/silent pairs + 3 pinned
+oracle-clean divergences — several effect calls, non-allowlist calls,
+and valued arm returns need call-site and flow facts the subset
+refuses). Lone allowlist effect calls (`console.warn` shapes, arity-only
+— templated arguments need no literal facts) and guard arms with exactly
+one allowlist effect call plus a bare `return` admit only under `void` /
+`undefined` / `any` annotations (tsc checks bare arm returns against the
+annotation and spells `TS2355` for return-less non-voidish bodies); the
+arm emits no verdict while the tail checks through the existing literal
+paths. Still declining by design with distinct recorded reasons:
+non-voidish annotations, direct calls, unknown receivers/members,
+exact-arity breaches, arm `throw`s, several effect calls, and valued arm
+returns (unit-pinned); every other effect shape keeps `Complex`, so
+`isPlainObject` and destr's main `destr` keep their exact reasons.
+Probes in `.agent/scratch/p049-probes/`.
