@@ -236,6 +236,41 @@
 //!   ([`FunctionBody::Complex`]) — never a partial verdict over the
 //!   remaining positions.
 //!
+//! Void-effect bodies (P049, probed on tsc 7.0.2 `--strict --pretty false`;
+//! probes in `.agent/scratch/p049-probes/`):
+//!
+//! - A lone allowlist effect call (`console.warn(tpl)` with a `: void`
+//!   annotation, probe `a`) is clean in tsc and admits silently with zero
+//!   positions (the throw-only precedent — the call emits no verdict and
+//!   carries no facts). Membership gates through the P024 tables over
+//!   fact-carried names only (never string-searching): direct calls and
+//!   unknown receivers/members decline distinctly, exact-arity opaque
+//!   signatures (`Math.floor`, `Array.isArray`, ...) enforce their count,
+//!   and range/variadic shapes (`console.warn`, `JSON.parse`, ...) admit
+//!   arity-free. Templated arguments need no literal facts (arity-only).
+//! - `if (c) { <effect call>; return; }` plus a trailing `return` skips the
+//!   arm and checks the tail through the existing literal paths (a wrong
+//!   literal tail reports one `TS2322`, probe `i`; a bare tail leaves no
+//!   position, probes `g`/`j`). The shape admits only under `void` /
+//!   `undefined` / `any` annotations: tsc checks the bare arm return
+//!   against the annotation (`TS2322` undefined-vs-`T` under any other
+//!   annotation, probes `c`/`d`/`f` — and `TS2355` for lone effects under
+//!   non-voidish annotations, probe `b`), so those decline distinctly
+//!   instead of mis-skipping.
+//! - Malformed arms decline with distinct reasons (never a partial verdict
+//!   over the tail): a `throw` in the arm, several effect calls (clean in
+//!   tsc, probe `f`), a valued arm return (clean in tsc under a matching
+//!   annotation, probe `e` — and `TS2322` number-vs-`void` under `: void`,
+//!   probe `e2`), and non-allowlist calls (tsc checks those call sites:
+//!   `TS2345` on wrong arguments plus the arm `TS2322`, probe `d` — pinned
+//!   oracle-error divergences). The destr pair is oracle-clean end to end
+//!   (probe `h`): its `warnKeyDropped` goes silent here while its
+//!   `jsonParseTransform` keeps declining on the non-allowlist arm.
+//! - Arms without a bare return (a call with no `return`, a misordered
+//!   pair, a non-call statement) and non-return tails keep
+//!   [`FunctionBody::Complex`] — today's behavior, so longer bodies like
+//!   `isPlainObject` and destr's main `destr` keep their exact reasons.
+//!
 //! Else-if chains (P045, probed on tsc 7.0.2 `--strict --pretty false`;
 //! probes in `.agent/scratch/p045-probes/`):
 //!
@@ -1274,7 +1309,8 @@ pub struct StraightBody {
 /// tail), the P043 [`FunctionBody::GuardThrow`] tail, the P043
 /// [`FunctionBody::StraightThrow`] leadings (plus the optional tail), and
 /// the P045 [`FunctionBody::ElseIfChain`] per branch (the `if`, each
-/// `else if`, then the terminal `else`); the
+/// `else if`, then the terminal `else`), and the P049
+/// [`FunctionBody::GuardEffect`] tail (the guard arm emits nothing); the
 /// rest decline to [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
@@ -1338,6 +1374,20 @@ pub enum FunctionBody {
     /// occurrence node, exactly like the P023 joins (no fixpoint, single
     /// pass).
     ElseIfChain(ElseIfChainBody),
+    /// A lone allowlist effect call (`console.warn("x");`): tsc checks the
+    /// call itself while the missing return is clean under `void` /
+    /// `undefined` / `any` (probed 7.0.2 P049 — any other annotation spells
+    /// `TS2355`, so those decline distinctly). An admitted body carries
+    /// zero positions and checks silently, like the P043 throw-only form.
+    EffectOnly(EffectCall),
+    /// Exactly two statements, `if (c) { <effect call>; return; }` with no
+    /// `else` plus a trailing `return` (valued or bare): the guard arm
+    /// emits no verdict while the tail checks through the same synthetic
+    /// delegation as the P023 guard tail (probed 7.0.2 P049). Only
+    /// void-ish annotations admit the shape — tsc checks the bare arm
+    /// return against the annotation, so anything else declines distinctly
+    /// instead of mis-skipping (a bare tail leaves no position to check).
+    GuardEffect(GuardEffectBody),
     /// No body node: `declared` tells `declare function` apart from an
     /// overload signature.
     NoBody {
@@ -1377,6 +1427,15 @@ pub enum FunctionBody {
     /// chain, or a complex branch). Shaping declines with the reason
     /// verbatim — never a partial verdict.
     ElseIfUnsupported {
+        /// Frontend-recorded decline reason.
+        reason: String,
+    },
+    /// An effect shape outside the checkable [`FunctionBody::EffectOnly`]
+    /// and [`FunctionBody::GuardEffect`] forms: the frontend recorded why
+    /// (a `throw` in the guard arm, several effect calls, or a valued arm
+    /// return). Shaping declines with the reason verbatim — never a
+    /// partial verdict over the tail.
+    EffectUnsupported {
         /// Frontend-recorded decline reason.
         reason: String,
     },
@@ -1506,6 +1565,44 @@ pub struct ElseIfChainBody {
     /// One `return` position per branch (the `if`, each `else if`, then the
     /// terminal `else`), in source order.
     pub branches: Vec<FunctionReturn>,
+}
+
+/// One effect call's allowlist-membership facts (P049).
+///
+/// Driver-mapped from the adapter's `EffectCallFact` (mechanical field
+/// copies — names cross as facts, never sliced text).
+/// The solver gates membership through the P024 tables
+/// ([`is_known_value_receiver`], [`opaque_signature`],
+/// [`member_shape_decline`]): no string-searching anywhere. Argument
+/// literal kinds never ride (arity-only — effect calls emit no verdict).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectCall {
+    /// Receiver name as written (`Some("console")`); `None` for direct
+    /// calls (never allowlisted — they decline distinctly).
+    pub receiver: Option<String>,
+    /// Member name as written (`warn`), or the direct callee name.
+    pub member: String,
+    /// Argument count (spreads never reach facts, so the count is exact).
+    pub arg_count: u32,
+}
+
+/// A checkable guard-effect body (P049): the trailing `return` after an
+/// `if`-without-`else` guard arm holding exactly one effect call plus a
+/// bare `return`, checked through the same synthetic delegation as the
+/// P023 guard tail (no fixpoint, single pass).
+///
+/// Driver-mapped from the adapter's guard-effect fact variant (mechanical
+/// field copies). The guard arm carries no checkable position: allowlist
+/// effect calls emit no verdict (probed 7.0.2), so the arm is skipped and
+/// only the tail shapes (a bare tail leaves no position to check).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardEffectBody {
+    /// The guard arm's call facts (allowlist membership plus arity gate
+    /// in [`gate_effect_call`]).
+    pub call: EffectCall,
+    /// The trailing `return`'s expression facts (`None` for a bare
+    /// trailing `return;`).
+    pub tail: Option<FunctionReturn>,
 }
 
 /// One `function name(params): ret` declaration to check.
@@ -3037,6 +3134,126 @@ fn shape_else_if(
     Ok(positions)
 }
 
+/// Whether one effective return annotation admits return-less effect
+/// positions (P049, probed on tsc 7.0.2 `--strict --pretty false`).
+///
+/// tsc's `TS2355` exempts exactly `void`, `undefined`, and `any` from the
+/// must-return-a-value rule, so lone effect calls and guard-effect arms
+/// (whose bare `return;` tsc checks against the annotation) admit only
+/// under those three spellings. Reads the canonical annotation maps (no
+/// new name table — `void`/`undefined` through [`annotation_type`],
+/// `any` through [`boundary_annotation_type`]).
+#[must_use]
+fn is_voidish_effect_annotation(annotation: &str) -> bool {
+    let text = annotation.trim();
+    if let Some(id) = annotation_type(text) {
+        return id == TypeStore::VOID || id == TypeStore::UNDEFINED;
+    }
+    matches!(
+        boundary_annotation_type(text),
+        Some(id) if id == TypeStore::ANY
+    )
+}
+
+/// Gates one effect call through the P024 allowlist (P049): `Ok` admits
+/// the position (the call emits no verdict — only tails and positions
+/// check); `Err` carries the distinct decline reason.
+///
+/// Membership rides the P024 tables over fact-carried names only (never
+/// string-searching): direct calls and unknown receivers/members decline
+/// (each distinctly), exact-arity opaque signatures (`Math.floor`,
+/// `Array.isArray`, ...) enforce their count, and range/variadic shapes
+/// (`console.warn`, `JSON.parse`, `Math.max`, ...) admit arity-free —
+/// their shapes are uncheckable in-subset either way (the P024 precedent).
+fn gate_effect_call(call: &EffectCall) -> Result<(), String> {
+    let Some(receiver) = call.receiver.as_deref() else {
+        return Err(format!(
+            "effect call to '{}': direct calls are outside the effect subset \
+            (only P024 allowlist member calls admit)",
+            call.member
+        ));
+    };
+    if !is_known_value_receiver(receiver) {
+        return Err(format!(
+            "effect call on '{receiver}': unknown receivers are outside the effect subset \
+            (only JSON, Object, Array, console, Math admit)"
+        ));
+    }
+    if let Some(sig) = opaque_signature(receiver, call.member.as_str()) {
+        let admitted = usize::try_from(call.arg_count).is_ok_and(|count| count == sig.arity);
+        if admitted {
+            return Ok(());
+        }
+        return Err(format!(
+            "effect call '{receiver}.{}' takes {} argument{} but got {}: \
+            exact-arity effects check arity",
+            call.member,
+            sig.arity,
+            if sig.arity == 1 { "" } else { "s" },
+            call.arg_count
+        ));
+    }
+    if member_shape_decline(receiver, call.member.as_str()).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "effect call '{receiver}.{}': unknown members are outside the effect subset",
+        call.member
+    ))
+}
+
+/// Gates one function declaration for effect positions (P049): the
+/// void-ish annotation rule first (annotation-level, mirroring how
+/// `TS2355` fires regardless of the body), since tsc checks bare arm
+/// returns against the annotation.
+fn gate_effect_annotation(decl: &FunctionDecl, effective: &str) -> Result<(), String> {
+    if is_voidish_effect_annotation(effective) {
+        return Ok(());
+    }
+    Err(format!(
+        "effect body on '{}' needs a 'void', 'undefined', or 'any' return annotation: \
+        tsc TS2355 requires a returned value otherwise",
+        decl.name
+    ))
+}
+
+/// Shapes one lone-effect body for [`function_shape`]: zero positions when
+/// the annotation is void-ish and the call is allowlisted (the call emits
+/// no verdict and carries no facts — see the module-level void-effect
+/// rules), so the declaration checks silently like the P043 throw-only
+/// form.
+fn shape_effect_only(
+    decl: &FunctionDecl,
+    call: &EffectCall,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    gate_effect_annotation(decl, effective)?;
+    gate_effect_call(call)?;
+    Ok(Vec::new())
+}
+
+/// Shapes one guard-effect body for [`function_shape`]: the tail return —
+/// one [`SynthReturn`] through the same synthetic delegation as the P023
+/// guard tail (a bare tail leaves no position, so the declaration checks
+/// silently; the guard arm emits no verdict and carries no facts — see
+/// the module-level void-effect rules).
+fn shape_guard_effect(
+    decl: &FunctionDecl,
+    body: &GuardEffectBody,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    gate_effect_annotation(decl, effective)?;
+    gate_effect_call(&body.call)?;
+    match body.tail.as_ref() {
+        None => Ok(Vec::new()),
+        Some(tail) => Ok(vec![shape_return(
+            tail,
+            "tail return",
+            return_site(decl, effective),
+        )?]),
+    }
+}
+
 /// Shapes one guard-throw body for [`function_shape`]: the tail return —
 /// one [`SynthReturn`] through the same synthetic delegation as the P023
 /// guard tail (the guard throw emits no verdict and carries no facts — see
@@ -3129,6 +3346,8 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         FunctionBody::ElseIfChain(body) => shape_else_if(decl, body, &effective)?,
         FunctionBody::GuardThrow(body) => shape_guard_throw(decl, body, &effective)?,
         FunctionBody::StraightThrow(body) => shape_straight_throw(decl, body, &effective)?,
+        FunctionBody::EffectOnly(call) => shape_effect_only(decl, call, &effective)?,
+        FunctionBody::GuardEffect(body) => shape_guard_effect(decl, body, &effective)?,
         FunctionBody::StraightBody(straight) => {
             let mut positions = Vec::with_capacity(straight.leading.len().saturating_add(1));
             for (leading_index, inner) in straight.leading.iter().enumerate() {
@@ -3164,7 +3383,8 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         FunctionBody::TryUnsupported { reason }
         | FunctionBody::SwitchUnsupported { reason }
         | FunctionBody::LoopUnsupported { reason }
-        | FunctionBody::ElseIfUnsupported { reason } => {
+        | FunctionBody::ElseIfUnsupported { reason }
+        | FunctionBody::EffectUnsupported { reason } => {
             return Err(reason.clone());
         }
         FunctionBody::Complex => {
@@ -5410,6 +5630,9 @@ fn check_generic_decl(
         | FunctionBody::GuardThrow(_)
         | FunctionBody::ElseIfChain(_)
         | FunctionBody::ElseIfUnsupported { .. }
+        | FunctionBody::EffectOnly(_)
+        | FunctionBody::GuardEffect(_)
+        | FunctionBody::EffectUnsupported { .. }
         | FunctionBody::StraightThrow(_) => {
             // Joined and straight returns over a bare type parameter need
             // per-position instantiation the subset refuses: decline like
@@ -12897,6 +13120,101 @@ mod tests {
             reasons[2]
         );
         assert!(reasons[3].contains("overload"), "reason: {}", reasons[3]);
+    }
+
+    /// One allowlisted effect call for gate tests: `console.warn` with one
+    /// argument (variadic — arity-free).
+    fn warn_call() -> EffectCall {
+        EffectCall {
+            receiver: Some("console".to_owned()),
+            member: "warn".to_owned(),
+            arg_count: 1,
+        }
+    }
+
+    #[test]
+    fn function_effect_gates_silent_and_decline_distinctly() {
+        let binder = binder_with(&[
+            ("lone", span(0, 8)),
+            ("guarded", span(9, 17)),
+            ("counted", span(18, 26)),
+            ("direct", span(27, 35)),
+            ("typed", span(36, 44)),
+        ]);
+        let lone = function(
+            "lone",
+            0,
+            8,
+            vec![("key", true)],
+            Some("void"),
+            FunctionBody::EffectOnly(warn_call()),
+        );
+        let guarded = function(
+            "guarded",
+            9,
+            17,
+            Vec::new(),
+            Some("void"),
+            FunctionBody::GuardEffect(GuardEffectBody {
+                call: warn_call(),
+                tail: None,
+            }),
+        );
+        let counted = function(
+            "counted",
+            18,
+            26,
+            Vec::new(),
+            Some("void"),
+            FunctionBody::GuardEffect(GuardEffectBody {
+                call: EffectCall {
+                    receiver: Some("Math".to_owned()),
+                    member: "floor".to_owned(),
+                    arg_count: 2,
+                },
+                tail: None,
+            }),
+        );
+        let direct = function(
+            "direct",
+            27,
+            35,
+            Vec::new(),
+            Some("void"),
+            FunctionBody::EffectOnly(EffectCall {
+                receiver: None,
+                member: "helper".to_owned(),
+                arg_count: 1,
+            }),
+        );
+        let typed = function(
+            "typed",
+            36,
+            44,
+            Vec::new(),
+            Some("number"),
+            FunctionBody::EffectOnly(warn_call()),
+        );
+        let decls = [lone, guarded, counted, direct, typed];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        // Lone allowlist effects and bare-tail guards check silently; the
+        // arity breach, the direct call, and the TS2355 annotation each
+        // decline with a distinct reason.
+        assert_eq!(report.unsupported.len(), 3);
+        let reasons: Vec<&str> = report
+            .unsupported
+            .iter()
+            .map(|u| u.reason.as_str())
+            .collect();
+        assert!(reasons[0].contains("arity"), "reason: {}", reasons[0]);
+        assert!(reasons[1].contains("direct"), "reason: {}", reasons[1]);
+        assert!(reasons[2].contains("TS2355"), "reason: {}", reasons[2]);
     }
 
     #[test]
