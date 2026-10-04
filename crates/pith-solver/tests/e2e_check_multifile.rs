@@ -1210,10 +1210,10 @@ fn reexported_interface_matches_baselines() {
     );
 }
 
-/// Re-exported aliases expand single-level (PITH-P035): the `alias-*` corpus
-/// case differentials against the recorded tsc baselines (the interface
-/// alias checks through the underlying shape, the primitive alias behaves
-/// exactly like its target spelling).
+/// Re-exported aliases expand transitively (PITH-P035, chains via P052):
+/// the `alias-*` corpus case differentials against the recorded tsc
+/// baselines (the interface alias checks through the underlying shape,
+/// the primitive alias behaves exactly like its target spelling).
 #[test]
 fn reexported_alias_matches_baselines() {
     let program = run_program(&[
@@ -1390,12 +1390,13 @@ fn cyclic_type_reexport_declines() {
     );
 }
 
-/// Unexpandable aliases decline with reasons (PITH-P035): chained
-/// (alias-to-alias), complex (object-literal target), and generic aliases
-/// stay outside the single-level subset while the direct alias checks. tsc
-/// resolves every one of these (pinned divergence, probed 7.0.2).
+/// Unexpandable aliases decline with reasons (PITH-P035, chains via P052):
+/// complex (object-literal target) and generic aliases stay outside the
+/// subset while the direct alias AND the chained alias check. tsc resolves
+/// every one of these; only the complex and generic declines are pinned
+/// divergences now (probed 7.0.2).
 #[test]
-fn unexpandable_aliases_decline() {
+fn chained_alias_resolves_while_complex_and_generic_decline() {
     let program = run_program(&[
         FileSpec {
             path: "shared.ts",
@@ -1418,23 +1419,32 @@ fn unexpandable_aliases_decline() {
                       const s: Second = { x: 1, y: 2 };\n\
                       const o: Obj = { x: 1 };\n\
                       const g: Gen = 1;\n",
-            objects: &[ObjectSpec {
-                name: "f",
-                members: &[
-                    ("x", ObjectMemberKind::Number),
-                    ("y", ObjectMemberKind::Number),
-                ],
-            }],
+            objects: &[
+                ObjectSpec {
+                    name: "f",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::Number),
+                    ],
+                },
+                ObjectSpec {
+                    name: "s",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::Number),
+                    ],
+                },
+            ],
         },
     ]);
     let main = program.report.file(FileId(2)).expect("main report");
     assert!(
         main.diagnostics.is_empty(),
-        "declines, never verdicts: {:?}",
+        "the chain checks clean, declines never verdict: {:?}",
         main.diagnostics
     );
-    assert_eq!(main.unsupported.len(), 3, "reasons: {:?}", main.unsupported);
-    for fragment in ["chained aliases", "non-identifier alias targets", "generic"] {
+    assert_eq!(main.unsupported.len(), 2, "reasons: {:?}", main.unsupported);
+    for fragment in ["non-identifier alias targets", "generic"] {
         assert!(
             main.unsupported
                 .iter()
@@ -1445,11 +1455,12 @@ fn unexpandable_aliases_decline() {
     }
 }
 
-/// Aliases over imported names decline as chained (PITH-P035): the target
-/// resolves only through the declaring file's own import, which is a second
-/// expansion level. tsc resolves it (pinned divergence, probed 7.0.2).
+/// Aliases over imported names resolve transitively (PITH-P035, chains via
+/// P052): the target resolves through the declaring file's own import into
+/// the next declaring file's shape. tsc resolves it (the old chained
+/// decline was a pinned divergence, probed 7.0.2).
 #[test]
-fn alias_over_import_declines_as_chained() {
+fn alias_over_import_resolves_transitively() {
     let program = run_program(&[
         FileSpec {
             path: "base.ts",
@@ -1466,20 +1477,86 @@ fn alias_over_import_declines_as_chained() {
         FileSpec {
             path: "main.ts",
             source: "import { First } from \"./mid\";\nconst f: First = { x: 1, y: 2 };\n",
-            objects: &[],
+            objects: &[ObjectSpec {
+                name: "f",
+                members: &[
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::Number),
+                ],
+            }],
         },
     ]);
     let main = program.report.file(FileId(2)).expect("main report");
     assert!(
         main.diagnostics.is_empty(),
-        "declines, never verdicts: {:?}",
+        "the import hop checks clean: {:?}",
         main.diagnostics
     );
-    assert_eq!(main.unsupported.len(), 1, "reasons: {:?}", main.unsupported);
     assert!(
-        main.unsupported[0].reason.contains("chained aliases"),
-        "reason: {}",
-        main.unsupported[0].reason
+        main.unsupported.is_empty(),
+        "no declines: {:?}",
+        main.unsupported
+    );
+}
+
+/// A wrong member through a cross-file alias chain diagnoses at the member
+/// (P052): the chain resolves to the underlying interface and checks exactly
+/// like a direct shape import. Probed tsc 7.0.2 (`main-wrong.ts`): one
+/// `TS2322` at the member.
+#[test]
+fn chained_alias_wrong_member_diagnoses_like_direct_import() {
+    let program = run_program(&[
+        FileSpec {
+            path: "shared.ts",
+            source: "export interface Point { x: number; y: number; }\n\
+                     export type First = Point;\n\
+                     export type Second = First;\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "mid.ts",
+            source: "export { First, Second } from \"./shared\";\n",
+            objects: &[],
+        },
+        FileSpec {
+            path: "main.ts",
+            source: "import { Second } from \"./mid\";\n\
+                      const ok: Second = { x: 1, y: 2 };\n\
+                      const wrong: Second = { x: 1, y: \"oops\" };\n",
+            objects: &[
+                ObjectSpec {
+                    name: "ok",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::Number),
+                    ],
+                },
+                ObjectSpec {
+                    name: "wrong",
+                    members: &[
+                        ("x", ObjectMemberKind::Number),
+                        ("y", ObjectMemberKind::String),
+                    ],
+                },
+            ],
+        },
+    ]);
+    let main = program.report.file(FileId(2)).expect("main report");
+    assert_eq!(
+        main.diagnostics.len(),
+        1,
+        "diagnostics: {:?}",
+        main.diagnostics
+    );
+    assert_eq!(main.diagnostics[0].code, "PITH2322");
+    assert_eq!(
+        main.diagnostics[0].message,
+        "Type 'string' is not assignable to type 'number'."
+    );
+    assert!(
+        main.unsupported.is_empty(),
+        "no declines: {:?}",
+        main.unsupported
     );
 }
 

@@ -406,10 +406,16 @@ fixture_test!(
     0
 );
 fixture_test!(
-    alias_chained_is_unsupported,
+    alias_chained_resolves_transitively,
     "alias-chained-declined.ts",
     "alias-chained-declined.expected.txt",
-    1
+    0
+);
+fixture_test!(
+    alias_chain_deep_resolves_transitively,
+    "alias-chain-deep.ts",
+    "alias-chain-deep.expected.txt",
+    0
 );
 fixture_test!(
     alias_shadowed_is_unsupported,
@@ -558,6 +564,78 @@ fixture_test!(
     "ternary-call-cond.expected.txt",
     0
 );
+
+#[test]
+fn alias_chain_mutual_cycle_declines() {
+    // Pinned oracle-error divergence (P052): tsc spells `TS2456` at both
+    // alias declarations while the solver declines once at the use — the
+    // subset spells no declaration diagnostics, and the visited set keeps
+    // the cycle from looping forever.
+    let source = include_str!("../../../corpus/check-const/alias-chain-mutual-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-const/alias-chain-mutual-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            (
+                "TS2456".to_owned(),
+                "Type alias 'A' circularly references itself.".to_owned()
+            ),
+            (
+                "TS2456".to_owned(),
+                "Type alias 'B' circularly references itself.".to_owned()
+            ),
+        ],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("circular"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn alias_chain_over_depth_declines_distinctly() {
+    // Pinned oracle-error divergence by design (P052): tsc has no depth
+    // limit, so it checks through the nine-link chain (`TS2322` on `bad`)
+    // while the solver declines once PER USE with its own over-depth
+    // reason — bounded iteration, never unbounded recursion. Both uses
+    // (`ok` and `bad`) decline: even the clean use cannot be checked
+    // without walking past the bound.
+    let source = include_str!("../../../corpus/check-const/alias-chain-over-depth-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-const/alias-chain-over-depth-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 2);
+    for note in &report.unsupported {
+        assert!(
+            note.reason.contains("deep alias chains"),
+            "reason: {}",
+            note.reason
+        );
+    }
+}
 
 #[test]
 fn ident_cycle_declines_with_forward_then_cycle() {

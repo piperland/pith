@@ -970,24 +970,70 @@ fn local_alias_enum_and_primitive_check_like_targets() {
 }
 
 #[test]
-fn local_alias_chained_and_shadowed_decline() {
-    // tsc resolves chains transitively and reads shadowed type meanings
-    // (both clean in tsc 7.0.2); the solver declines with reasons instead
-    // of forcing verdicts (pinned divergences).
+fn local_alias_chain_resolves_transitively() {
+    // tsc resolves chains transitively (probed 7.0.2 p052-probes/chain2.ts);
+    // the P038 single-level chained decline is gone.
     expect_differential(
-        "local_alias_chained_declines",
-        "type A = number;\ntype B = A;\nconst b: B = 1;\n",
-        &[HandFed {
-            name: "b",
-            kind: DeclKind::Const,
-            annotation: Some("B"),
-            init: Some(InitKind::Number),
-            members: None,
-            init_text: Some("1"),
-        }],
-        "",
-        1,
+        "local_alias_chain_resolves_transitively",
+        "type A = number;\ntype B = A;\nconst ok: B = 1;\nconst bad: B = \"oops\";\n",
+        &[
+            HandFed {
+                name: "ok",
+                kind: DeclKind::Const,
+                annotation: Some("B"),
+                init: Some(InitKind::Number),
+                members: None,
+                init_text: Some("1"),
+            },
+            HandFed {
+                name: "bad",
+                kind: DeclKind::Const,
+                annotation: Some("B"),
+                init: Some(InitKind::String),
+                members: None,
+                init_text: Some("\"oops\""),
+            },
+        ],
+        "alias-chain.ts:TS2322: Type 'string' is not assignable to type 'number'.\n",
+        0,
     );
+}
+
+#[test]
+fn local_alias_chain_to_interface_matches_baseline() {
+    // The P052 corpus fixture through the adapter-fed pipeline: the chained
+    // interface checks with the UNDERLYING display, exactly like tsc.
+    expect_differential(
+        "local_alias_chain_to_interface_matches_baseline",
+        include_str!("../../../corpus/check-enums-namespaces/alias-chain-interface.ts"),
+        &[
+            HandFed {
+                name: "ok",
+                kind: DeclKind::Const,
+                annotation: Some("B"),
+                init: None,
+                members: Some(&[("x", Number), ("y", Number)]),
+                init_text: None,
+            },
+            HandFed {
+                name: "wrong",
+                kind: DeclKind::Const,
+                annotation: Some("B"),
+                init: None,
+                members: Some(&[("x", Number), ("y", ObjectMemberKind::String)]),
+                init_text: None,
+            },
+        ],
+        include_str!("../../../corpus/check-enums-namespaces/alias-chain-interface.expected.txt"),
+        0,
+    );
+}
+
+#[test]
+fn local_alias_shadowed_declines() {
+    // tsc reads the shadowed type meaning (clean in tsc 7.0.2); the solver
+    // declines with a reason instead of forcing a verdict so an expansion
+    // can never hijack a value binding (pinned divergence).
     expect_differential(
         "local_alias_shadowed_declines",
         "type Alias = number;\n\
