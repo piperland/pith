@@ -1,0 +1,1 @@
+enum-member-returns.ts:TS2322: Type 'Color.Red' is not assignable to type 'Other'.

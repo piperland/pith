@@ -1,0 +1,3 @@
+enum-member-singleton-source.ts:TS2322: Type 'Other' is not assignable to type 'Color'.
+enum-member-singleton-source.ts:TS2322: Type 'Solo' is not assignable to type 'Color'.
+enum-member-singleton-source.ts:TS2322: Type 'Color.Red' is not assignable to type 'Other'.

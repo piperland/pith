@@ -1,0 +1,5 @@
+enum-member-refs.ts:TS2322: Type '5' is not assignable to type 'Color'.
+enum-member-refs.ts:TS2322: Type 'Color.Red' is not assignable to type 'Other'.
+enum-member-refs.ts:TS2322: Type 'Color.Green' is not assignable to type 'Other'.
+enum-member-refs.ts:TS2322: Type '"a"' is not assignable to type 'Str'.
+enum-member-refs.ts:TS2322: Type 'true' is not assignable to type 'Color'.
