@@ -66,6 +66,15 @@
 //! diverges by design: `throw-complex-declined` (the oracle is clean where
 //! the subset declines — pins the clean baseline plus one unsupported
 //! note).
+//! Else-if chain bodies check per branch in source order (P045):
+//! `elseif-clean` is silent with zero notes; `elseif-branch-wrong` matches
+//! its oracle `TS2322`; `elseif-two-wrong` matches twice. Three more
+//! fixtures diverge by design: `elseif-missing-else` (the oracle errors
+//! `TS2366` where the subset rides the missing-else gate — silent plus one
+//! unsupported note) and `elseif-nested-declined` plus
+//! `elseif-complex-branch-declined` (the oracle is clean where the subset
+//! declines — each pins the clean baseline plus one unsupported note with
+//! its distinct reason).
 //! One fixture still diverges by design
 //! (the oracle errors where the subset declines): `unannotated-param`
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
@@ -81,8 +90,8 @@ use pith_frontend::{
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_functions, CastInput, CastKind, CountedForBody, DeclKind, FileReport, FunctionBody,
-    FunctionDecl, FunctionParam, FunctionReturn, GuardThrowBody, InitKind, InnerDecl,
+    check_functions, CastInput, CastKind, CountedForBody, DeclKind, ElseIfChainBody, FileReport,
+    FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardThrowBody, InitKind, InnerDecl,
     JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind, StraightBody, StraightThrowBody,
     SwitchBody, TryCatchBody,
 };
@@ -356,6 +365,15 @@ fn map_counted_for(body: &FrontendReturn, tail: Option<&FrontendReturn>) -> Coun
     }
 }
 
+/// Maps one frontend else-if chain body to the solver's: one return per
+/// branch in source order, each through [`map_function_return`] (same
+/// `init_array: None` seam as every other return position).
+fn map_else_if(branches: &[FrontendReturn]) -> ElseIfChainBody {
+    ElseIfChainBody {
+        branches: branches.iter().map(map_function_return).collect(),
+    }
+}
+
 /// Maps one frontend straight-with-throw body to the solver's: leading
 /// declarators in source order plus the optional terminal return (throws
 /// carry no facts — see the module-level P043 throw rules). The lone
@@ -435,6 +453,12 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 FunctionBodyFact::CountedFor { body, tail } => {
                     FunctionBody::CountedFor(map_counted_for(body, tail.as_ref()))
                 }
+                FunctionBodyFact::ElseIfChain { branches } => {
+                    FunctionBody::ElseIfChain(map_else_if(branches))
+                }
+                FunctionBodyFact::ElseIfUnsupported { reason } => FunctionBody::ElseIfUnsupported {
+                    reason: reason.clone(),
+                },
                 FunctionBodyFact::GuardThrow { tail } => FunctionBody::GuardThrow(GuardThrowBody {
                     tail: map_function_return(tail),
                 }),
@@ -780,6 +804,24 @@ fixture_test!(
     "throw-only.expected.txt",
     0
 );
+fixture_test!(
+    elseif_clean_is_silent,
+    "elseif-clean.ts",
+    "elseif-clean.expected.txt",
+    0
+);
+fixture_test!(
+    elseif_branch_wrong_matches_ts2322,
+    "elseif-branch-wrong.ts",
+    "elseif-branch-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    elseif_two_wrong_matches_ts2322_twice,
+    "elseif-two-wrong.ts",
+    "elseif-two-wrong.expected.txt",
+    0
+);
 
 #[test]
 fn straight_identifier_init_divergence_pins_ts2322() {
@@ -1026,6 +1068,66 @@ fn throw_complex_decline_pins_clean_oracle() {
         include_str!("../../../corpus/check-functions/throw-complex-declined.ts"),
         include_str!("../../../corpus/check-functions/throw-complex-declined.expected.txt"),
         "complex body on 'branchThrow': control flow is outside the subset",
+    );
+}
+
+#[test]
+fn elseif_missing_else_declines_where_oracle_errors_ts2366() {
+    // By design the subset declines where the oracle errors: tsc reports
+    // `TS2366` on the missing terminal `else` (exhaustiveness needs a
+    // declaration-completeness family the subset refuses) while the solver
+    // records one unsupported note and stays silent — never a forced
+    // verdict, never a partial one over the checkable branches.
+    let source = include_str!("../../../corpus/check-functions/elseif-missing-else.ts");
+    let expected = include_str!("../../../corpus/check-functions/elseif-missing-else.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2366".to_owned(),
+            "Function lacks ending return statement and return type does not include \
+            'undefined'."
+                .to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason, "missing else in else-if chain is outside the subset",
+        "recorded reason"
+    );
+}
+
+#[test]
+fn elseif_nested_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: a chain
+    // nested inside a branch needs flow facts (probed 7.0.2 P045) while the
+    // solver records one unsupported note with the nested-chain reason.
+    expect_clean_oracle_decline(
+        "elseif_nested_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/elseif-nested-declined.ts"),
+        include_str!("../../../corpus/check-functions/elseif-nested-declined.expected.txt"),
+        "nested else-if chain is outside the subset",
+    );
+}
+
+#[test]
+fn elseif_complex_branch_decline_pins_clean_oracle() {
+    // By design the subset declines where the oracle is clean: a `throw`
+    // branch inside a chain is clean in tsc (throws accept any value —
+    // probed 7.0.2 P043/P045) while the solver records one unsupported note
+    // with the complex-branch reason — never a partial verdict over the
+    // remaining branches.
+    expect_clean_oracle_decline(
+        "elseif_complex_branch_decline_pins_clean_oracle",
+        include_str!("../../../corpus/check-functions/elseif-complex-branch-declined.ts"),
+        include_str!("../../../corpus/check-functions/elseif-complex-branch-declined.expected.txt"),
+        "complex else-if branch is outside the subset",
     );
 }
 
