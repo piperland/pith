@@ -258,6 +258,8 @@ fn news_from_facts(parsed: &ParsedFile) -> Vec<NewSite> {
                     kind: map_new_arg_kind(arg.kind),
                     span: arg.span,
                     cast: None,
+                    // Constructor drivers never feed identifier names.
+                    ident: None,
                 })
                 .collect(),
         })

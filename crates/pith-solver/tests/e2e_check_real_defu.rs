@@ -381,6 +381,8 @@ fn calls_from_facts(parsed: &ParsedFile) -> Vec<CallSite> {
                     kind: map_call_arg_kind(arg.kind),
                     span: arg.span,
                     cast: None,
+                    // Non-generic call drivers never feed identifier names.
+                    ident: None,
                 })
                 .collect(),
         })

@@ -12,12 +12,18 @@
 //! and the modifier flag, and call facts (callee name + identifier span,
 //! call span, argument literal kinds + spans) all come from adapter facts. The driver-side
 //! mappings are the literal-kind enum translations (mechanical and
-//! exhaustive) plus ONE disclosed hand-fed seam: explicit type arguments ride
+//! exhaustive) plus THREE disclosed hand-fed seams: explicit type arguments ride
 //! per-call (`Some(vec!["number"])` for `id<number>(1)`, `None` for `id(1)`)
-//! because the adapter emits no call-type-argument facts. Arity, spans, and
-//! inferred bindings still come from facts; only the angle-bracket texts are
-//! hand-fed — the same seam shape as the const driver's hand-fed
-//! annotations, and it vanishes when the adapter emits the facts.
+//! because the adapter emits no call-type-argument facts; bare-identifier
+//! argument names are driver-sliced from the argument fact spans (the P048
+//! seam — the adapter emits no identifier-argument facts); and const sources
+//! plus enclosing-function contexts feed the P061 per-call [`IdentTable`]
+//! (the adapter emits no call-scope facts, so the caller names the enclosing
+//! function per call and the driver maps its parameter facts verbatim).
+//! Arity, spans, and inferred bindings still come from facts; only the
+//! angle-bracket texts, sliced names, and enclosing selections are hand-fed
+//! — the same seam shape as the const driver's hand-fed annotations, and
+//! each vanishes when the adapter emits the facts.
 //!
 //! The driver routes only declarations carrying type-parameter facts (a
 //! non-empty name list or a set complexity flag); plain functions belong to
@@ -34,14 +40,15 @@
 //! instead of forcing a false match.
 
 use pith_frontend::{
-    parse_module, CallArgKind as FrontendCallArgKind, FunctionBodyFact, ParsedFile,
+    parse_module, CallArgFact as FrontendCallArg, CallArgKind as FrontendCallArgKind,
+    FunctionBodyFact, InitFact as FrontendInitFact, InitKind as FrontendInitKind, ParsedFile,
     ReturnKind as FrontendReturnKind, SingleReturnFact as FrontendReturn,
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_solver::{
-    check_generics, CallArg, CallSite, FileReport, FunctionBody, FunctionDecl, FunctionParam,
-    FunctionReturn, GenericCall, GenericDecl, InitKind, JoinedReturns, ObjectInit,
-    ObjectMemberInit, ObjectMemberKind, TypeParamBound,
+    check_generics_with_consts, CallArg, CallSite, ConstDecl, DeclKind, FileReport, FunctionBody,
+    FunctionDecl, FunctionParam, FunctionReturn, GenericCall, GenericDecl, GenericEnclosing,
+    InitKind, JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind, TypeParamBound,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -120,6 +127,149 @@ fn map_call_arg_kind(kind: FrontendCallArgKind) -> InitKind {
         FrontendCallArgKind::Null => InitKind::Null,
         FrontendCallArgKind::Undefined => InitKind::Undefined,
         FrontendCallArgKind::NonLiteral => InitKind::NonLiteral,
+    }
+}
+
+/// Slices `source` at a fact span (`None` on skew — only possible with
+/// recovery from parse errors; mirrors the check-const driver's seam).
+fn slice_of(source: &str, span: Span) -> Option<&str> {
+    let lo = usize::try_from(span.lo).ok()?;
+    let hi = usize::try_from(span.hi).ok()?;
+    source.get(lo..hi)
+}
+
+/// Whether sliced text is a bare identifier (mirrors the check-const
+/// driver's check).
+fn is_bare_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Slices one call argument's bare-identifier name (the P061 seam): `Some`
+/// only for `NonLiteral` arguments whose fact span slices to a bare
+/// identifier — literals and every other shape feed `None` and keep their
+/// historical paths.
+fn call_arg_ident(source: &str, arg: &FrontendCallArg) -> Option<String> {
+    if arg.kind != FrontendCallArgKind::NonLiteral {
+        return None;
+    }
+    slice_of(source, arg.span)
+        .filter(|text| is_bare_identifier(text))
+        .map(str::to_owned)
+}
+
+/// Maps one frontend initializer kind to the solver's, variant by variant.
+///
+/// Exhaustive so a new frontend variant fails to compile instead of silently
+/// mis-checking.
+fn map_const_init(kind: FrontendInitKind) -> InitKind {
+    match kind {
+        FrontendInitKind::Number => InitKind::Number,
+        FrontendInitKind::String => InitKind::String,
+        FrontendInitKind::Boolean => InitKind::Boolean,
+        FrontendInitKind::Null => InitKind::Null,
+        FrontendInitKind::Undefined => InitKind::Undefined,
+        FrontendInitKind::NonLiteral => InitKind::NonLiteral,
+    }
+}
+
+/// Maps one frontend initializer fact to the solver's, with the P060 regex
+/// seam (mirrors the check-const driver): a bare `NonLiteral` whose sliced
+/// text leads with `/` reads as [`InitKind::RegExp`], so regex sources
+/// propagate their kind through the P048 paths.
+fn map_const_init_kind(source: &str, init: &FrontendInitFact) -> InitKind {
+    let sliced_regex = init.cast.is_none()
+        && init.ternary.is_none()
+        && init.member_ref.is_none()
+        && slice_of(source, init.span).is_some_and(|text| text.trim_start().starts_with('/'));
+    if init.kind == FrontendInitKind::NonLiteral && sliced_regex {
+        return InitKind::RegExp;
+    }
+    map_const_init(init.kind)
+}
+
+/// The const-source driver (P061): every [`ConstDecl`] identifier-source
+/// field comes from adapter facts.
+///
+/// - `name`/`scope`/`symbol` via symbol linkage + binder resolution (the
+///   check-const fallback);
+/// - `kind` is `const` (the adapter emits no `let` facts yet);
+/// - `annotation` as the frontend's colon-stripped text verbatim;
+/// - `init` via [`map_const_init_kind`] (literals plus the regex seam);
+/// - `init_ident` is the P048 seam (bare identifiers driver-sliced from the
+///   init fact span; anything else feeds `None`);
+/// - object/array/cast/ternary/member shapes are `None` (no fixture in this
+///   suite holds one: those sources decline at the use through the shared
+///   P048 `Other` path instead of mis-binding — a disclosed driver limit;
+///   sources never check here: they only feed the per-call [`IdentTable`]).
+fn consts_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<ConstDecl> {
+    parsed
+        .decls
+        .iter()
+        .map(|decl| {
+            let (name, span, symbol) = fallback_span(parsed, binder, decl.symbol, decl.scope);
+            let init_ident = match &decl.init {
+                Some(init) if init.kind == FrontendInitKind::NonLiteral => {
+                    slice_of(source, init.span)
+                        .filter(|text| is_bare_identifier(text))
+                        .map(str::to_owned)
+                }
+                _ => None,
+            };
+            ConstDecl {
+                name,
+                span,
+                scope: decl.scope,
+                symbol,
+                kind: DeclKind::Const,
+                annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
+                init: decl
+                    .init
+                    .as_ref()
+                    .map(|init| map_const_init_kind(source, init)),
+                init_ident,
+                init_object: None,
+                init_array: None,
+                cast: None,
+                init_ternary: None,
+                init_member_ref: None,
+            }
+        })
+        .collect()
+}
+
+/// Maps one named function's parameter facts to a call's enclosing context
+/// (P061): parameter names + annotated-ness + annotation texts +
+/// optional/rest markers verbatim, plus the function's fact scope as the
+/// resolution scope. The caller names the enclosing function per call (the
+/// hand-fed seam — call facts carry no scope); panics when no function fact
+/// bears the name.
+fn enclosing_from_function(parsed: &ParsedFile, name: &str) -> GenericEnclosing {
+    let func = parsed
+        .functions
+        .iter()
+        .find(|func| {
+            parsed
+                .symbols
+                .get(usize::try_from(func.symbol).unwrap_or(usize::MAX))
+                .is_some_and(|symbol| symbol.name == name)
+        })
+        .unwrap_or_else(|| panic!("no function fact named '{name}'"));
+    GenericEnclosing {
+        params: func
+            .params
+            .iter()
+            .map(|param| FunctionParam {
+                name: param.name.clone(),
+                annotated: param.annotated,
+                annotation: param.annotation_text.clone(),
+                optional: param.optional,
+                is_rest: param.is_rest,
+            })
+            .collect(),
+        scope: func.scope,
     }
 }
 
@@ -294,19 +444,36 @@ fn generics_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<GenericDecl>
 ///
 /// Callee name plus identifier span, whole-call span, and argument kinds +
 /// spans verbatim; only the [`map_call_arg_kind`] enum translation is
-/// driver-side. Explicit type arguments are NOT facts (the adapter emits
-/// none) — the caller supplies them positionally in `explicit`.
-fn calls_from_facts(parsed: &ParsedFile, explicit: &[Option<Vec<String>>]) -> Vec<GenericCall> {
+/// driver-side. Bare-identifier arguments slice their names from the argument
+/// fact span (the P061 seam — the adapter emits no identifier-argument
+/// facts; anything else feeds `None` and keeps its historical path).
+/// Explicit type arguments are NOT facts (the adapter emits none) — the
+/// caller supplies them positionally in `explicit` — and enclosing-function
+/// contexts ride positionally in `enclosing` for the same reason (call facts
+/// carry no scope, so the caller names the enclosing function per call and
+/// the driver maps its parameter facts; `None` means a top-level call).
+fn calls_from_facts(
+    parsed: &ParsedFile,
+    source: &str,
+    explicit: &[Option<Vec<String>>],
+    enclosing: &[Option<GenericEnclosing>],
+) -> Vec<GenericCall> {
     assert_eq!(
         parsed.calls.len(),
         explicit.len(),
         "explicit type arguments must align one per call fact"
     );
+    assert_eq!(
+        parsed.calls.len(),
+        enclosing.len(),
+        "enclosing contexts must align one per call fact"
+    );
     parsed
         .calls
         .iter()
         .zip(explicit.iter())
-        .map(|(call, written)| GenericCall {
+        .zip(enclosing.iter())
+        .map(|((call, written), context)| GenericCall {
             call: CallSite {
                 callee: call.callee.clone(),
                 callee_span: call.callee_span,
@@ -318,16 +485,31 @@ fn calls_from_facts(parsed: &ParsedFile, explicit: &[Option<Vec<String>>]) -> Ve
                         kind: map_call_arg_kind(arg.kind),
                         span: arg.span,
                         cast: None,
+                        ident: call_arg_ident(source, arg),
                     })
                     .collect(),
             },
             explicit_args: written.clone(),
+            enclosing: context.clone(),
         })
         .collect()
 }
 
 /// Runs the full real pipeline on one source text with a fresh binder.
 fn run_pipeline(source: &str, explicit: &[Option<Vec<String>>]) -> (ParsedFile, FileReport) {
+    run_pipeline_with_enclosing(source, explicit, &[])
+}
+
+/// Runs the full real pipeline with per-call enclosing functions for
+/// identifier-argument resolution (P061): `enclosing` names, one per call
+/// fact (`None` for top-level calls), the function whose body holds the
+/// call — the hand-fed seam for call-scope facts the adapter does not emit.
+/// Shorter slices default the rest to top-level.
+fn run_pipeline_with_enclosing(
+    source: &str,
+    explicit: &[Option<Vec<String>>],
+    enclosing: &[Option<&str>],
+) -> (ParsedFile, FileReport) {
     let parsed = parse_module(FILE, "fixture.ts", source);
     let frontend_errors = &parsed.errors;
     assert!(
@@ -336,8 +518,19 @@ fn run_pipeline(source: &str, explicit: &[Option<Vec<String>>]) -> (ParsedFile, 
     );
     let binder = build_binder(&parsed);
     let decls = generics_from_facts(&parsed, &binder);
-    let calls = calls_from_facts(&parsed, explicit);
-    let report = check_generics(FILE, &decls, &calls, &binder);
+    let consts = consts_from_facts(&parsed, &binder, source);
+    let contexts = parsed
+        .calls
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            enclosing
+                .get(index)
+                .and_then(|name| name.map(|name| enclosing_from_function(&parsed, name)))
+        })
+        .collect::<Vec<_>>();
+    let calls = calls_from_facts(&parsed, source, explicit, &contexts);
+    let report = check_generics_with_consts(FILE, &decls, &consts, &calls, &binder);
     (parsed, report)
 }
 
@@ -379,7 +572,21 @@ fn expect_differential(
     explicit: &[Option<Vec<String>>],
     unsupported: usize,
 ) {
-    let (_, report) = run_pipeline(source, explicit);
+    expect_differential_enclosing(name, source, expected, explicit, &[], unsupported);
+}
+
+/// Asserts the pipeline verdict differentially with per-call enclosing
+/// functions (P061): `enclosing` names, one per call fact (`None` for
+/// top-level calls), the function whose body holds the call.
+fn expect_differential_enclosing(
+    name: &str,
+    source: &str,
+    expected: &str,
+    explicit: &[Option<Vec<String>>],
+    enclosing: &[Option<&str>],
+    unsupported: usize,
+) {
+    let (_, report) = run_pipeline_with_enclosing(source, explicit, enclosing);
     let mut actual: Vec<(String, String)> = report
         .diagnostics
         .iter()
@@ -494,18 +701,49 @@ fixture_test!(
     &[None, Some(args1("string"))],
     1
 );
-fixture_test!(
-    defaulted_override_matches_ts2345,
-    "defaulted-inference-override.ts",
-    "defaulted-inference-override.expected.txt",
-    &[None, Some(args1("string"))],
-    1
-);
+#[test]
+fn defaulted_override_matches_ts2345() {
+    // Explicit `string` override against `number` diagnoses TS2345; the
+    // body (`return x`) and the ambient-sourced ident arg (`u`, declared
+    // without a literal) each decline with their own reason — two notes,
+    // never a partial verdict over the call.
+    let source = include_str!("../../../corpus/check-generics/defaulted-inference-override.ts");
+    let expected =
+        include_str!("../../../corpus/check-generics/defaulted-inference-override.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2345".to_owned(),
+            "Argument of type 'number' is not assignable to parameter of type 'string'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source, &[None, Some(args1("string"))]);
+    assert_eq!(report.unsupported.len(), 2);
+    let reasons: Vec<&str> = report
+        .unsupported
+        .iter()
+        .map(|note| note.reason.as_str())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("non-literal return")),
+        "reasons: {reasons:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("does not initialize from a literal")),
+        "reasons: {reasons:?}"
+    );
+}
 
 #[test]
 fn inference_failure_pins_clean_oracle() {
     // No literal candidate: tsc binds from the identifier's type (clean)
-    // while the subset declines with a reason (plus the body note).
+    // while the subset declines naming the non-literal source (plus the
+    // body note) — the P061 P048 reason replaces the old "cannot infer".
     let source = include_str!("../../../corpus/check-generics/inference-failure.ts");
     let expected = include_str!("../../../corpus/check-generics/inference-failure.expected.txt");
     assert!(
@@ -523,7 +761,7 @@ fn inference_failure_pins_clean_oracle() {
         report
             .unsupported
             .iter()
-            .any(|note| note.reason.contains("cannot infer")),
+            .any(|note| note.reason.contains("does not initialize from a literal")),
         "reasons: {:?}",
         report.unsupported
     );
@@ -606,12 +844,91 @@ fixture_test!(
     &[None],
     1
 );
+fixture_test!(
+    ident_arg_clean_binds_silently,
+    "ident-arg-clean.ts",
+    "ident-arg-clean.expected.txt",
+    &[None, None],
+    1
+);
+fixture_test!(
+    ident_arg_wrong_matches_ts2345,
+    "ident-arg-wrong.ts",
+    "ident-arg-wrong.expected.txt",
+    &[None],
+    1
+);
+fixture_test!(
+    inferred_kind_arg_matches_ts2345,
+    "inferred-kind-arg.ts",
+    "inferred-kind-arg.expected.txt",
+    &[None],
+    1
+);
+fixture_test!(
+    cross_ident_pair_binds_silently,
+    "cross-ident-pair.ts",
+    "cross-ident-pair.expected.txt",
+    &[None],
+    1
+);
+
+#[test]
+fn param_sourced_arg_binds_silently() {
+    // `id(p)` inside `wrap(p: number)`: the oracle binds from the parameter
+    // (clean) while the solver binds through the fed enclosing context
+    // (plus the body note).
+    let source = include_str!("../../../corpus/check-generics/param-sourced-arg.ts");
+    let expected = include_str!("../../../corpus/check-generics/param-sourced-arg.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on parameter-sourced calls"
+    );
+    expect_differential_enclosing(
+        "param_sourced_arg_binds_silently",
+        source,
+        expected,
+        &[None],
+        &[Some("wrap")],
+        1,
+    );
+}
+
+#[test]
+fn unresolvable_ident_declines_distinctly() {
+    // `id(nope)`: the oracle spells TS2304 at the argument while the subset
+    // declines distinctly (never bound as `unknown`, never silently
+    // skipped), plus the body note.
+    let source = include_str!("../../../corpus/check-generics/unresolvable-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-generics/unresolvable-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [("TS2304".to_owned(), "Cannot find name 'nope'.".to_owned())],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source, &[None]);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 2);
+    assert!(
+        report
+            .unsupported
+            .iter()
+            .any(|note| note.reason.contains("no checkable const declarator")),
+        "reasons: {:?}",
+        report.unsupported
+    );
+}
 
 #[test]
 fn pair_inference_failure_pins_clean_oracle() {
     // No literal candidates: tsc binds from the identifiers' types (clean)
-    // while the subset declines naming the first uninferrable parameter
-    // (plus the body note).
+    // while the subset declines naming the first non-literal source (plus
+    // the body note) — the P061 P048 reason replaces "cannot infer".
     let source = include_str!("../../../corpus/check-generics/pair-inference-failure.ts");
     let expected =
         include_str!("../../../corpus/check-generics/pair-inference-failure.expected.txt");
@@ -630,7 +947,7 @@ fn pair_inference_failure_pins_clean_oracle() {
         report
             .unsupported
             .iter()
-            .any(|note| note.reason.contains("cannot infer")),
+            .any(|note| note.reason.contains("does not initialize from a literal")),
         "reasons: {:?}",
         report.unsupported
     );
@@ -846,14 +1163,12 @@ fn driver_maps_facts_without_hand_feeding() {
     // Guards the mapping itself: names from symbol linkage, type-parameter
     // names plus constraint/default texts plus the modifier flag verbatim,
     // params/returns verbatim, call facts verbatim — only angle-bracket
-    // texts ride the disclosed hand-fed seam.
-    let parsed = parse_module(
-        FILE,
-        "m.ts",
-        "function id<T>(x: T): T {\n  return x;\n}\n\
+    // texts, sliced identifier names, const sources, and enclosing contexts
+    // ride the disclosed hand-fed seams.
+    let source = "function id<T>(x: T): T {\n  return x;\n}\n\
          function idc<T extends string>(x: T): T {\n  return x;\n}\n\
-         id(1);\n",
-    );
+         id(1);\n";
+    let parsed = parse_module(FILE, "m.ts", source);
     let errors = &parsed.errors;
     assert!(parsed.errors.is_empty(), "errors: {errors:?}");
     assert_eq!(parsed.functions.len(), 2);
@@ -875,7 +1190,7 @@ fn driver_maps_facts_without_hand_feeding() {
         assert_eq!(decl.decl.span.file, FILE);
         assert!(decl.decl.span.lo < decl.decl.span.hi);
     }
-    let calls = calls_from_facts(&parsed, &[None]);
+    let calls = calls_from_facts(&parsed, source, &[None], &[None]);
     assert_eq!(calls.len(), 1);
     let site = &calls[0].call;
     assert_eq!(site.callee, "id");
@@ -883,5 +1198,11 @@ fn driver_maps_facts_without_hand_feeding() {
     assert!(site.callee_span.lo < site.callee_span.hi);
     assert_eq!(site.args.len(), 1);
     assert_eq!(site.args[0].kind, InitKind::Number);
+    // Literal arguments never slice identifier names.
+    assert_eq!(site.args[0].ident, None);
     assert!(calls[0].explicit_args.is_none());
+    assert!(calls[0].enclosing.is_none());
+    // Const sources map verbatim (no fixture consts here).
+    let consts = consts_from_facts(&parsed, &binder, source);
+    assert!(consts.is_empty());
 }
