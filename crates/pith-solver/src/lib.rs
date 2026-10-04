@@ -408,6 +408,58 @@
 //!   thread [`NamedTypeScope::EMPTY`] (pinned gaps: those paths keep
 //!   today's verdicts).
 //!
+//! Structural admission for locally-shaped named params (P062, probed on tsc
+//! 7.0.2 `--strict --pretty false`; probes in `.agent/scratch/p062-probes/`):
+//!
+//! - Object-literal args against params naming a LOCAL interface with
+//!   primitive members check member-wise through the SHARED P017 comparison
+//!   ([`check_interface_shape`] — the same function, never a parallel
+//!   implementation), spelling the interface name: wrong members diagnose
+//!   per-member `TS2322` (`a-clean` silent; `b-wrong` one `TS2322`;
+//!   `i-two-wrong` two), first-excess `TS2353` (`c-excess`), one-missing
+//!   `TS2741` (`d-missing`) and several-missing `TS2739` (`e-missing-many`)
+//!   — the wrong > excess > missing priority holds (`j-wrong-excess` only
+//!   `TS2322`, `k-excess-missing` only `TS2353`); optional members stay
+//!   absent-silent and present-checked (`n-optional`); fresh booleans spell
+//!   literally in actual types (`y-bool-actual`).
+//! - Calls diagnose positionally and stop at the first mismatch, exactly
+//!   like primitive positions (probes `l`, `q`): two wrong args report only
+//!   the first, and a primitive `TS2345` beside a structural `TS2322`
+//!   interleave in argument order. Arity still runs first (`w-arity-shape`
+//!   spells `TS2554` on either side — the P046 never-runs rule is gone for
+//!   admitted shapes).
+//! - Primitive literals against shapes spell `TS2345` naming the interface
+//!   (`m-prim-shape`: `Argument of type 'number' is not assignable to
+//!   parameter of type 'Point'.`), through the existing primitive tail —
+//!   never the object path's `TS2322`.
+//! - Anchor divergence (pinned): tsc anchors wrong members at the member
+//!   name, excess at the excess member, and missing at the literal brace,
+//!   while the solver anchors every structural verdict at the argument span
+//!   (the `TS2345` precedent) — differentials compare codes plus messages
+//!   only, so baselines still match exactly.
+//! - Imported shapes check in tsc (`s-imp`: `TS2322` plus `TS2353`) but
+//!   decline here with the legacy opaque reason (no cross-file shapes reach
+//!   the single-file scope — never silent), exactly like qualified
+//!   spellings (`r-qualified`, checked in tsc) and union params
+//!   (`z-union-param`, `TS2345` with the expanded actual in tsc).
+//!   Alias-named params keep the opaque decline too (pinned follow-up: call
+//!   sites thread no alias tables — tsc itself spells alias-to-interface
+//!   uses transparently, `o-alias-iface` naming the UNDERLYING `Point`).
+//! - Methoded shapes check in tsc when complete (`g-methoded` clean) and
+//!   diagnose the missing method otherwise (`p-method-missing` spells
+//!   `TS2741` for `run`), but every methoded/index-signature shape declines
+//!   distinctly here (no function-value facts — the adapter's
+//!   `complex_reason` gate fires inside the shared comparison, so the
+//!   decline rides along by construction). Identifier args decline with
+//!   their own reason (no value-type facts — clean in tsc, probe
+//!   `f-nonliteral`); unshaped non-literals keep the legacy opaque decline
+//!   (an object literal without member facts is indistinguishable from a
+//!   call result — never misnamed). Generic declarations keep the opaque
+//!   decline for every named param (no type-param name facts tell `T` from
+//!   shapes — never forced), and overload groups keep the P044 exclusion
+//!   (unprobed matching semantics — never forced). Definition side stays
+//!   opaque (P046).
+//!
 //! BLOCKER (P013 call facts), resolved by P014: call-site arity checking
 //! runs on the adapter's `ParsedFile::calls` facts through [`check_calls`]. `void` returns are excluded from the
 //! corpus: tsc accepts `undefined` for `void` while the shared annotation
@@ -4094,6 +4146,18 @@ pub struct CallArg {
     /// generic inference (P061) resolves it one level through the P048
     /// table and binds the kind into its [`InferenceTable`] slot.
     pub ident: Option<String>,
+    /// Object-literal members when the argument is a `{ ... }` literal
+    /// (`None` otherwise). Hand-fed per fixture — the adapter emits no
+    /// call-argument member facts, so drivers feed `Some` only for direct
+    /// object literals (asserted in tests; the kind stays
+    /// [`InitKind::NonLiteral`] either way, exactly like the frontend
+    /// classifies). `Some` marks a fresh syntactic literal, so the P062
+    /// structural path checks it member-wise through the shared
+    /// [`check_interface_shape`] comparison; `None` keeps the historical
+    /// per-argument behavior (literals check primitively, other shapes
+    /// degrade per the named-shape rules). The seam vanishes when the
+    /// adapter emits the facts.
+    pub arg_object: Option<ObjectInit>,
 }
 
 /// One direct `f(...)` call site to check.
@@ -4113,27 +4177,36 @@ pub struct CallSite {
     pub args: Vec<CallArg>,
 }
 
-/// Known named-type names for one call-checking run, bundled so the
+/// Known named types for one call-checking run, bundled so the
 /// per-call helpers stay lean (pedantic arity discipline, mirroring
 /// [`LocalAliasScope`]).
 ///
 /// `names` lists the interface and alias names declared in the file
-/// (driver-collected from the adapter's interface/alias facts — opaque means
-/// only the NAME is ever read: no member or target facts flow, so args
-/// against these params decline distinctly instead of checking). Unknown,
-/// generic (`T`), union, and complex annotations never match and keep
-/// today's verdicts by construction.
+/// (driver-collected from the adapter's interface/alias facts).
+/// `interfaces` carries the local [`InterfaceShape`]s those names may
+/// resolve to (driver-mapped from the same facts with binder identities —
+/// the linkage that tells a local shape from an imported name): params
+/// naming a resolved local shape admit the P062 structural comparison at
+/// call sites, while names no shape claims (imported names, aliases,
+/// classes) keep the opaque decline. Unknown, generic (`T`), union, and
+/// complex annotations never match and keep today's verdicts by
+/// construction. Definition side stays opaque throughout (P046).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NamedTypeScope<'a> {
     /// Interface and alias names in scope, as written.
     pub names: &'a [&'a str],
+    /// Local interface shapes available for structural admission.
+    pub interfaces: &'a [InterfaceShape],
 }
 
 impl NamedTypeScope<'static> {
     /// Empty scope for paths that thread no named-type tables (plain
     /// [`check_calls`], class constructors, multifile): named annotations
     /// there keep today's verdicts.
-    pub const EMPTY: Self = Self { names: &[] };
+    pub const EMPTY: Self = Self {
+        names: &[],
+        interfaces: &[],
+    };
 }
 
 /// Checks every direct call site in `calls` against the function
@@ -4184,10 +4257,11 @@ pub fn check_calls(
 /// `scope`, returning the sorted [`FileReport`].
 ///
 /// Same per-call outcomes as [`check_calls`], except parameters whose
-/// annotation exactly names a [`NamedTypeScope`] entry classify opaque:
-/// the call declines distinctly instead of checking (see the module-level
-/// named-parameter rules). Unknown, generic, union, and complex
-/// annotations never match the scope and keep today's verdicts.
+/// annotation exactly names a [`NamedTypeScope`] entry resolve structurally:
+/// a param naming a local [`InterfaceShape`] admits the P062 comparison for
+/// object-literal arguments (see the module-level structural rules) while
+/// names no shape claims keep the opaque decline. Unknown, generic, union,
+/// and complex annotations never match the scope and keep today's verdicts.
 #[must_use]
 pub fn check_calls_with_named_types(
     file: FileId,
@@ -4253,7 +4327,7 @@ fn check_one_call(
         check_overload_call(&mut run, candidates);
         return;
     }
-    check_single_call(file, &decls[candidates[0]], call, scope, report);
+    check_single_call(file, &decls[candidates[0]], call, scope, binder, report);
 }
 
 /// Checks one call site against exactly one declaration, pushing into
@@ -4261,22 +4335,27 @@ fn check_one_call(
 ///
 /// Parameter gates first (each its own [`UnsupportedDecl`] at the callee
 /// span), then at most one diagnostic: arity (`PITH2554`, or `PITH2555`
-/// below a rest minimum) beats arg types (`PITH2345`), and only the first
-/// mismatched argument reports (all probed on tsc 7.0.2).
+/// below a rest minimum) beats arg types (`PITH2345` beside the structural
+/// families), and only the first mismatched argument reports (all probed on
+/// tsc 7.0.2). Non-literal arguments against named shapes degrade
+/// per-argument with distinct reasons while arity still enforces.
 fn check_single_call(
     file: FileId,
     decl: &FunctionDecl,
     call: &CallSite,
     scope: &NamedTypeScope<'_>,
+    binder: &Binder,
     report: &mut FileReport,
 ) {
-    let Some(resolved) = call_params(call, decl, file, scope, report) else {
+    let lookup = ShapeLookup { file, binder };
+    let Some(resolved) = call_params(call, decl, file, scope, Some(lookup), report) else {
         return;
     };
     let target = owned_target(resolved);
     let site = VerdictSite {
         anchor: call.callee_span,
         args: &call.args,
+        callee: call.callee.as_str(),
     };
     let view = CallTarget {
         fixed: &target.fixed,
@@ -4299,6 +4378,12 @@ fn check_single_call(
 /// an explicit `undefined` argument is silent (the parameter's type carries
 /// `| undefined` — probed tsc 7.0.2 P037); rest-element params always read
 /// `false`, so `undefined` extras diagnose like any other mismatch.
+/// `shape` carries the resolved local [`InterfaceShape`] for params naming
+/// one (P062): object-literal arguments check member-wise through the shared
+/// comparison, primitive literals mismatch through the existing `TS2345`
+/// tail (the expectation reads [`TypeStore::ANY` — no literal kind inhabits
+/// it, so every bearing literal diagnoses), and other argument shapes
+/// degrade per-argument with distinct reasons.
 #[derive(Clone, Debug)]
 struct CallParam {
     /// Expected builtin [`TypeId`], or `None` when this position never
@@ -4309,6 +4394,11 @@ struct CallParam {
     display: String,
     /// Whether this position admits an explicit `undefined` argument.
     optional: bool,
+    /// Parameter name as written (feeds per-position decline reasons).
+    name: String,
+    /// Resolved local shape for P062 structural positions (`None` for every
+    /// other position, including all overload and member-call params).
+    shape: Option<InterfaceShape>,
 }
 
 /// One anchored call site for the shared verdict tail: direct calls anchor at
@@ -4319,6 +4409,10 @@ struct VerdictSite<'a> {
     anchor: Span,
     /// Argument facts in source order.
     args: &'a [CallArg],
+    /// Callee name for per-position decline reasons (direct calls name the
+    /// function; member sites name the member — those params never carry
+    /// shapes, so member reasons never surface).
+    callee: &'a str,
 }
 
 /// Admitted arity of one call target: `min` required arguments plus the
@@ -4425,12 +4519,20 @@ fn range_text(arity: CallArity) -> String {
 /// first-mismatch rule still governs `TS2345`. Explicit `undefined` at an
 /// optional position is silent (its type carries `| undefined` — probed
 /// P037); everywhere else it diagnoses like any other mismatch.
+///
+/// Params naming a local shape (P062) check positionally in the same walk:
+/// object-literal arguments run the shared comparison (first mismatch stops
+/// the call, like `TS2345`), identifier arguments decline with their own
+/// reason, unshaped non-literals keep the opaque decline, and primitive
+/// literals mismatch through the existing tail below.
 fn check_call_arguments(
     file: FileId,
     site: &VerdictSite<'_>,
     target: &CallTarget<'_>,
     report: &mut FileReport,
 ) {
+    // Built lazily: primitive-only calls never pay for the memo database.
+    let mut structural: Option<StructuralCtx> = None;
     for (index, argument) in site.args.iter().enumerate() {
         let param: &CallParam = if let Some(fixed) = target.fixed.get(index) {
             fixed
@@ -4467,6 +4569,12 @@ fn check_call_arguments(
                 }
             }
         }
+        if param.shape.is_some() {
+            let ctx = structural.get_or_insert_with(|| StructuralCtx::fresh(file));
+            if check_shaped_argument(ctx, site, param, argument, kind, report) {
+                return;
+            }
+        }
         if kind == InitKind::NonLiteral {
             continue;
         }
@@ -4492,20 +4600,185 @@ fn check_call_arguments(
     }
 }
 
+/// Per-call scratch for structural argument checks (P062), bundled so the
+/// positional walk stays lean (pedantic arity discipline).
+///
+/// The memo database is a throwaway: call checking threads no [`QueryDb`],
+/// and the shared comparison memoizes unconditionally — recording into a
+/// per-call database keeps verdicts identical with no observable memo
+/// effects. Freshness marks one synthetic occurrence fresh: hand-fed object
+/// args are direct syntactic literals by driver invariant, so excess members
+/// always diagnose here (the stale-literal decline never fires — only
+/// adapter-realizable freshness facts could say otherwise).
+struct StructuralCtx {
+    /// File owning the call site.
+    file: FileId,
+    /// Synthetic occurrence node every structural arg of this call shares.
+    node: NodeId,
+    /// Throwaway shape memo (see the struct docs).
+    db: QueryDb,
+    /// Freshness table marking [`StructuralCtx::node`] fresh.
+    freshness: FreshnessTable,
+    /// Empty identifier table (calls thread no P048 sources on this path).
+    idents: IdentTable,
+}
+
+impl StructuralCtx {
+    /// Builds the per-call scratch: one fresh synthetic occurrence in `file`.
+    /// Call checking threads no adapter [`NodeId`] facts, so the node is a
+    /// fixed saturating placeholder (the [`occurrence_node`] skew precedent)
+    /// that never leaves this call.
+    fn fresh(file: FileId) -> Self {
+        let node = NodeId(u32::MAX);
+        let mut freshness = FreshnessTable::default();
+        freshness.fresh.insert((file, node), true);
+        Self {
+            file,
+            node,
+            db: QueryDb::new(),
+            freshness,
+            idents: IdentTable::default(),
+        }
+    }
+}
+
+/// Checks one argument against its named shape (P062): object literals run
+/// the shared comparison, identifier arguments decline with their own
+/// reason, unshaped non-literals keep the legacy opaque decline, and
+/// primitive literals fall through to the `TS2345` tail.
+///
+/// Returns whether a diagnostic fired (the caller stops the call on the
+/// first mismatch — probed tsc 7.0.2 `l`/`q`); decline notes never stop the
+/// walk, so later positions still check.
+fn check_shaped_argument(
+    structural: &mut StructuralCtx,
+    site: &VerdictSite<'_>,
+    param: &CallParam,
+    argument: &CallArg,
+    kind: InitKind,
+    report: &mut FileReport,
+) -> bool {
+    let Some(shape) = param.shape.as_ref() else {
+        return false;
+    };
+    if let Some(object) = argument.arg_object.as_ref() {
+        return check_structural_call_arg(structural, shape, argument, object, report);
+    }
+    if argument.ident.is_some() {
+        report.unsupported.push(UnsupportedDecl {
+            file: structural.file,
+            span: argument.span,
+            reason: format!(
+                "call to '{}': identifier argument for '{}' of type '{}' is outside the subset: \
+                identifiers carry no value-type facts",
+                site.callee, param.name, param.display,
+            ),
+        });
+        return false;
+    }
+    if kind == InitKind::NonLiteral {
+        report.unsupported.push(UnsupportedDecl {
+            file: structural.file,
+            span: argument.span,
+            reason: format!(
+                "call to '{}': parameter type '{}' for '{}' is an opaque named type: outside \
+                the subset",
+                site.callee, param.display, param.name,
+            ),
+        });
+    }
+    false
+}
+
+/// Checks one object-literal argument against its named shape through the
+/// SHARED P017 comparison ([`check_interface_shape`] — gates, member
+/// classification, and the wrong > excess > missing tail all run unchanged,
+/// with the interface name as the expected spelling), anchored at the
+/// argument span.
+///
+/// The synthetic [`ConstDecl`] carries only the argument's shape facts (no
+/// initializer kind besides the members — the object-return precedent); the
+/// declaration-side fields never participate on this path. Returns whether
+/// diagnostics fired.
+fn check_structural_call_arg(
+    structural: &mut StructuralCtx,
+    shape: &InterfaceShape,
+    argument: &CallArg,
+    object: &ObjectInit,
+    report: &mut FileReport,
+) -> bool {
+    let synth = ConstDecl {
+        name: String::new(),
+        span: argument.span,
+        scope: 0,
+        symbol: None,
+        kind: DeclKind::Const,
+        annotation: None,
+        init: None,
+        init_ident: None,
+        init_object: Some(object.clone()),
+        init_array: None,
+        cast: None,
+        init_ternary: None,
+        init_member_ref: None,
+    };
+    let before = report.diagnostics.len();
+    let mut ctx = CheckCtx {
+        file: structural.file,
+        node: structural.node,
+        db: &mut structural.db,
+        freshness: &structural.freshness,
+        report,
+        extra: &[],
+        idents: &structural.idents,
+    };
+    check_interface_shape(&synth, argument.span, shape.name.as_str(), shape, &mut ctx);
+    ctx.report.diagnostics.len() != before
+}
+
 /// One admitted parameter list for [`check_one_call`]: fixed positions in
-/// source order (each an `(expected, display, optional)` triple — `None`
-/// expectations are accept-all `any`/`unknown`), the admitted
-/// argument-count range, and the rest-element type when variadic.
+/// source order (each a [`ResolvedFixed`] — `None` expectations are
+/// accept-all `any`/`unknown`), the admitted argument-count range, and the
+/// rest-element type when variadic.
+#[derive(Clone, Debug)]
+struct ResolvedFixed {
+    /// Expected builtin [`TypeId`], or `None` when this position never
+    /// mismatches.
+    expected: Option<TypeId>,
+    /// Parameter type text for `TS2345` messages.
+    display: String,
+    /// Whether explicit `undefined` is silent at the position.
+    optional: bool,
+    /// Parameter name as written (feeds per-position decline reasons).
+    name: String,
+    /// Resolved local shape for P062 structural positions (`None` for every
+    /// other position).
+    shape: Option<InterfaceShape>,
+}
+
 struct ResolvedCallParams {
-    /// Fixed positions in source order: expected type, display text, and
-    /// whether explicit `undefined` is silent at the position.
-    fixed: Vec<(Option<TypeId>, String, bool)>,
+    /// Fixed positions in source order.
+    fixed: Vec<ResolvedFixed>,
     /// Fewest admitted arguments (the required prefix).
     min: usize,
     /// Most admitted fixed arguments (`None` when a rest element trails).
     max: Option<usize>,
     /// Rest-element expectation (`None` for exact/range lists).
     rest: Option<(Option<TypeId>, String)>,
+}
+
+/// Binder context for admitting locally-shaped named params (P062): the
+/// file plus the checking [`Binder`] the annotation resolves through.
+/// Overload resolution passes `None` (structural admission is single-call
+/// only — overload signatures keep the P044 exclusion); single calls pass
+/// `Some`, except for generic declarations (no type-param name facts tell
+/// `T` from shapes, so those keep the opaque decline — never forced).
+#[derive(Clone, Copy, Debug)]
+struct ShapeLookup<'b> {
+    /// File owning the declaration.
+    file: FileId,
+    /// Binder the annotation name resolves through.
+    binder: &'b Binder,
 }
 
 /// Gates one call's parameter list for [`check_single_call`].
@@ -4518,15 +4791,37 @@ fn call_params(
     decl: &FunctionDecl,
     file: FileId,
     scope: &NamedTypeScope<'_>,
+    lookup: Option<ShapeLookup<'_>>,
     report: &mut FileReport,
 ) -> Option<ResolvedCallParams> {
-    match resolve_params(decl, scope) {
+    match resolve_params(decl, scope, lookup) {
         Ok(resolved) => Some(resolved),
         Err(reason) => {
             decline(call, file, report, &reason);
             None
         }
     }
+}
+
+/// Resolves one scope-hit annotation to its local interface shape (P062):
+/// the annotation resolves through the [`Binder`] at the declaration scope
+/// and matches an [`InterfaceShape`] claiming that identity — structural
+/// lookup only, never string-searching. `None` keeps the opaque decline:
+/// names no local shape claims (imported names, aliases, classes) resolve
+/// elsewhere or nowhere.
+fn lookup_named_shape(
+    lookup: Option<ShapeLookup<'_>>,
+    decl_scope: u32,
+    text: &str,
+    scope: &NamedTypeScope<'_>,
+) -> Option<InterfaceShape> {
+    let context = lookup?;
+    let id = context.binder.resolve(context.file, decl_scope, text)?;
+    scope
+        .interfaces
+        .iter()
+        .find(|shape| shape.symbol == Some(id))
+        .cloned()
 }
 
 /// Resolves one declaration's parameter list into its admitted call shape.
@@ -4536,14 +4831,18 @@ fn call_params(
 /// Structural gates run first (`params_complex`, non-trailing rest), then
 /// parameter-by-parameter in order (unannotated, required-after-optional,
 /// then the type text): the first failure wins, so reasons stay single and
-/// deterministic. Overload resolution reuses this per signature, so generic
-/// signatures gate separately (see [`check_overload_call`]) rather than
-/// here. Parameters naming a [`NamedTypeScope`] entry classify opaque and
-/// decline distinctly; every other uncheckable text keeps its old reason.
+/// deterministic. Overload resolution reuses this per signature with no
+/// lookup, so generic and otherwise-uncheckable signatures gate separately
+/// (see [`check_overload_call`]) rather than here. Parameters naming a
+/// [`NamedTypeScope`] entry classify opaque and decline distinctly unless a
+/// local shape admits them (single calls only — see [`ShapeLookup`]); every
+/// other uncheckable text keeps its old reason.
 fn resolve_params(
     decl: &FunctionDecl,
     scope: &NamedTypeScope<'_>,
+    lookup: Option<ShapeLookup<'_>>,
 ) -> Result<ResolvedCallParams, String> {
+    let lookup = lookup.filter(|_| !decl.has_type_params);
     if decl.params_complex {
         return Err("non-identifier parameter pattern is outside the subset".to_owned());
     }
@@ -4581,12 +4880,18 @@ fn resolve_params(
                 param.name
             ));
         }
-        match classify_param(param, scope) {
-            Ok((expected, display)) => fixed.push((expected, display, param.optional)),
+        match classify_param(param, scope, decl.scope, lookup) {
+            Ok((expected, display, shape)) => fixed.push(ResolvedFixed {
+                expected,
+                display,
+                optional: param.optional,
+                name: param.name.clone(),
+                shape,
+            }),
             Err(reason) => return Err(reason),
         }
     }
-    let min = fixed.iter().filter(|member| !member.2).count();
+    let min = fixed.iter().filter(|member| !member.optional).count();
     let max = if rest.is_some() {
         None
     } else {
@@ -4629,16 +4934,20 @@ fn owned_target(resolved: ResolvedCallParams) -> OwnedTarget {
     let fixed = resolved
         .fixed
         .into_iter()
-        .map(|(expected, display, optional)| CallParam {
-            expected,
-            display,
-            optional,
+        .map(|slot| CallParam {
+            expected: slot.expected,
+            display: slot.display,
+            optional: slot.optional,
+            name: slot.name,
+            shape: slot.shape,
         })
         .collect();
     let rest = resolved.rest.map(|(expected, display)| CallParam {
         expected,
         display,
         optional: false,
+        name: String::new(),
+        shape: None,
     });
     OwnedTarget {
         fixed,
@@ -4722,7 +5031,7 @@ fn check_overload_call(run: &mut OverloadRun<'_>, candidates: &[usize]) {
             );
             continue;
         }
-        match resolve_params(decl, &run.scope) {
+        match resolve_params(decl, &run.scope, None) {
             Ok(resolved) => checkable.push(OverloadCandidate { resolved }),
             Err(reason) => excluded.push(reason),
         }
@@ -4796,11 +5105,15 @@ fn check_resolved_call(
             // names never ride along (P061 resolves them only in generic
             // inference).
             ident: None,
+            // Overload signatures never carry shapes (P062 structural
+            // admission is single-call only), so member facts never ride.
+            arg_object: None,
         })
         .collect();
     let site = VerdictSite {
         anchor: run.call.callee_span,
         args: &synth,
+        callee: run.call.callee.as_str(),
     };
     let view = CallTarget {
         fixed: &target.fixed,
@@ -4909,7 +5222,7 @@ fn first_overload_mismatch_inner(
             continue;
         };
         let (expected, display, optional) = if let Some(fixed) = resolved.fixed.get(index) {
-            (fixed.0, fixed.1.as_str(), fixed.2)
+            (fixed.expected, fixed.display.as_str(), fixed.optional)
         } else if let Some(element) = resolved.rest.as_ref() {
             (element.0, element.1.as_str(), false)
         } else {
@@ -5125,21 +5438,27 @@ fn classify_rest_element(param: &FunctionParam) -> Result<(Option<TypeId>, Strin
     }
 }
 /// Classifies one annotated fixed parameter into its
-/// expected ([`TypeId`], display text): `Err` carries the decline reason
-/// (union, object, unknown, or missing type text the subset cannot spell
-/// argument checks against).
+/// expected ([`TypeId`], display text, resolved shape): `Err` carries the
+/// decline reason (union, object, unknown, or missing type text the subset
+/// cannot spell argument checks against).
 ///
 /// `any` and `unknown` parameters accept every literal (probed tsc 7.0.2:
 /// both directions silent), so they classify accept-all (`None`, the
 /// non-literal precedent); `never` keeps declining (unprobed message shape
 /// — never forced). Bare names matching the [`NamedTypeScope`] classify
 /// opaque and decline distinctly (the P046 named-parameter rule — the
-/// subset has no value facts for named types, so args never check);
-/// everything else keeps its legacy decline.
+/// subset has no value facts for named types, so args never check), except
+/// single-call params resolving to a local [`InterfaceShape`] through
+/// `lookup` (P062 structural admission — the expectation reads
+/// [`TypeStore::ANY` so every bearing literal mismatches through the
+/// existing `TS2345` tail, while object literals run the shared comparison;
+/// see [`ShapeLookup`]); everything else keeps its legacy decline.
 fn classify_param(
     param: &FunctionParam,
     scope: &NamedTypeScope<'_>,
-) -> Result<(Option<TypeId>, String), String> {
+    decl_scope: u32,
+    lookup: Option<ShapeLookup<'_>>,
+) -> Result<(Option<TypeId>, String, Option<InterfaceShape>), String> {
     let text = param.annotation.as_deref().map_or("", str::trim);
     if text.contains('|') {
         return Err(format!(
@@ -5150,12 +5469,15 @@ fn classify_param(
         boundary_annotation_type(text),
         Some(id) if id == TypeStore::ANY || id == TypeStore::UNKNOWN
     ) {
-        return Ok((None, text.to_owned()));
+        return Ok((None, text.to_owned(), None));
     }
     if let Some(expected) = annotation_type(text) {
-        return Ok((Some(expected), text.to_owned()));
+        return Ok((Some(expected), text.to_owned(), None));
     }
     if scope.names.contains(&text) {
+        if let Some(shape) = lookup_named_shape(lookup, decl_scope, text, scope) {
+            return Ok((Some(TypeStore::ANY), shape.name.clone(), Some(shape)));
+        }
         return Err(format!(
             "parameter type '{text}' for '{}' is an opaque named type: outside the subset",
             param.name
@@ -5210,6 +5532,10 @@ fn exact_sig(arity: usize, params: &[(Option<TypeId>, &str)]) -> OpaqueSig {
             expected: *expected,
             display: (*display).to_owned(),
             optional: false,
+            // Opaque lib params never carry shapes, so no decline reason
+            // ever names them.
+            name: String::new(),
+            shape: None,
         });
     }
     OpaqueSig { arity, params: out }
@@ -5345,6 +5671,7 @@ fn check_one_member_call(run: &mut MemberRun<'_>, call: &MemberCallSite) {
         let site = VerdictSite {
             anchor: call.member_span,
             args: &call.args,
+            callee: call.member.as_str(),
         };
         let target = CallTarget {
             fixed: &sig.params,
@@ -13122,6 +13449,8 @@ mod tests {
                 }),
                 // Assertion tests never feed identifier names.
                 ident: None,
+                // Assertion tests never feed object members.
+                arg_object: None,
             }],
         }
     }
@@ -13557,7 +13886,10 @@ mod tests {
         // is clean; the subset holds no value facts for named types, so the
         // call declines distinctly instead of checking — arity never runs.
         let binder = Binder::new();
-        let scope = NamedTypeScope { names: &["Point"] };
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &[],
+        };
         let decls = [callable("show", vec![("p", "Point")])];
         let calls = [call(
             "show",
@@ -13605,7 +13937,10 @@ mod tests {
         // P046 regression guard: with a populated scope, `T`, unions, and
         // qualified spellings never take the opaque reason.
         let binder = Binder::new();
-        let scope = NamedTypeScope { names: &["Point"] };
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &[],
+        };
         let decls = [
             callable("generic", vec![("x", "T")]),
             callable("union", vec![("x", "number | string")]),
@@ -13657,7 +13992,10 @@ mod tests {
         // signature records the opaque reason, and with no admitting
         // signature the call declines (never a forced `TS2769`).
         let binder = Binder::new();
-        let scope = NamedTypeScope { names: &["Point"] };
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &[],
+        };
         let decls = [
             signature("show", "p", "Point"),
             signature("show", "flag", "boolean"),
@@ -13666,6 +14004,634 @@ mod tests {
             "show",
             span(0, 4),
             vec![(InitKind::Number, span(5, 6))],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("opaque named type"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn structural_clean_call_is_silent() {
+        // Probed tsc 7.0.2 (P062 `a`): a matching object arg is clean.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false), ("y", "string", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("show", vec![("p", "Point")])];
+        let calls = [object_call(
+            "show",
+            span(0, 4),
+            vec![(
+                span(5, 24),
+                vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("y", ObjectMemberKind::String),
+                ],
+            )],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn structural_wrong_members_diagnose_per_member() {
+        // Probed tsc 7.0.2 (P062 `b`, `i`): one `TS2322` per wrong member at
+        // the argument span (the pinned member-vs-argument anchor split).
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false), ("y", "string", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("show", vec![("p", "Point")])];
+        let calls = [object_call(
+            "show",
+            span(0, 4),
+            vec![(
+                span(5, 30),
+                vec![
+                    ("x", ObjectMemberKind::String),
+                    ("y", ObjectMemberKind::Number),
+                ],
+            )],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(5, 30));
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn structural_excess_names_the_interface() {
+        // Probed tsc 7.0.2 (P062 `c`): first-excess `TS2353` spelling the
+        // interface name, never expanded members.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("show", vec![("p", "Point")])];
+        let calls = [object_call(
+            "show",
+            span(0, 4),
+            vec![(
+                span(5, 24),
+                vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("extra", ObjectMemberKind::Number),
+                ],
+            )],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_EXCESS_MEMBER);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Object literal may only specify known properties, and 'extra' does not exist in \
+            type 'Point'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn structural_missing_collapses_like_declarations() {
+        // Probed tsc 7.0.2 (P062 `d`, `e`): one missing member spells
+        // `TS2741`, several collapse into one `TS2739` — the shared tail, so
+        // actual types spell fresh booleans literally (`y-bool-actual` pins
+        // the spelling through the corpus driver). Excess beats missing
+        // (probed: `{y}` against `{x}` reports `TS2353`), so the
+        // missing-only shape spells `{}` here.
+        let binder = binder_with(&[("Point", span(0, 20)), ("Big", span(21, 40))]);
+        let shapes = [
+            interface_shape_detailed(&binder, "Point", vec![("x", "number", false)], &[]),
+            interface_shape_detailed(
+                &binder,
+                "Big",
+                vec![
+                    ("a", "number", false),
+                    ("b", "string", false),
+                    ("c", "boolean", false),
+                ],
+                &[],
+            ),
+        ];
+        let scope = NamedTypeScope {
+            names: &["Point", "Big"],
+            interfaces: &shapes,
+        };
+        let decls = [
+            callable("one", vec![("p", "Point")]),
+            callable("many", vec![("p", "Big")]),
+        ];
+        let calls = [
+            object_call("one", span(0, 3), vec![(span(4, 12), vec![])]),
+            object_call(
+                "many",
+                span(13, 17),
+                vec![(span(18, 28), vec![("a", ObjectMemberKind::Number)])],
+            ),
+        ];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].code, CODE_MISSING_MEMBER);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Property 'x' is missing in type '{}' but required in type 'Point'."
+        );
+        assert_eq!(report.diagnostics[1].code, CODE_MISSING_MANY);
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type '{ a: number; }' is missing the following properties from type 'Big': b, c"
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn structural_priority_matches_declarations() {
+        // Probed tsc 7.0.2 (P062 `j`, `k`): wrong suppresses excess, excess
+        // suppresses missing — one family per argument, by construction.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false), ("y", "string", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("show", vec![("p", "Point")])];
+        let wrong_excess = [object_call(
+            "show",
+            span(0, 4),
+            vec![(
+                span(5, 30),
+                vec![
+                    ("x", ObjectMemberKind::String),
+                    ("extra", ObjectMemberKind::Number),
+                ],
+            )],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &wrong_excess, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert!(report.unsupported.is_empty());
+        let excess_missing = [object_call(
+            "show",
+            span(0, 4),
+            vec![(
+                span(5, 24),
+                vec![
+                    ("x", ObjectMemberKind::Number),
+                    ("extra", ObjectMemberKind::Number),
+                ],
+            )],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &excess_missing, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_EXCESS_MEMBER);
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn structural_first_mismatch_stops_the_call() {
+        // Probed tsc 7.0.2 (P062 `l`, `q`): two wrong args report only the
+        // first, and primitive `TS2345` beside structural `TS2322`
+        // interleave in argument order.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [FunctionDecl {
+            name: "show".to_owned(),
+            span: span(0, 10),
+            scope: 0,
+            symbol: None,
+            params: vec![
+                FunctionParam {
+                    name: "first".to_owned(),
+                    annotated: true,
+                    annotation: Some("number".to_owned()),
+                    optional: false,
+                    is_rest: false,
+                },
+                FunctionParam {
+                    name: "second".to_owned(),
+                    annotated: true,
+                    annotation: Some("Point".to_owned()),
+                    optional: false,
+                    is_rest: false,
+                },
+            ],
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("number".to_owned()),
+            body: single(InitKind::Number),
+        }];
+        let primitive_first = [CallSite {
+            callee: "show".to_owned(),
+            callee_span: span(0, 4),
+            span: span(0, 60),
+            args: vec![
+                CallArg {
+                    kind: InitKind::String,
+                    span: span(5, 11),
+                    cast: None,
+                    ident: None,
+                    arg_object: None,
+                },
+                CallArg {
+                    kind: InitKind::NonLiteral,
+                    span: span(13, 26),
+                    cast: None,
+                    ident: None,
+                    arg_object: Some(ObjectInit {
+                        members: vec![ObjectMemberInit {
+                            name: "x".to_owned(),
+                            kind: ObjectMemberKind::String,
+                        }],
+                        fresh: true,
+                    }),
+                },
+            ],
+        }];
+        let report = check_calls_with_named_types(FILE, &decls, &primitive_first, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(report.diagnostics[0].span, span(5, 11));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn structural_mismatch_first_stops_later_primitive() {
+        // Reversed positions: the structural mismatch fires first and the
+        // later primitive mismatch never surfaces (probed tsc 7.0.2 `g`).
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let reversed = [FunctionDecl {
+            name: "wave".to_owned(),
+            span: span(0, 10),
+            scope: 0,
+            symbol: None,
+            params: vec![
+                FunctionParam {
+                    name: "first".to_owned(),
+                    annotated: true,
+                    annotation: Some("Point".to_owned()),
+                    optional: false,
+                    is_rest: false,
+                },
+                FunctionParam {
+                    name: "second".to_owned(),
+                    annotated: true,
+                    annotation: Some("number".to_owned()),
+                    optional: false,
+                    is_rest: false,
+                },
+            ],
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("number".to_owned()),
+            body: single(InitKind::Number),
+        }];
+        let structural_first = [CallSite {
+            callee: "wave".to_owned(),
+            callee_span: span(0, 4),
+            span: span(0, 60),
+            args: vec![
+                CallArg {
+                    kind: InitKind::NonLiteral,
+                    span: span(5, 18),
+                    cast: None,
+                    ident: None,
+                    arg_object: Some(ObjectInit {
+                        members: vec![ObjectMemberInit {
+                            name: "x".to_owned(),
+                            kind: ObjectMemberKind::String,
+                        }],
+                        fresh: true,
+                    }),
+                },
+                CallArg {
+                    kind: InitKind::String,
+                    span: span(20, 26),
+                    cast: None,
+                    ident: None,
+                    arg_object: None,
+                },
+            ],
+        }];
+        let report =
+            check_calls_with_named_types(FILE, &reversed, &structural_first, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(report.diagnostics[0].span, span(5, 18));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn structural_primitive_arg_spells_ts2345() {
+        // Probed tsc 7.0.2 (P062 `m`): a primitive literal against a shape
+        // spells `TS2345` naming the interface — the existing tail, never the
+        // object path's `TS2322`.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("take", vec![("p", "Point")])];
+        let calls = [call(
+            "take",
+            span(0, 4),
+            vec![(InitKind::Number, span(5, 6))],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'number' is not assignable to parameter of type 'Point'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn structural_arity_still_runs_first() {
+        // Probed tsc 7.0.2 (P062 `w`): arity beats arg types for admitted
+        // shapes — too-few anchors at the callee, too-many at the excess.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("show", vec![("p", "Point")])];
+        let missing = [call("show", span(0, 4), vec![])];
+        let report = check_calls_with_named_types(FILE, &decls, &missing, &binder, &scope);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARITY);
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn structural_identifier_arg_declines_distinctly() {
+        // An identifier names a value the subset has no facts for (clean in
+        // tsc, probe `f-nonliteral`): the call declines with its own reason,
+        // never the opaque one and never silently.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("show", vec![("p", "Point")])];
+        let calls = [ident_call("show", span(0, 4), "obj", span(5, 8))];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].span, span(5, 8));
+        assert!(
+            report.unsupported[0].reason.contains("identifier argument"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            !report.unsupported[0].reason.contains("opaque"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn structural_unshaped_nonliteral_keeps_opaque_decline() {
+        // A non-literal without member facts (a call result in the real
+        // pipeline — object literals without facts are indistinguishable
+        // from one) keeps the legacy opaque decline: never misnamed.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("show", vec![("p", "Point")])];
+        let calls = [call(
+            "show",
+            span(0, 4),
+            vec![(InitKind::NonLiteral, span(5, 14))],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("opaque named type"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn structural_imported_name_keeps_opaque_decline() {
+        // An imported name sits in scope (the driver collects it) but claims
+        // no local shape: tsc checks it (`s-imp`), the solver keeps the
+        // legacy opaque decline — never a forced verdict.
+        let binder = binder_with(&[("Point", span(0, 20)), ("Local", span(21, 40))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Local",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point", "Local"],
+            interfaces: &shapes,
+        };
+        let decls = [
+            callable("show", vec![("p", "Point")]),
+            callable("local", vec![("p", "Local")]),
+        ];
+        let calls = [
+            object_call(
+                "show",
+                span(0, 4),
+                vec![(span(5, 18), vec![("x", ObjectMemberKind::String)])],
+            ),
+            object_call(
+                "local",
+                span(19, 24),
+                vec![(span(25, 33), vec![("x", ObjectMemberKind::Number)])],
+            ),
+        ];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("opaque named type"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn structural_methoded_shape_declines_distinctly() {
+        // tsc checks methoded shapes when complete (`g-methoded`) and names
+        // the missing method otherwise (`p-method-missing`); the subset
+        // holds no function-value facts, so the adapter's complex-member
+        // gate declines inside the shared comparison instead.
+        let binder = binder_with(&[("Svc", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Svc",
+            vec![("x", "number", false), ("run", "fn", false)],
+            &["run"],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Svc"],
+            interfaces: &shapes,
+        };
+        let decls = [callable("show", vec![("p", "Svc")])];
+        let calls = [object_call(
+            "show",
+            span(0, 4),
+            vec![(span(5, 13), vec![("x", ObjectMemberKind::Number)])],
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("member 'run'"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn structural_generic_declaration_keeps_opaque_decline() {
+        // No type-param name facts tell `T` from shapes: generic declarations
+        // keep the opaque decline for every named param — never forced.
+        let binder = binder_with(&[("Point", span(0, 20))]);
+        let shapes = [interface_shape_detailed(
+            &binder,
+            "Point",
+            vec![("x", "number", false)],
+            &[],
+        )];
+        let scope = NamedTypeScope {
+            names: &["Point"],
+            interfaces: &shapes,
+        };
+        let mut decl = callable("show", vec![("p", "Point")]);
+        decl.has_type_params = true;
+        let calls = [object_call(
+            "show",
+            span(0, 4),
+            vec![(span(5, 18), vec![("x", ObjectMemberKind::String)])],
+        )];
+        let report = check_calls_with_named_types(FILE, &[decl], &calls, &binder, &scope);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("opaque named type"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn structural_alias_name_keeps_opaque_decline() {
+        // Pinned follow-up: call sites thread no alias tables, so
+        // alias-named params keep the opaque decline (tsc checks them —
+        // `o-alias-iface` even spells the underlying name).
+        let binder = Binder::new();
+        let scope = NamedTypeScope {
+            names: &["Alias"],
+            interfaces: &[],
+        };
+        let decls = [callable("show", vec![("p", "Alias")])];
+        let calls = [object_call(
+            "show",
+            span(0, 4),
+            vec![(span(5, 18), vec![("x", ObjectMemberKind::String)])],
         )];
         let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
         assert!(report.diagnostics.is_empty());
@@ -14929,8 +15895,101 @@ mod tests {
                     cast: None,
                     // Non-generic call tests never feed identifier names.
                     ident: None,
+                    // Plain call tests never feed object members (see
+                    // `object_call` for the structural seam).
+                    arg_object: None,
                 })
                 .collect(),
+        }
+    }
+
+    /// One call site whose arguments are object literals (P062): each entry
+    /// names the argument span plus its member facts. The kind stays
+    /// [`InitKind::NonLiteral`] (the frontend classification); only the
+    /// hand-fed members mark the fresh literal.
+    fn object_call(
+        callee: &str,
+        callee_span: Span,
+        args: Vec<(Span, Vec<(&str, ObjectMemberKind)>)>,
+    ) -> CallSite {
+        CallSite {
+            callee: callee.to_owned(),
+            callee_span,
+            span: span(0, 60),
+            args: args
+                .into_iter()
+                .map(|(arg_span, members)| CallArg {
+                    kind: InitKind::NonLiteral,
+                    span: arg_span,
+                    cast: None,
+                    ident: None,
+                    arg_object: Some(ObjectInit {
+                        members: members
+                            .into_iter()
+                            .map(|(name, kind)| ObjectMemberInit {
+                                name: name.to_owned(),
+                                kind,
+                            })
+                            .collect(),
+                        fresh: true,
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    /// One call site whose single argument is a bare identifier (P062): the
+    /// name rides the P061 seam (never object members).
+    fn ident_call(callee: &str, callee_span: Span, name: &str, arg_span: Span) -> CallSite {
+        CallSite {
+            callee: callee.to_owned(),
+            callee_span,
+            span: span(0, 60),
+            args: vec![CallArg {
+                kind: InitKind::NonLiteral,
+                span: arg_span,
+                cast: None,
+                ident: Some(name.to_owned()),
+                arg_object: None,
+            }],
+        }
+    }
+
+    /// One local interface shape for structural call tests: `members` are
+    /// `(name, annotation-text, optional)` triples; `complex` names members
+    /// carrying the adapter's decline marker (methods, index signatures).
+    /// The shape claims the binder identity `name` resolves to at the
+    /// declaration scope (panics on skew — the linkage that tells a local
+    /// shape from an imported name).
+    fn interface_shape_detailed(
+        binder: &Binder,
+        name: &str,
+        members: Vec<(&str, &str, bool)>,
+        complex: &[&str],
+    ) -> InterfaceShape {
+        let id = binder
+            .resolve(FILE, 0, name)
+            .unwrap_or_else(|| panic!("shape '{name}' binds nothing"));
+        InterfaceShape {
+            name: name.to_owned(),
+            scope: 0,
+            symbol: Some(id),
+            span: span(0, 20),
+            members: members
+                .into_iter()
+                .map(|(member, ty, optional)| InterfaceMember {
+                    name: member.to_owned(),
+                    annotation_text: Some(ty.to_owned()),
+                    optional,
+                    span: span(0, 20),
+                    complex_reason: complex
+                        .contains(&member)
+                        .then(|| "method members are outside the subset".to_owned()),
+                })
+                .collect(),
+            heritage: Vec::new(),
+            has_type_params: false,
+            exported: false,
         }
     }
 
@@ -18228,6 +19287,8 @@ mod tests {
                         cast: None,
                         // The legacy helper never feeds identifier names.
                         ident: None,
+                        // Generic tests never feed object members.
+                        arg_object: None,
                     })
                     .collect(),
             },
@@ -18261,6 +19322,8 @@ mod tests {
                         span: span(lo, hi),
                         cast: None,
                         ident: ident.map(str::to_owned),
+                        // Generic tests never feed object members.
+                        arg_object: None,
                     })
                     .collect(),
             },
