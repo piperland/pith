@@ -148,3 +148,27 @@ single pass). Still declining by design with distinct recorded reasons:
 `throw` arms in `try`/`catch`, `throw` cases or defaults in `switch`,
 throw tails after guard returns, and any other multi-path body. Probes in
 `.agent/scratch/p043-probes/`.
+
+## P045 else-if chains
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| elseif-clean.ts | clean | silent, 0 notes (branches per position) |
+| elseif-branch-wrong.ts | 1x TS2322 (middle branch) | 1x PITH2322 |
+| elseif-two-wrong.ts | 2x TS2322 | 2x PITH2322 (branches independent) |
+| elseif-missing-else.ts | 1x TS2366 | silent + 1 UNSUPPORTED (pinned divergence) |
+| elseif-nested-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| elseif-complex-branch-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+
+Differential: 6/6 match-or-pin (3 diagnostic/silent pairs + 2 pinned
+oracle-clean divergences — nested chains and throw branches need flow
+facts the subset refuses — + 1 pinned oracle-error divergence: a missing
+terminal `else` reports `TS2366` while the subset has no
+declaration-completeness family). Each branch of a full
+`if`/`else-if`/…/`else` chain checks independently through the same
+synthetic delegation as joins (no fixpoint, single pass — any condition
+qualifies, single-statement blocks unwrap). Still declining by design
+with distinct recorded reasons: missing terminal `else`, nested chains,
+and complex branches (unit-pinned); an `else-if` chain paired with any
+other statement stays `Complex` (the P023 `if/else`-plus-tail precedent).
+Probes in `.agent/scratch/p045-probes/`.
