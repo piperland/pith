@@ -4086,6 +4086,14 @@ pub struct CallArg {
     /// angle assertion (`None` otherwise). Declined casts diagnose at the
     /// operand span; admitted results check like their kind.
     pub cast: Option<CastInput>,
+    /// Referenced name when the argument is a bare identifier (`None`
+    /// otherwise). Driver-sliced from the argument fact span (bare
+    /// identifiers only — anything else feeds `None`) until the adapter
+    /// emits identifier-argument facts — the same seam as
+    /// [`ConstDecl::init_ident`]. Non-generic call checking ignores it;
+    /// generic inference (P061) resolves it one level through the P048
+    /// table and binds the kind into its [`InferenceTable`] slot.
+    pub ident: Option<String>,
 }
 
 /// One direct `f(...)` call site to check.
@@ -4784,6 +4792,10 @@ fn check_resolved_call(
             kind: kind.unwrap_or(InitKind::NonLiteral),
             span: argument.span,
             cast: None,
+            // Overload verdicts re-check synthetic literal kinds: identifier
+            // names never ride along (P061 resolves them only in generic
+            // inference).
+            ident: None,
         })
         .collect();
     let site = VerdictSite {
@@ -5914,6 +5926,34 @@ fn class_occurrence_node(base: u32, offset: usize) -> NodeId {
 ///   reports `TS2345` on `"s"` — literal-type inference is outside the
 ///   subset (pinned oracle-error divergence).
 ///
+/// - Identifier arguments (P061, probed on tsc 7.0.2 `--strict --pretty
+///   false`; probes in `.agent/scratch/p061-probes/`): in the INFERRED path
+///   only, an argument that is a bare identifier resolves one level through
+///   the P048 [`IdentTable`] (literal or P060-inferred kinds, single level)
+///   and binds its kind into the per-position [`InferenceTable`] slot, so
+///   `const a = 1; id(a)` and `const a: number = 1; id(a)` are clean,
+///   `const r = "s"; idc(r)` over `<T extends string>` diagnoses `TS2345`
+///   at the argument exactly like a literal, and `pair(a, a)` binds
+///   per position. Enclosing-function parameters count as sources (fed per
+///   call, since call facts carry no scope): `id(p)` over `p: number` is
+///   clean, and a parameter shadows any same-name outer const for the whole
+///   body, so params resolve before the declaration table. Unresolvable
+///   identifiers decline distinctly at the argument (never bound as
+///   `unknown`, never silently skipped — even when a default could fill the
+///   slot: `idd(nope)` declines where tsc spells `TS2304`). Every other
+///   P048 decline rides through with its reason (`let` bindings, depth-2+
+///   chains, use-before-declaration, non-literal sources — including bare
+///   `declare` sources, whose annotations never propagate without a literal
+///   shape), and duplicate
+///   bare names keep their per-position silence (`same(a, "s")` stays
+///   silent where tsc spells the literal `1` — the P036 divergence above).
+///   The explicit-list path ignores identifier names entirely, so
+///   `id<string>(a)` keeps its historical per-argument skip (oracle
+///   `TS2345` — pinned divergence); mis-substitution wording is untouched.
+///   Visibility counts the source-order prefix whose binder span ends before
+///   the call starts (the single-pass order, no flow analysis); each call
+///   builds its own table, so no resolution state crosses call sites.
+///
 /// Corollaries a generic declaration is never decl-silent: literal bodies
 /// always diagnose (no literal inhabits bare `T`), non-literal bodies
 /// decline, and every other shape declines. Calls verify independently.
@@ -5983,6 +6023,33 @@ pub struct GenericCall {
     pub call: CallSite,
     /// Written type-argument texts in source order; `None` means inferred.
     pub explicit_args: Option<Vec<String>>,
+    /// Enclosing-function context for identifier-argument resolution (P061);
+    /// `None` for top-level calls. Hand-fed per call (the adapter emits no
+    /// call-scope facts, so the driver names the enclosing function — the
+    /// same seam shape as `explicit_args`): parameters plus the owning scope
+    /// of the function name, mapped verbatim from that function's facts.
+    pub enclosing: Option<GenericEnclosing>,
+}
+
+/// Enclosing-function context for one generic call site (P061).
+///
+/// Call facts carry no scope, so identifier arguments inside a function body
+/// could never reach the body's parameters through facts alone. The driver
+/// feeds the enclosing function's parameter facts plus its scope instead;
+/// the solver builds that call's [`IdentTable`] params from these (never
+/// inventing value types — H-002 opacity holds, exactly like
+/// [`ident_params_from_function`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericEnclosing {
+    /// Value parameters of the enclosing function in source order
+    /// (name/annotation/optional/rest verbatim from its facts).
+    pub params: Vec<FunctionParam>,
+    /// Owning scope of the enclosing function name (from its fact scope):
+    /// identifier arguments resolve from here. Body-local bindings carry no
+    /// facts and stay invisible (pinned limit); top-level consts resolve
+    /// exactly as for top-level calls, while same-name parameters shadow
+    /// them (params resolve before the declaration table).
+    pub scope: u32,
 }
 
 /// Per-call-site inference side table (H-002 refined mode).
@@ -6095,6 +6162,27 @@ pub fn check_generics(
     calls: &[GenericCall],
     binder: &Binder,
 ) -> FileReport {
+    check_generics_with_consts(file, decls, &[], calls, binder)
+}
+
+/// Checks every generic declaration in `decls` plus every instantiation in
+/// `calls` for `file`, with the file's `const` declarators as identifier
+/// sources, returning the sorted [`FileReport`].
+///
+/// `consts` feeds the P061 per-call [`IdentTable`] (in source order — the
+/// same order [`check_file`] checks): identifier arguments resolve against
+/// the prefix whose binder span ends before the call starts. Callers with no
+/// const facts pass `&[]` (every identifier argument then declines), which
+/// is exactly what [`check_generics`] threads through. See
+/// [`check_generics`] for the declaration/call phases, priority, and spans.
+#[must_use]
+pub fn check_generics_with_consts(
+    file: FileId,
+    decls: &[GenericDecl],
+    consts: &[ConstDecl],
+    calls: &[GenericCall],
+    binder: &Binder,
+) -> FileReport {
     let mut report = FileReport::default();
     let mut shapes: Vec<Option<GenericShape>> = Vec::with_capacity(decls.len());
     for generic in decls {
@@ -6112,6 +6200,7 @@ pub fn check_generics(
         binder,
         shapes: &shapes,
         by_name: &by_name,
+        consts,
         inference: InferenceTable::default(),
         report: &mut report,
     };
@@ -6129,6 +6218,10 @@ struct GenericCallCtx<'a, 'b> {
     binder: &'a Binder,
     shapes: &'a [Option<GenericShape>],
     by_name: &'a HashMap<&'b str, Vec<usize>>,
+    /// File `const` declarators in source order (P061 identifier sources):
+    /// each inferred call builds its own [`IdentTable`] prefix from these,
+    /// so no resolution state crosses call sites (H-002).
+    consts: &'a [ConstDecl],
     inference: InferenceTable,
     report: &'a mut FileReport,
 }
@@ -6637,6 +6730,9 @@ struct GenericCallView<'a> {
     call: &'a CallSite,
     /// Admitted per-parameter bounds plus the value-to-type position map.
     shape: GenericShape,
+    /// Enclosing-function context for identifier-argument resolution, if the
+    /// driver fed one (P061): params plus the resolution scope.
+    enclosing: Option<GenericEnclosing>,
 }
 
 /// Resolved per-parameter instantiation for one admitted call: canonical
@@ -6646,6 +6742,13 @@ struct ResolvedCall {
     ids: Vec<TypeId>,
     /// Display text per type parameter.
     displays: Vec<String>,
+    /// Effective literal kind per VALUE position, in argument order (`Some`
+    /// only for inferred identifier arguments that substituted a checkable
+    /// kind — P061): the argument check runs these against the declared
+    /// constraint exactly like literals, so `idc(a)` diagnoses where tsc
+    /// does. Literal positions read their own kind; explicit calls and
+    /// silent (`any`/`never`) bindings read `None` and skip as before.
+    ident_kinds: Vec<Option<InitKind>>,
 }
 
 /// Checks one generic instantiation, pushing into the context report.
@@ -6695,7 +6798,12 @@ fn check_one_generic_call(node: NodeId, call_site: &GenericCall, ctx: &mut Gener
         // Declined at declaration level: the declaration note covers it.
         return;
     };
-    let view = GenericCallView { node, call, shape };
+    let view = GenericCallView {
+        node,
+        call,
+        shape,
+        enclosing: call_site.enclosing.clone(),
+    };
     if let Some(texts) = call_site.explicit_args.as_ref() {
         if !check_type_arity(&view, texts, ctx) {
             return;
@@ -6835,6 +6943,10 @@ fn resolve_explicit(
     let mut resolved = ResolvedCall {
         ids: Vec::with_capacity(view.shape.params.len()),
         displays: Vec::with_capacity(view.shape.params.len()),
+        // Explicit type arguments check against their own resolved display,
+        // so identifier arguments keep the historical per-argument skip here
+        // (P061 leaves the explicit path untouched).
+        ident_kinds: vec![None; view.call.args.len()],
     };
     let mut missed = false;
     for (index, param) in view.shape.params.iter().enumerate() {
@@ -6890,26 +7002,162 @@ fn resolve_explicit(
     Some(resolved)
 }
 
+/// Builds one generic call's identifier side table (P061, H-002).
+///
+/// Fresh per call and dropped after it: inputs map from `consts` in source
+/// order, visibility counts the prefix whose binder span ends before the
+/// call starts (the single-pass order without flow analysis — later
+/// declarators decline as use-before-declaration), and params come from the
+/// call's enclosing function, if the driver fed one. Nothing here persists
+/// across calls; only the [`InferenceTable`] bindings (keyed per
+/// occurrence) outlive the call.
+fn ident_table_for_call(
+    binder: &Binder,
+    file: FileId,
+    consts: &[ConstDecl],
+    enclosing: Option<&GenericEnclosing>,
+    call_lo: u32,
+) -> IdentTable {
+    // Later declarators stay mapped (so they decline as
+    // use-before-declaration) but past the visibility cursor.
+    let checked = consts
+        .iter()
+        .take_while(|decl| decl.span.hi <= call_lo)
+        .count();
+    let inputs = consts
+        .iter()
+        .map(|decl| ident_input_from_decl(binder, file, decl))
+        .collect::<Vec<_>>();
+    IdentTable {
+        checked,
+        inputs,
+        params: enclosing.map_or(Vec::new(), |enclosing| {
+            ident_params_from_function(&enclosing.params)
+        }),
+    }
+}
+
+/// Decline reason for an identifier no checkable source claims (P061).
+///
+/// Names the same rule as [`resolve_table_target`]'s fallthrough: only
+/// in-scope `const` declarators with literal initializers (plus enclosing
+/// parameters, resolved before the table) propagate.
+fn unresolvable_ident_reason(name: &str) -> String {
+    format!(
+        "identifier '{name}' names no checkable const declarator or parameter in scope: \
+        only in-scope 'const' declarators with literal initializers propagate"
+    )
+}
+
+/// Resolves one inferred identifier argument one level (P061).
+///
+/// Enclosing parameters resolve first: a parameter shadows any same-name
+/// outer binding for the whole body (language semantics), while the
+/// declaration table only ever holds outer consts — so unlike [`resolve_ident`]
+/// (whose table holds the shadowing binding itself) the param check must come
+/// first. Anything else resolves from the call scope through the
+/// declaration table with the shared P048 rules. `Keep` cannot surface from
+/// the table paths on real inputs, so it folds into the same decline.
+fn resolve_generic_ident(
+    binder: &Binder,
+    file: FileId,
+    table: &IdentTable,
+    name: &str,
+    scope: u32,
+) -> IdentResolution {
+    if let Some(resolution) = resolve_param_source(table, name) {
+        return resolution;
+    }
+    let Some(target) = binder.resolve(file, scope, name) else {
+        return IdentResolution::Decline(unresolvable_ident_reason(name));
+    };
+    let judged = IdentUse {
+        name,
+        target,
+        // Call arguments are uses, never declarators: no self-cycle is
+        // possible, and depth-2+ sources decline through the shared path.
+        use_symbol: None,
+    };
+    match resolve_table_target(binder, &LocalAliasScope::EMPTY, table, file, &judged) {
+        IdentResolution::Keep => IdentResolution::Decline(unresolvable_ident_reason(name)),
+        resolution => resolution,
+    }
+}
+
 /// Binds every type parameter from its corresponding literal argument,
 /// recording each binding in the [`InferenceTable`].
 ///
-/// Non-literal positions fill from their own default (the oracle binds
-/// from the identifier's type — clean either way) and decline with no
-/// candidate otherwise (first failure only). The caller guarantees
-/// value-arity alignment, so every position has an argument. Returns
-/// `None` after pushing the decline note.
+/// Bare-identifier arguments (P061) resolve one level through the call's
+/// [`IdentTable`] and bind their kind exactly like literals (P048 declines
+/// ride through with their reasons at the argument span — first failure
+/// only); `any`/`never` sources bind silently while contributing no check
+/// kind. Non-identifier positions fill from their own default and decline
+/// with no candidate otherwise. The caller guarantees value-arity
+/// alignment, so every position has an argument. Returns `None` after
+/// pushing the decline note.
 #[must_use]
 fn resolve_inferred(
     view: &GenericCallView<'_>,
     ctx: &mut GenericCallCtx<'_, '_>,
 ) -> Option<ResolvedCall> {
     let file = ctx.file;
+    let table = ident_table_for_call(
+        ctx.binder,
+        file,
+        ctx.consts,
+        view.enclosing.as_ref(),
+        view.call.span.lo,
+    );
+    let scope = view
+        .enclosing
+        .as_ref()
+        .map_or(0, |enclosing| enclosing.scope);
     let mut bound: Vec<Option<(TypeId, String)>> = vec![None; view.shape.params.len()];
+    let mut ident_kinds: Vec<Option<InitKind>> = vec![None; view.call.args.len()];
     for (position, argument) in view.call.args.iter().enumerate() {
         // Aligned by the caller's arity gate: one slot per value position.
         let slot = view.shape.slots[position];
         let param = &view.shape.params[slot];
         if argument.kind == InitKind::NonLiteral {
+            if let Some(name) = argument.ident.as_deref() {
+                let outcome = resolve_generic_ident(ctx.binder, file, &table, name, scope);
+                match outcome {
+                    IdentResolution::Substitute(kind) => {
+                        let id = ctx.inference.record(file, view.node, slot, kind.type_id());
+                        bound[slot] = Some((id, kind.name().to_owned()));
+                        ident_kinds[position] = Some(kind);
+                        continue;
+                    }
+                    IdentResolution::SilentAny => {
+                        let id = ctx.inference.record(file, view.node, slot, TypeStore::ANY);
+                        bound[slot] = Some((id, "any".to_owned()));
+                        continue;
+                    }
+                    IdentResolution::SilentNever => {
+                        let id = ctx
+                            .inference
+                            .record(file, view.node, slot, TypeStore::NEVER);
+                        bound[slot] = Some((id, "never".to_owned()));
+                        continue;
+                    }
+                    IdentResolution::Decline(reason) => {
+                        ctx.report.unsupported.push(UnsupportedDecl {
+                            file,
+                            span: argument.span,
+                            reason,
+                        });
+                        return None;
+                    }
+                    IdentResolution::Keep => {
+                        ctx.report.unsupported.push(UnsupportedDecl {
+                            file,
+                            span: argument.span,
+                            reason: unresolvable_ident_reason(name),
+                        });
+                        return None;
+                    }
+                }
+            }
             if let Some(default) = param.default.as_ref() {
                 let id = ctx.inference.record(file, view.node, slot, default.id);
                 bound[slot] = Some((id, default.text.clone()));
@@ -6936,6 +7184,7 @@ fn resolve_inferred(
     let mut resolved = ResolvedCall {
         ids: Vec::with_capacity(bound.len()),
         displays: Vec::with_capacity(bound.len()),
+        ident_kinds,
     };
     for slot in bound {
         if let Some((id, display)) = slot {
@@ -6981,14 +7230,16 @@ fn check_constraints(
 
 /// Checks every value argument against its substituted parameter type
 /// (probed tsc 7.0.2 P036): only the first mismatch reports `PITH2345` at
-/// its argument. Non-literal arguments skip per-argument (P014 precedent).
-/// Under inference each position verifies against its declared constraint
-/// when one exists (violations spell `TS2345` with the constraint text,
-/// never `TS2344`); unconstrained inferred positions skip (the slot was
-/// just bound from that very literal, so the comparison is vacuous by
-/// construction — duplicate bare names sharing one slot still verify per
-/// position, never against a later overwrite). Under explicit arguments
-/// each position checks against its resolved display.
+/// its argument. Non-literal arguments skip per-argument (P014 precedent),
+/// except inferred identifier arguments that substituted a checkable kind
+/// (P061): those verify against the declared constraint exactly like
+/// literals (violations spell `TS2345` with the constraint text, never
+/// `TS2344`). Under inference each literal position verifies against its
+/// declared constraint when one exists (unconstrained inferred positions
+/// skip — the slot was just bound from that very literal, so the comparison
+/// is vacuous by construction — duplicate bare names sharing one slot still
+/// verify per position, never against a later overwrite). Under explicit
+/// arguments each position checks against its resolved display.
 fn check_arg_types(
     view: &GenericCallView<'_>,
     resolved: &ResolvedCall,
@@ -6996,9 +7247,14 @@ fn check_arg_types(
     inferred: bool,
 ) {
     for (position, argument) in view.call.args.iter().enumerate() {
-        if argument.kind == InitKind::NonLiteral {
-            continue;
-        }
+        let kind = if argument.kind == InitKind::NonLiteral {
+            let Some(bound) = resolved.ident_kinds[position] else {
+                continue;
+            };
+            bound
+        } else {
+            argument.kind
+        };
         // Aligned by the caller's arity gate: one slot per value position.
         let slot = view.shape.slots[position];
         let (expected, display) = if inferred {
@@ -7009,14 +7265,14 @@ fn check_arg_types(
         } else {
             (resolved.ids[slot], resolved.displays[slot].as_str())
         };
-        if argument.kind.type_id() != expected {
+        if kind.type_id() != expected {
             ctx.report.diagnostics.push(PithDiagnostic {
                 code: CODE_ARG_TYPE.to_owned(),
                 file: ctx.file,
                 span: argument.span,
                 message: format!(
                     "Argument of type '{}' is not assignable to parameter of type '{display}'.",
-                    argument.kind.name(),
+                    kind.name(),
                 ),
             });
             return;
@@ -12864,6 +13120,8 @@ mod tests {
                     operand_span: span(4, 11),
                     kind,
                 }),
+                // Assertion tests never feed identifier names.
+                ident: None,
             }],
         }
     }
@@ -14669,6 +14927,8 @@ mod tests {
                     kind,
                     span: arg_span,
                     cast: None,
+                    // Non-generic call tests never feed identifier names.
+                    ident: None,
                 })
                 .collect(),
         }
@@ -17966,10 +18226,46 @@ mod tests {
                         kind,
                         span: span(lo, hi),
                         cast: None,
+                        // The legacy helper never feeds identifier names.
+                        ident: None,
                     })
                     .collect(),
             },
             explicit_args: explicit.map(|texts| texts.into_iter().map(str::to_owned).collect()),
+            // The legacy helper never feeds enclosing-function context.
+            enclosing: None,
+        }
+    }
+
+    /// One generic call whose arguments may name bare identifiers (P061):
+    /// each tuple carries the literal kind, the span, and the sliced name
+    /// (`None` for literals). `enclosing` feeds the enclosing-function
+    /// context, if any.
+    fn generic_call_args_ident(
+        callee: &str,
+        callee_lo: u32,
+        callee_hi: u32,
+        args: Vec<(InitKind, u32, u32, Option<&str>)>,
+        explicit: Option<Vec<&str>>,
+        enclosing: Option<GenericEnclosing>,
+    ) -> GenericCall {
+        GenericCall {
+            call: CallSite {
+                callee: callee.to_owned(),
+                callee_span: span(callee_lo, callee_hi),
+                span: span(callee_lo, callee_hi + 2),
+                args: args
+                    .into_iter()
+                    .map(|(kind, lo, hi, ident)| CallArg {
+                        kind,
+                        span: span(lo, hi),
+                        cast: None,
+                        ident: ident.map(str::to_owned),
+                    })
+                    .collect(),
+            },
+            explicit_args: explicit.map(|texts| texts.into_iter().map(str::to_owned).collect()),
+            enclosing,
         }
     }
 
@@ -17979,6 +18275,48 @@ mod tests {
         binder: &Binder,
     ) -> FileReport {
         check_generics(FILE, decls, calls, binder)
+    }
+
+    /// One generics run with file `const` declarators as identifier sources
+    /// (P061): `consts` feeds the per-call [`IdentTable`] prefix rule, so
+    /// identifier arguments resolve exactly like the fact-fed pipeline.
+    fn generics_report_with_consts(
+        decls: &[GenericDecl],
+        consts: &[ConstDecl],
+        calls: &[GenericCall],
+        binder: &Binder,
+    ) -> FileReport {
+        check_generics_with_consts(FILE, decls, consts, calls, binder)
+    }
+
+    /// One identifier source: name/span plus the declarator kind, the
+    /// annotation text, initializer kind, and sliced identifier name (each
+    /// `None` when absent). Spans drive the per-call visibility prefix, so
+    /// sources must end before the call starts.
+    fn const_source(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        kind: DeclKind,
+        annotation: Option<&str>,
+        init: Option<InitKind>,
+        init_ident: Option<&str>,
+    ) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind,
+            annotation: annotation.map(str::to_owned),
+            init,
+            init_ident: init_ident.map(str::to_owned),
+            init_object: None,
+            init_array: None,
+            cast: None,
+            init_ternary: None,
+            init_member_ref: None,
+        }
     }
 
     #[test]
@@ -18223,6 +18561,427 @@ mod tests {
         assert_eq!(report.unsupported.len(), 2);
         assert!(
             report.unsupported[1].reason.contains("cannot infer"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    /// One enclosing-function context with primitively annotated required
+    /// parameters (P061): names plus annotation texts, scope root.
+    fn enclosing_with(params: Vec<(&str, &str)>) -> GenericEnclosing {
+        GenericEnclosing {
+            params: params
+                .into_iter()
+                .map(|(name, annotation)| FunctionParam {
+                    name: name.to_owned(),
+                    annotated: true,
+                    annotation: Some(annotation.to_owned()),
+                    optional: false,
+                    is_rest: false,
+                })
+                .collect(),
+            scope: 0,
+        }
+    }
+
+    #[test]
+    fn generic_ident_literal_source_binds_silently() {
+        // `id(a)` over `const a = 1`: the P060-inferred kind binds into the
+        // slot, so the call is silent (plus the body note).
+        let binder = binder_with(&[("id", span(0, 20)), ("a", span(22, 23))]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [const_source(
+            "a",
+            22,
+            23,
+            DeclKind::Const,
+            None,
+            Some(InitKind::Number),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("a"))];
+        let calls = [generic_call_args_ident("id", 30, 32, args, None, None)];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_annotated_source_binds_silently() {
+        // `id(a)` over `const a: string = "s"`: the declared annotation wins
+        // (tsc types uses by the DECLARED type — the P048 rule), so the call
+        // binds `string` silently.
+        let binder = binder_with(&[("id", span(0, 20)), ("a", span(22, 23))]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [const_source(
+            "a",
+            22,
+            23,
+            DeclKind::Const,
+            Some("string"),
+            Some(InitKind::String),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("a"))];
+        let calls = [generic_call_args_ident("id", 30, 32, args, None, None)];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_constrained_wrong_is_ts2345() {
+        // `idc(a)` over `const a = 1` and `<T extends string>`: the inferred
+        // `number` checks against the constraint exactly like a literal, so
+        // the oracle's TS2345 fires at the argument (never TS2344).
+        let binder = binder_with(&[("idc", span(0, 20)), ("a", span(22, 23))]);
+        let decl = bounded_decl("idc", 0, 20, Some("string"), None);
+        let consts = [const_source(
+            "a",
+            22,
+            23,
+            DeclKind::Const,
+            None,
+            Some(InitKind::Number),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("a"))];
+        let calls = [generic_call_args_ident("idc", 30, 33, args, None, None)];
+        let report = generics_report_with_consts(&[decl], &consts, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'number' is not assignable to parameter of type 'string'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(40, 41));
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_unresolvable_declines_distinctly() {
+        // `id(nope)` with no source: the decline names the missing source
+        // (never bound as `unknown`, never silently skipped), plus the body
+        // note. The oracle spells TS2304 (pinned oracle-error divergence).
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let args = vec![(InitKind::NonLiteral, 40, 44, Some("nope"))];
+        let calls = [generic_call_args_ident("id", 30, 32, args, None, None)];
+        let report = generics_report_with_consts(&decls, &[], &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[1]
+                .reason
+                .contains("no checkable const declarator"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn generic_ident_explicit_path_ignores_names() {
+        // `id<string>(a)` over `const a = 1`: the explicit path never
+        // resolves identifier names, so the historical per-argument skip
+        // holds (oracle TS2345 — pinned divergence, P061 leaves explicit
+        // lists untouched).
+        let binder = binder_with(&[("id", span(0, 20)), ("a", span(22, 23))]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [const_source(
+            "a",
+            22,
+            23,
+            DeclKind::Const,
+            None,
+            Some(InitKind::Number),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("a"))];
+        let calls = [generic_call_args_ident(
+            "id",
+            30,
+            32,
+            args,
+            Some(vec!["string"]),
+            None,
+        )];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_param_source_binds_silently() {
+        // `id(p)` inside `wrap(p: number)`: the enclosing parameter binds
+        // `number` into the slot, so the call is silent (plus the body note).
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("p"))];
+        let enclosing = enclosing_with(vec![("p", "number")]);
+        let calls = [generic_call_args_ident(
+            "id",
+            30,
+            32,
+            args,
+            None,
+            Some(enclosing),
+        )];
+        let report = generics_report_with_consts(&decls, &[], &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_param_shadows_outer_const() {
+        // `idc(p)` with a `p: number` parameter and an outer `const p = "s"`:
+        // the parameter wins for the whole body, so the `number` constraint
+        // holds silently (a table-first order would mis-fire TS2345).
+        let binder = binder_with(&[("idc", span(0, 20)), ("p", span(22, 23))]);
+        let decl = bounded_decl("idc", 0, 20, Some("number"), None);
+        let consts = [const_source(
+            "p",
+            22,
+            23,
+            DeclKind::Const,
+            None,
+            Some(InitKind::String),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("p"))];
+        let enclosing = enclosing_with(vec![("p", "number")]);
+        let calls = [generic_call_args_ident(
+            "idc",
+            30,
+            33,
+            args,
+            None,
+            Some(enclosing),
+        )];
+        let report = generics_report_with_consts(&[decl], &consts, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_let_source_declines() {
+        // `id(m)` over `let m = 1`: mutable bindings never propagate (the
+        // P048 rule rides through), so the call declines (plus the body
+        // note). The oracle is clean (pinned oracle-clean divergence).
+        let binder = binder_with(&[("id", span(0, 20)), ("m", span(22, 23))]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [const_source(
+            "m",
+            22,
+            23,
+            DeclKind::Let,
+            None,
+            Some(InitKind::Number),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("m"))];
+        let calls = [generic_call_args_ident("id", 30, 32, args, None, None)];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[1].reason.contains("'let'"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn generic_ident_chain_declines_single_level() {
+        // `id(b)` over `const b = a`: single-level propagation stops at the
+        // chain link (the P048 rule rides through), so the call declines
+        // (plus the body note). The oracle is clean (pinned divergence).
+        let binder = binder_with(&[
+            ("id", span(0, 20)),
+            ("a", span(22, 23)),
+            ("b", span(25, 26)),
+        ]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [
+            const_source(
+                "a",
+                22,
+                23,
+                DeclKind::Const,
+                None,
+                Some(InitKind::Number),
+                None,
+            ),
+            const_source(
+                "b",
+                25,
+                26,
+                DeclKind::Const,
+                None,
+                Some(InitKind::NonLiteral),
+                Some("a"),
+            ),
+        ];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("b"))];
+        let calls = [generic_call_args_ident("id", 30, 32, args, None, None)];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[1].reason.contains("single-level"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn generic_ident_pair_binds_per_position() {
+        // `pair(a, a)` over `const a = 1`: each identifier binds its own
+        // slot, so the call is silent (plus the body note).
+        let binder = binder_with(&[("pair", span(0, 20)), ("a", span(22, 23))]);
+        let decls = [pair_decl(0, 20)];
+        let consts = [const_source(
+            "a",
+            22,
+            23,
+            DeclKind::Const,
+            None,
+            Some(InitKind::Number),
+            None,
+        )];
+        let args = vec![
+            (InitKind::NonLiteral, 40, 41, Some("a")),
+            (InitKind::NonLiteral, 43, 44, Some("a")),
+        ];
+        let calls = [generic_call_args_ident("pair", 30, 34, args, None, None)];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_unresolvable_beats_default() {
+        // `idd(nope)` over `<T = number>`: the unresolvable identifier
+        // declines distinctly instead of filling silently from the default
+        // (plus the body note). The oracle spells TS2304 (pinned divergence).
+        let binder = binder_with(&[("idd", span(0, 20))]);
+        let decl = bounded_decl("idd", 0, 20, None, Some("number"));
+        let args = vec![(InitKind::NonLiteral, 40, 44, Some("nope"))];
+        let calls = [generic_call_args_ident("idd", 30, 33, args, None, None)];
+        let report = generics_report_with_consts(&[decl], &[], &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[1]
+                .reason
+                .contains("no checkable const declarator"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn generic_ident_any_source_binds_silently() {
+        // `id(a)` over `const a: any = 1`: the `any` annotation silences
+        // the use (the P048 rule rides through), so the call binds `any`
+        // silently (plus the body note).
+        let binder = binder_with(&[("id", span(0, 20)), ("a", span(22, 23))]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [const_source(
+            "a",
+            22,
+            23,
+            DeclKind::Const,
+            Some("any"),
+            Some(InitKind::Number),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("a"))];
+        let calls = [generic_call_args_ident("id", 30, 32, args, None, None)];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_regexp_source_binds_silently() {
+        // `id(r)` over `const r = /x/`: the P060-inferred `RegExp` kind
+        // binds (against the shared `UNKNOWN` id, spelled `RegExp`), so the
+        // unconstrained call is silent (plus the body note).
+        let binder = binder_with(&[("id", span(0, 20)), ("r", span(22, 23))]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [const_source(
+            "r",
+            22,
+            23,
+            DeclKind::Const,
+            None,
+            Some(InitKind::RegExp),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("r"))];
+        let calls = [generic_call_args_ident("id", 30, 32, args, None, None)];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_use_before_declaration_declines() {
+        // `id(a)` before `const a = 1`: the visibility prefix hides later
+        // declarators, so the call declines as use-before-declaration (plus
+        // the body note). The oracle spells TS2448 (pinned divergence).
+        let binder = binder_with(&[("id", span(0, 20)), ("a", span(50, 51))]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [const_source(
+            "a",
+            50,
+            51,
+            DeclKind::Const,
+            None,
+            Some(InitKind::Number),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("a"))];
+        let calls = [generic_call_args_ident("id", 30, 32, args, None, None)];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[1]
+                .reason
+                .contains("used before its declaration"),
             "reason: {}",
             report.unsupported[1].reason
         );
