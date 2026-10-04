@@ -940,6 +940,45 @@
 //! facts; only the referenced NAME rides the seam, and every resolution step
 //! goes through the [`Binder`].
 //!
+//! Widened-kind inference for literal-inited unannotated consts (P060,
+//! probed on tsc 7.0.2 `--strict --pretty false`; probes in
+//! `.agent/scratch/p060-probes/`):
+//!
+//! - `const x = 1` (and `"s"`, `true`, `null`, `undefined`, `/x/`, `/x/g`)
+//!   are all silent in tsc, so the unannotated gate now infers them silently
+//!   (no diagnostic, no note). The kind — including the new
+//!   [`InitKind::RegExp`], which spells tsc's own `RegExp` — feeds the
+//!   [`IdentTable`] sources through the existing P048 paths, so
+//!   `const s: string = r` over `const r = /x/` diagnoses
+//!   `Type 'RegExp' is not assignable to type 'string'.` exactly like tsc.
+//! - `RegExp` mismatches diagnose with the `RegExp` spelling wherever a
+//!   primitive mismatch would: `: string`, `: number`, `: never`, and enums
+//!   (`Type 'RegExp' is not assignable to type 'Color'.`). `any`/`unknown`
+//!   annotations stay silent through the existing boundary path.
+//! - tsc treats regex as an object where shapes compare: `RegExp` against
+//!   an object, interface, or array annotation spells the missing-property
+//!   families (`TS2741`/`TS2740`) while every other literal spells
+//!   compositional `TS2322`. The subset spells no missing-property
+//!   elaboration for a regex actual, so those decline with distinct reasons
+//!   instead of mis-spelling (the P034 no-misspelling discipline).
+//! - A written `: RegExp` stays lib-declined (clean in tsc): the subset
+//!   models no `.d.ts` shapes, so the annotation declines with its own lib
+//!   reason (the P034 precedent — never a false `TS2304`).
+//! - Everything else keeps its exact verdict: unannotated `let` (mutable —
+//!   the P048 rule), array/object/call/spread/index initializers (all
+//!   [`InitKind::NonLiteral`] — no shape inference, the explicit
+//!   out-of-scope), identifier uses (`const t = r` keeps the unannotated
+//!   decline: nothing to check against), ternaries, casts, member refs, and
+//!   missing inits. Narrowing keeps its own inline unannotated decline
+//!   (pinned gap: that entry threads no [`IdentTable`]).
+//!
+//! BLOCKER (same seam as [`ConstDecl::init_ident`]): the adapter emits no
+//! regex facts (regex literals classify [`InitKind::NonLiteral`]
+//! frontend-side), so the check-const driver reads the sliced init text — a
+//! trimmed leading `/` (division cannot lead an expression) — until the
+//! adapter emits one. Parenthesized `(/x/)` keeps the `NonLiteral` decline
+//! (no peel, the P048 bare-identifier precedent; tsc is silent — pinned).
+//!
 //! Lib types, first cut (P034, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p034-probes/`):
 //!
@@ -1085,6 +1124,15 @@ pub enum InitKind {
     Null,
     /// `undefined`.
     Undefined,
+    /// A regex literal (`/x/`, `/x/g`, ...).
+    ///
+    /// Spells `RegExp` in messages (tsc's own name, probed 7.0.2 P060).
+    /// It inhabits [`TypeStore::UNKNOWN`] here only because no `RegExp`
+    /// builtin exists in scope (`pith-types` is outside this task):
+    /// `UNKNOWN` is unequal to every annotation [`TypeId`] that reaches a
+    /// const-path comparison, so regex initializers always diagnose with
+    /// the `RegExp` spelling and never silence wrongly.
+    RegExp,
     /// An admitted `as unknown` result (never a direct literal: only
     /// [`evaluate_cast`] produces it). Spells `unknown` in messages, so
     /// `unknown`-into-`T` flows diagnose exactly like the oracle.
@@ -1098,6 +1146,8 @@ impl InitKind {
     ///
     /// `NonLiteral` has no known type here, so it yields [`TypeStore::UNKNOWN`]
     /// and callers must route it to unsupported, never to a verdict.
+    /// [`InitKind::RegExp`] shares the fallback (see its docs): the
+    /// inequality still diagnoses everywhere a comparison runs.
     #[must_use]
     pub fn type_id(self) -> TypeId {
         match self {
@@ -1106,7 +1156,7 @@ impl InitKind {
             Self::Boolean => TypeStore::BOOLEAN,
             Self::Null => TypeStore::NULL,
             Self::Undefined => TypeStore::UNDEFINED,
-            Self::Unknown | Self::NonLiteral => TypeStore::UNKNOWN,
+            Self::RegExp | Self::Unknown | Self::NonLiteral => TypeStore::UNKNOWN,
         }
     }
 
@@ -1119,6 +1169,7 @@ impl InitKind {
             Self::Boolean => "boolean",
             Self::Null => "null",
             Self::Undefined => "undefined",
+            Self::RegExp => "RegExp",
             Self::Unknown | Self::NonLiteral => "unknown",
         }
     }
@@ -2331,7 +2382,8 @@ fn lib_family(head: &str) -> Option<&'static str> {
 ///
 /// Tuples decline here too: `[number, string]` is lib-adjacent syntax but
 /// tuples are NOT arrays, so they need their own reason rather than the
-/// array path or a false `TS2304`.
+/// array path or a false `TS2304`. `RegExp` declines here as well (P060):
+/// written `: RegExp` names a `.d.ts` class the subset never models.
 fn lib_decline_reason(annotation: &str) -> Option<String> {
     if annotation.starts_with('[') {
         return Some(format!(
@@ -2353,6 +2405,11 @@ fn lib_decline_reason(annotation: &str) -> Option<String> {
     if head == "ReadonlyArray" {
         return Some(format!(
             "readonly array annotation '{annotation}' is outside the subset"
+        ));
+    }
+    if head == "RegExp" {
+        return Some(format!(
+            "lib type annotation '{annotation}' is outside the subset: lib modeling"
         ));
     }
     lib_family(head).map(|family| {
@@ -8359,15 +8416,47 @@ fn apply_assertion(
     }
 }
 
+/// Whether an unannotated declaration infers silently (P060; see the
+/// module-level probe record): a `const` whose initializer is a bare
+/// primitive, `null`, `undefined`, or regex literal with no other shape.
+/// `let` stays declined (mutability is invisible to the pass), as do array,
+/// object, call, spread, index, identifier, ternary, cast, member-ref, and
+/// missing initializers — all byte-identical, no shape inference.
+fn unannotated_infers_silently(decl: &ConstDecl) -> bool {
+    decl.kind == DeclKind::Const
+        && decl.init_ident.is_none()
+        && decl.cast.is_none()
+        && decl.init_object.is_none()
+        && decl.init_array.is_none()
+        && decl.init_ternary.is_none()
+        && decl.init_member_ref.is_none()
+        && matches!(
+            decl.init,
+            Some(
+                InitKind::Number
+                    | InitKind::String
+                    | InitKind::Boolean
+                    | InitKind::Null
+                    | InitKind::Undefined
+                    | InitKind::RegExp
+            )
+        )
+}
+
 /// The missing-annotation path for `check_one`: declined casts still
-/// diagnose without annotations (probed tsc 7.0.2); admitted and complex
-/// casts fall into the usual no-annotation decline.
+/// diagnose without annotations (probed tsc 7.0.2); literal-inited
+/// unannotated consts infer silently (P060); admitted and complex casts
+/// plus every other unannotated shape fall into the usual no-annotation
+/// decline.
 fn decline_unannotated(decl: &ConstDecl, span: Span, file: FileId, report: &mut FileReport) {
     if let Some(cast) = decl.cast.as_ref() {
         if matches!(evaluate_cast(cast), CastEvaluation::Decline(_)) {
             emit_cast_diagnostic(file, cast, &mut *report);
             return;
         }
+    }
+    if unannotated_infers_silently(decl) {
+        return;
     }
     report.unsupported.push(UnsupportedDecl {
         file,
@@ -10109,9 +10198,12 @@ fn diagnose_missing_members(
 /// Object annotation with a non-object initializer.
 ///
 /// Primitive literals diagnose compositionally (oracle: `Type 'number' is
-/// not assignable to type '{ a: number; }'.`); missing/non-literal
-/// initializers decline with the usual reasons. `init` is the declaration's
-/// own kind or the cast-substituted kind (see [`finish_object_check`]).
+/// not assignable to type '{ a: number; }'.`); regex literals decline
+/// instead (P060: the oracle spells the missing-member family for a
+/// `RegExp` actual, which no compositional message may fake); missing/
+/// non-literal initializers decline with the usual reasons. `init` is the
+/// declaration's own kind or the cast-substituted kind (see
+/// [`finish_object_check`]).
 fn check_object_annotation_non_object_init(
     init: Option<InitKind>,
     span: Span,
@@ -10131,6 +10223,17 @@ fn check_object_annotation_non_object_init(
             file: ctx.file,
             span,
             reason: "non-literal initializer is outside the subset".to_owned(),
+        });
+        return;
+    }
+    if init == InitKind::RegExp {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason:
+                "regex literal initializer against an object annotation is outside the subset: \
+                the oracle spells the missing-member family"
+                    .to_owned(),
         });
         return;
     }
@@ -10252,7 +10355,9 @@ fn check_array_members(
 ///
 /// Missing/non-literal initializers decline with the usual reasons;
 /// primitive literals diagnose compositionally with the suffix spelling
-/// (`Type 'number' is not assignable to type 'number[]'.`, probed 7.0.2).
+/// (`Type 'number' is not assignable to type 'number[]'.`, probed 7.0.2);
+/// regex literals decline instead (P060: the oracle spells `TS2740` for a
+/// `RegExp` actual, which no compositional message may fake).
 fn check_array_annotation_non_array_init(
     init: Option<InitKind>,
     span: Span,
@@ -10272,6 +10377,16 @@ fn check_array_annotation_non_array_init(
             file: ctx.file,
             span,
             reason: "non-literal initializer is outside the subset".to_owned(),
+        });
+        return;
+    }
+    if init == InitKind::RegExp {
+        ctx.report.unsupported.push(UnsupportedDecl {
+            file: ctx.file,
+            span,
+            reason: "regex literal initializer against an array annotation is outside the subset: \
+                the oracle spells TS2740"
+                .to_owned(),
         });
         return;
     }
@@ -11696,7 +11811,7 @@ impl EnumDeclCtx<'_, '_, '_> {
     /// Checks one literal initializer against an enum shape: numerics test
     /// membership by value; every other literal diagnoses (probed tsc 7.0.2:
     /// strings never match — even member values — booleans spell
-    /// literally, `null`/`undefined` spell widened).
+    /// literally, `null`/`undefined` spell widened, regex spells `RegExp`).
     fn check_enum_literal(
         &mut self,
         span: Span,
@@ -11760,7 +11875,7 @@ impl EnumDeclCtx<'_, '_, '_> {
                     format!("Type '{spelling}' is not assignable to type '{display}'."),
                 );
             }
-            InitKind::Null | InitKind::Undefined | InitKind::Unknown => {
+            InitKind::Null | InitKind::Undefined | InitKind::Unknown | InitKind::RegExp => {
                 self.diagnose(
                     span,
                     CODE_MISMATCH,
@@ -12621,8 +12736,9 @@ mod tests {
             exported: false,
         }];
         let decls = [
-            // The merged declarator itself: unannotated, so the verdict is
-            // the no-annotation note — anchored at the FIRST declaration.
+            // The merged declarator itself: unannotated, so P060 infers it
+            // silently (the pre-P060 no-annotation note is gone) — anchored
+            // at the FIRST declaration all the same.
             ConstDecl {
                 name: "Foo".to_owned(),
                 span: span(35, 38),
@@ -12645,8 +12761,14 @@ mod tests {
         let report = check_interfaces(FILE, &decls, &shapes, &binder, &mut db);
         assert_eq!(report.diagnostics.len(), 1);
         assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
-        assert_eq!(report.unsupported.len(), 1);
-        assert_eq!(report.unsupported[0].span, first);
+        // (P060 flip: the unannotated merged declarator no longer records
+        // the no-annotation note, so only the interface-use diagnostic
+        // remains.)
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
     }
 
     #[test]
@@ -13434,6 +13556,9 @@ mod tests {
 
     #[test]
     fn out_of_subset_is_unsupported_never_silent() {
+        // P060 conversion: the unannotated member `n` feeds a `NonLiteral`
+        // (call-shaped) initializer — a bare unannotated literal would now
+        // infer silently instead of recording a note.
         let binder = binder_with(&[
             ("u", span(0, 8)),
             ("n", span(9, 17)),
@@ -13449,7 +13574,7 @@ mod tests {
                 symbol: None,
                 kind: DeclKind::Const,
                 annotation: None,
-                init: Some(InitKind::Number),
+                init: Some(InitKind::NonLiteral),
                 init_ident: None,
                 init_object: None,
                 init_array: None,
@@ -20703,8 +20828,8 @@ mod tests {
     #[test]
     fn ident_unannotated_source_propagates_clean() {
         // `const a = 1; const b: number = a;` (probe p01): the use checks
-        // clean while the unannotated source keeps its own no-annotation
-        // note through the pre-existing gate.
+        // clean; P060 flips the source silent too (tsc infers the literal
+        // kind — the pre-P060 no-annotation note is gone).
         let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
         let decls = [
             literal_source("a", 0, 10, InitKind::Number),
@@ -20717,17 +20842,18 @@ mod tests {
             "diagnostics: {:?}",
             report.diagnostics
         );
-        assert_eq!(report.unsupported.len(), 1);
-        assert_eq!(
-            report.unsupported[0].reason,
-            "no annotation: inference is outside the subset"
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
         );
     }
 
     #[test]
     fn ident_chain_wrong_diagnoses_at_use_span() {
         // `const a = 1; const b: string = a;` spells TS2322 at the use
-        // (probe p02); the unannotated source keeps its own note.
+        // (probe p02); P060 flips the source silent (tsc infers it — the
+        // pre-P060 no-annotation note is gone).
         let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
         let decls = [
             literal_source("a", 0, 10, InitKind::Number),
@@ -20742,10 +20868,10 @@ mod tests {
             report.diagnostics[0].message,
             "Type 'number' is not assignable to type 'string'."
         );
-        assert_eq!(report.unsupported.len(), 1);
-        assert_eq!(
-            report.unsupported[0].reason,
-            "no annotation: inference is outside the subset"
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
         );
     }
 
@@ -21149,6 +21275,238 @@ mod tests {
         assert_eq!(
             report.diagnostics[1].message,
             "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn unannotated_literal_consts_infer_silently() {
+        // P060 (probes `u-*`): tsc infers every literal-inited unannotated
+        // const, so the gate stays silent with no note — for the five
+        // pre-existing kinds and the new `RegExp` alike.
+        let binder = binder_with(&[
+            ("n", span(0, 10)),
+            ("s", span(11, 21)),
+            ("b", span(22, 32)),
+            ("z", span(33, 43)),
+            ("u", span(44, 54)),
+            ("r", span(55, 65)),
+        ]);
+        let decls = [
+            literal_source("n", 0, 10, InitKind::Number),
+            literal_source("s", 11, 21, InitKind::String),
+            literal_source("b", 22, 32, InitKind::Boolean),
+            literal_source("z", 33, 43, InitKind::Null),
+            literal_source("u", 44, 54, InitKind::Undefined),
+            literal_source("r", 55, 65, InitKind::RegExp),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn unannotated_let_keeps_no_annotation_decline() {
+        // P060 keeps `let` byte-identical (probe `u-let` is silent in tsc —
+        // a pinned divergence): mutability is invisible to the single pass.
+        let binder = binder_with(&[("l", span(0, 10))]);
+        let decls = [ConstDecl {
+            kind: DeclKind::Let,
+            annotation: None,
+            init_ternary: None,
+            init_member_ref: None,
+            ..literal_source("l", 0, 10, InitKind::Number)
+        }];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "no annotation: inference is outside the subset"
+        );
+    }
+
+    #[test]
+    fn unannotated_nonliteral_and_missing_shapes_keep_decline() {
+        // P060 infers literal kinds only: calls (and every other
+        // `NonLiteral` shape) plus missing initializers keep the exact
+        // historical reason — no shape inference.
+        let binder = binder_with(&[("c", span(0, 10)), ("m", span(11, 21))]);
+        let missing = ConstDecl {
+            init: None,
+            ..literal_source("m", 11, 21, InitKind::Number)
+        };
+        let decls = [literal_source("c", 0, 10, InitKind::NonLiteral), missing];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 2);
+        for note in &report.unsupported {
+            assert_eq!(
+                note.reason,
+                "no annotation: inference is outside the subset"
+            );
+        }
+    }
+
+    #[test]
+    fn regexp_kind_spells_and_compares() {
+        // The `RegExp` spelling is tsc's own (probes `m-regex-*`); the
+        // shared `UNKNOWN` fallback is unequal to every annotation `TypeId`
+        // that reaches a const-path comparison, so regex always diagnoses.
+        assert_eq!(InitKind::RegExp.name(), "RegExp");
+        for ann in [
+            TypeStore::NUMBER,
+            TypeStore::STRING,
+            TypeStore::BOOLEAN,
+            TypeStore::VOID,
+            TypeStore::UNDEFINED,
+            TypeStore::NULL,
+            TypeStore::NEVER,
+        ] {
+            assert_ne!(InitKind::RegExp.type_id(), ann);
+        }
+    }
+
+    #[test]
+    fn regexp_mismatch_spells_regexp() {
+        // `const t: string = /x/` (probe `m-regex-str`) and the `number`
+        // twin (probe `m-regex-num`): one `TS2322` each, `RegExp` actual.
+        let binder = binder_with(&[("t", span(0, 10)), ("n", span(11, 21))]);
+        let decls = [
+            decl("t", 0, 10, "string", InitKind::RegExp),
+            decl("n", 11, 21, "number", InitKind::RegExp),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 2);
+        for diag in &report.diagnostics {
+            assert_eq!(diag.code, CODE_MISMATCH);
+        }
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'RegExp' is not assignable to type 'string'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Type 'RegExp' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn regexp_annotation_lib_declines() {
+        // A written `: RegExp` names an unmodeled lib class (probes
+        // `w-regex` clean, `m-str-regex` errors): both decline with the lib
+        // reason — never a forced verdict, never a false `TS2304`.
+        let binder = binder_with(&[("r", span(0, 10)), ("s", span(11, 21))]);
+        let decls = [
+            decl("r", 0, 10, "RegExp", InitKind::RegExp),
+            decl("s", 11, 21, "RegExp", InitKind::String),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 2);
+        for note in &report.unsupported {
+            assert!(
+                note.reason.contains("lib type annotation"),
+                "reason: {}",
+                note.reason
+            );
+        }
+    }
+
+    #[test]
+    fn regexp_against_object_and_array_declines() {
+        // tsc spells the missing-property families for a `RegExp` actual
+        // (probes `e-obj`, `e-arr`) while other literals spell
+        // compositional `TS2322` (probes `f-*`): the subset declines both
+        // with distinct reasons instead of mis-spelling.
+        let binder = binder_with(&[("o", span(0, 10)), ("a", span(11, 21))]);
+        let decls = [
+            decl("o", 0, 10, "{ a: number; }", InitKind::RegExp),
+            decl("a", 11, 21, "number[]", InitKind::RegExp),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 2);
+        assert!(
+            report.unsupported[0].reason.contains("missing-member"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+        assert!(
+            report.unsupported[1].reason.contains("TS2740"),
+            "reason: {}",
+            report.unsupported[1].reason
+        );
+    }
+
+    #[test]
+    fn regexp_source_propagates_to_use() {
+        // `const r = /x/; const s: string = r;` (probe `e-propa`): the
+        // unannotated regex source feeds the P048 table, so the use
+        // diagnoses with the `RegExp` spelling while the source stays
+        // silent (the P060 flip of the pre-existing source note).
+        let binder = binder_with(&[("r", span(0, 10)), ("s", span(11, 21))]);
+        let decls = [
+            literal_source("r", 0, 10, InitKind::RegExp),
+            ident_use("s", 11, 21, "string", "r"),
+        ];
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(report.diagnostics[0].span, span(11, 21));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'RegExp' is not assignable to type 'string'."
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn regexp_against_enum_diagnoses() {
+        // `const a: Color = /x/` (probe `e-color`): enums spell the same
+        // compositional `TS2322` as primitives, so regex diagnoses here.
+        let binder = binder_with(&[("Color", span(0, 5)), ("a", span(6, 16))]);
+        let shape = color_shape(&binder);
+        let input = EnumInput {
+            enums: &[shape],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let decls = [enum_decl_for("a", 6, 16, "Color", InitKind::RegExp, None)];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'RegExp' is not assignable to type 'Color'."
         );
         assert!(report.unsupported.is_empty());
     }
