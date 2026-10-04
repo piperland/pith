@@ -46,11 +46,12 @@ Call-site arity checking is FUTURE (needs call facts).
 | straight-nested-block.ts | 1x TS2322 | 1x PITH2322 (blocks flattened) |
 | straight-object-inner.ts | 1x TS2322 | 1x PITH2322 (object path) |
 | straight-unannotated-cast.ts | 1x TS2352 | 1x PITH2352 (operand span) |
-| straight-identifier-init.ts | 1x TS2322 | silent + 1 UNSUPPORTED (pinned divergence) |
+| straight-identifier-init.ts | 1x TS2322 | 1x PITH2322 (propagation — first flip) |
+| straight-let-init-declined.ts | 1x TS2322 | silent + 1 UNSUPPORTED (`let` never propagates) |
 
-Differential: 8/8 match-or-pin on the straight subset (7 diagnostic/silent
-pairs + 1 pinned oracle-error divergence — identifier initializers need
-value-type facts). Still declining by design: `var`, destructured
+Differential: 9/9 match-or-pin on the straight subset (8 diagnostic/silent
+pairs + 1 pinned oracle-error divergence — `let` bindings need flow facts
+the subset refuses). Still declining by design: `var`, destructured
 bindings, deeper nesting, non-terminal returns, bodies past the four-item
 cap, and every P023-era exclusion (loops, `switch`, joins-plus-tail).
 
@@ -186,8 +187,9 @@ params admit as opaque definition-side: the annotated gate already
 accepts every annotated param, and no value-type facts about the param
 flow anywhere (H-002). Body positions touching the param ride the
 existing gates (`return p` declines whole-decl via the non-literal
-position gate; `const y: T = p` declines per-position via the `t3`
-identifier gate — both unit-pinned, never forced verdicts). Call-site
+position gate; `const y: T = p` resolves one level — primitive params
+check like their annotation (P048), the rest decline per-position —
+unit-pinned, never forced verdicts). Call-site
 args against named params decline distinctly per site (corpus-pinned in
 check-calls). Generic `T`, union, and complex param annotations decline
 exactly as before. Probes in `.agent/scratch/p046-probes/`.

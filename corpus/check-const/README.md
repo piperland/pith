@@ -20,10 +20,15 @@ annotations. Oracle baselines are tsc 7.0.2 via
 | alias-shadowed-declined.ts | clean | UNSUPPORTED (local values shadow aliases) |
 | alias-generic-declined.ts | clean | UNSUPPORTED (generic aliases never instantiate) |
 | alias-interface-declined.ts | clean | UNSUPPORTED (named shapes need the enum entry) |
+| ident-chain.ts | 1x TS2322 | 1x PITH2322 on `c`, silent on `b` (propagation) |
+| ident-cycle-declined.ts | TS2448 + TS2454 | silent + 2 UNSUPPORTED (forward, then cycle) |
+| ident-depth2-declined.ts | 1x TS2322 | silent + 1 UNSUPPORTED (single level only) |
+| ident-let-declined.ts | 1x TS2322 | silent + 1 UNSUPPORTED (top-level `let` has no facts) |
 
-Differential: 8/8 match (2 silent/clean + 6 diagnostic pairs across 6
-fixtures, code family + message shape); 6/6 out-of-subset recorded as
-UNSUPPORTED, never silent.
+Differential: 9/9 match (2 silent/clean + 7 diagnostic pairs across 7
+fixtures, code family + message shape); 9/9 out-of-subset recorded as
+UNSUPPORTED, never silent (6 oracle-clean + 3 pinned oracle-error
+divergences — cycles, depth-2+ chains, and `let` sources).
 
 Local aliases (PITH-P038): single-level expansion mirrors the P035
 imported-alias rules — alias-to-primitive/boundary rewrites the annotation

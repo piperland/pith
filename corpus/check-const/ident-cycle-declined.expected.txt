@@ -1,0 +1,2 @@
+ident-cycle-declined.ts:TS2448: Block-scoped variable 'b' used before its declaration.
+ident-cycle-declined.ts:TS2454: Variable 'b' is used before being assigned.
