@@ -160,6 +160,7 @@ fn functions_from_handfed(
                 symbol,
                 params: Vec::new(),
                 params_complex: false,
+                has_type_params: false,
                 is_async: spec.is_async,
                 return_annotation: Some(spec.return_annotation.to_owned()),
                 body: FunctionBody::SingleReturn(FunctionReturn {

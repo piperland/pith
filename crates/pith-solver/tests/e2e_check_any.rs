@@ -347,6 +347,7 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 params_complex: func.params_complex,
                 // No async fact yet (see the check-functions driver).
                 is_async: false,
+                has_type_params: !func.type_params.is_empty() || func.type_params_complex,
                 return_annotation: func.return_annotation.as_ref().map(|ann| ann.text.clone()),
                 body,
             }

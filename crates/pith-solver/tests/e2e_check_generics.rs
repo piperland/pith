@@ -251,6 +251,8 @@ fn generics_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<GenericDecl>
                     params_complex: func.params_complex,
                     // No async fact yet (see the check-functions driver).
                     is_async: false,
+                    // Genericity lives in the enclosing `GenericDecl`, never here.
+                    has_type_params: false,
                     return_annotation: func.return_annotation.as_ref().map(|ann| ann.text.clone()),
                     body,
                 },

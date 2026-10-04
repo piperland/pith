@@ -18,17 +18,23 @@
 //! Differential rule: same as check-functions — oracle lines are
 //! `file:TSNNNN: message`, compared as sorted `(numeric-code, message)`
 //! multisets (`TS2554`/`TS2555` <-> `PITH2554`/`PITH2555`, `TS2345` <->
-//! `PITH2345`) plus the unsupported count. Three fixtures diverge by design
-//! (the oracle errors where the subset declines or skips):
+//! `PITH2345`, `TS2769` <-> `PITH2769`, `TS2575` <-> `PITH2575`) plus the
+//! unsupported count. Oracle `TS2769` continuation lines (indented, no file
+//! prefix) fold into the previous message with `"\n"`, matching the
+//! solver's multi-line message. Two fixtures diverge by design (the oracle
+//! errors where the subset declines or skips):
 //! `unresolved-callee` (oracle `TS2304`, solver silent — the name is already
-//! tracked as an unresolved reference, never double-diagnosed),
-//! `overloads-declined` (oracle `TS2554`, solver one unsupported — overload
-//! resolution is future work), and `required-after-optional-declined`
-//! (oracle `TS1016` on the declaration, solver one unsupported — the solver
-//! spells no declaration diagnostics). Those pin the divergence explicitly
-//! instead of forcing a false match. Ranges, rest minima, and rest-element
-//! checks all match (P037 converted the old `rest-param-declined`
-//! divergence into a silent match).
+//! tracked as an unresolved reference, never double-diagnosed) and
+//! `required-after-optional-declined` (oracle `TS1016` on the declaration,
+//! solver one unsupported — the solver spells no declaration diagnostics).
+//! A third pins the generic exclusion: `overload-generic-declined` (oracle
+//! `TS2769`, solver one unsupported — generic signatures decline with a
+//! distinct reason). Those pin the divergence explicitly instead of forcing
+//! a false match. Overload any-match, union arities, and the gap spelling
+//! all match (P044 converted the old `overloads-declined` divergence into
+//! a `TS2554` match). Ranges, rest minima, and rest-element checks all
+//! match (P037 converted the old `rest-param-declined` divergence into a
+//! silent match).
 
 use pith_frontend::{
     parse_module, CallArgKind as FrontendCallArgKind, FunctionBodyFact, ParsedFile,
@@ -242,6 +248,7 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 params_complex: func.params_complex,
                 // No async fact yet (see the check-functions driver).
                 is_async: false,
+                has_type_params: !func.type_params.is_empty() || func.type_params_complex,
                 return_annotation: func.return_annotation.as_ref().map(|ann| ann.text.clone()),
                 body,
             }
@@ -317,18 +324,25 @@ fn run_pipeline(source: &str) -> (ParsedFile, FileReport) {
 
 /// Parses normalized oracle lines (`file:TSNNNN: message`) into sorted
 /// `(numeric-code, message)` pairs; spans/positions are already folded away.
+/// Indented continuation lines (the oracle's `TS2769` elaboration) fold into
+/// the previous message with `"\n"`, matching the solver's multi-line
+/// message exactly.
 fn parse_baseline(expected: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = expected
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let mut parts = line.splitn(3, ':');
-            let _file = parts.next().unwrap_or("");
-            let code = parts.next().unwrap_or("").trim().to_owned();
-            let message = parts.next().unwrap_or("").trim().to_owned();
-            (code, message)
-        })
-        .collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in expected.lines().filter(|line| !line.trim().is_empty()) {
+        if line.starts_with(char::is_whitespace) {
+            if let Some(last) = out.last_mut() {
+                last.1.push('\n');
+                last.1.push_str(line);
+            }
+            continue;
+        }
+        let mut parts = line.splitn(3, ':');
+        let _file = parts.next().unwrap_or("");
+        let code = parts.next().unwrap_or("").trim().to_owned();
+        let message = parts.next().unwrap_or("").trim().to_owned();
+        out.push((code, message));
+    }
     out.sort();
     out
 }
@@ -446,6 +460,30 @@ fixture_test!(
     "rest-prefix.expected.txt",
     0
 );
+fixture_test!(
+    overload_clean_calls_are_silent,
+    "overload-clean.ts",
+    "overload-clean.expected.txt",
+    0
+);
+fixture_test!(
+    overload_first_match_calls_are_silent,
+    "overload-first-match.ts",
+    "overload-first-match.expected.txt",
+    0
+);
+fixture_test!(
+    overload_wrong_all_matches_ts2769,
+    "overload-wrong-all.ts",
+    "overload-wrong-all.expected.txt",
+    0
+);
+fixture_test!(
+    overload_arity_matches_ts2554_and_ts2575,
+    "overload-arity.ts",
+    "overload-arity.expected.txt",
+    0
+);
 
 #[test]
 fn unresolved_callee_pins_ts2304_and_skips_silently() {
@@ -505,9 +543,9 @@ fn method_call_excluded_emits_no_facts_and_stays_silent() {
 }
 
 #[test]
-fn overloads_declined_pins_ts2554() {
-    // Overload resolution is future work: tsc reports `TS2554` while the
-    // solver declines with one unsupported note.
+fn overloads_resolve_union_arity_to_ts2554() {
+    // P044 converted the old decline into a match: both overload signatures
+    // admit exactly one argument, so two arguments union to `TS2554`.
     let source = include_str!("../../../corpus/check-calls/overloads-declined.ts");
     let expected = include_str!("../../../corpus/check-calls/overloads-declined.expected.txt");
     assert_eq!(
@@ -516,9 +554,35 @@ fn overloads_declined_pins_ts2554() {
             "TS2554".to_owned(),
             "Expected 1 arguments, but got 2.".to_owned()
         )],
+        "oracle baseline pins the union arity"
+    );
+    expect_differential(
+        "overloads_resolve_union_arity_to_ts2554",
+        source,
+        expected,
+        0,
+    );
+}
+
+#[test]
+fn overload_generic_declines_and_pins_ts2769() {
+    // Generic signatures decline with a distinct reason: tsc reports
+    // `TS2769` (elaborating the last signature) while the solver records one
+    // unsupported note — the oracle might match the excluded signature.
+    let source = include_str!("../../../corpus/check-calls/overload-generic-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/overload-generic-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2769".to_owned(),
+            "No overload matches this call.\n  The last overload gave the following error.\n    \
+            Argument of type 'boolean' is not assignable to parameter of type 'number'."
+                .to_owned()
+        )],
         "oracle baseline pins the divergence"
     );
-    let (parsed, report) = run_pipeline(source);
+    let (_, report) = run_pipeline(source);
     assert!(
         report.diagnostics.is_empty(),
         "diagnostics: {:?}",
@@ -528,14 +592,9 @@ fn overloads_declined_pins_ts2554() {
     assert!(
         report.unsupported[0]
             .reason
-            .contains("multiple declarations"),
+            .contains("generic type parameters"),
         "reason: {}",
         report.unsupported[0].reason
-    );
-    assert_eq!(
-        parsed.calls.len(),
-        1,
-        "the declined call still emits a fact"
     );
 }
 

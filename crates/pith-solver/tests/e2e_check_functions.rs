@@ -476,6 +476,7 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 // No async fact yet (the adapter emits none): every fixture
                 // here is non-async, so `false` changes nothing.
                 is_async: false,
+                has_type_params: !func.type_params.is_empty() || func.type_params_complex,
                 return_annotation: func.return_annotation.as_ref().map(|ann| ann.text.clone()),
                 body,
             }
