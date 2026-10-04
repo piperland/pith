@@ -33,15 +33,19 @@ tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs` (normalized
 | member-unknown-member.ts | 1x TS2339 (`Property 'nope' …`) | UNSUPPORTED (unknown member; full lib types out of scope) |
 | member-unknown-receiver.ts | 1x TS2304 | silent, zero member facts (tracked unresolved; never double-diagnosed) |
 | member-lib-declined.ts | clean | 4x UNSUPPORTED (range/overload/variadic lib shapes) |
+| named-param-call-declined.ts | 1x TS2345 (primitive control) | 1x PITH2345 + 1 UNSUPPORTED (opaque named param declines distinctly; oracle clean there — pinned divergence) |
+| generic-param-declined.ts | clean | silent + 1 UNSUPPORTED (generic `T` declines exactly as before — pinned divergence) |
 
 Differential: 16/16 match on the checkable direct-call subset (6
-silent/clean + 10 diagnostic groups); 3/3 divergences pinned explicitly
-(oracle errors while the solver declines or skips) — unresolved-callee
-silence (tracked once, never double-diagnosed), required-after-optional
-shapes, and generic overload signatures are acknowledged non-goals, never
-silent gaps. PITH-P044 converted the old overload decline into matches
-(any-match resolution, union arities, and the gap spelling). PITH-P037
-converted the old range/variadic declines into matches.
+silent/clean + 10 diagnostic groups); 5/5 divergences pinned explicitly
+(oracle errors while the solver declines or skips, or oracle clean while
+the solver declines) — unresolved-callee silence (tracked once, never
+double-diagnosed), required-after-optional shapes, generic overload
+signatures, opaque named-param calls, and generic `T` calls are
+acknowledged non-goals, never silent gaps. PITH-P044 converted the old
+overload decline into matches (any-match resolution, union arities, and
+the gap spelling). PITH-P037 converted the old range/variadic declines
+into matches.
 
 Member differential: 3/3 match on the checkable opaque subset (1 silent +
 2 diagnostic groups); 3/3 divergences pinned explicitly —
@@ -50,6 +54,17 @@ Member differential: 3/3 match on the checkable opaque subset (1 silent +
 unresolved), `member-lib-declined` (oracle clean, solver four
 unsupported — range/overload/variadic lib shapes are acknowledged
 non-goals, never silent gaps).
+
+## P046 named (interface/alias) params
+
+Call-site args against opaque (known interface/alias) params decline
+distinctly per site — even a matching object arg cannot verify without
+value facts, so arity never runs (the uncheckable-shape precedent).
+Generic `T`, union, and complex param annotations decline exactly as
+before (never the opaque reason). The call driver collects the scope
+from the adapter's interface/alias facts; class constructors and
+multifile calls thread an empty scope (pinned gaps — those paths keep
+today's verdicts). Probes in `.agent/scratch/p046-probes/`.
 
 Probe rules (tsc 7.0.2, recorded in `pith-solver` docs): one family per
 call site, arity beats arg types, only the first mismatched argument

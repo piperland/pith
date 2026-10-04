@@ -172,3 +172,22 @@ with distinct recorded reasons: missing terminal `else`, nested chains,
 and complex branches (unit-pinned); an `else-if` chain paired with any
 other statement stays `Complex` (the P023 `if/else`-plus-tail precedent).
 Probes in `.agent/scratch/p045-probes/`.
+
+## P046 named (interface/alias) params
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| named-param-clean.ts | clean | silent, 0 notes (interface + alias + primitive params admit as opaque) |
+| named-param-body-wrong.ts | 1x TS2322 (tail) | 1x PITH2322 |
+| named-param-unused.ts | clean | silent, 0 notes (untouched named param; leadings + tail check) |
+
+Differential: 3/3 match (2 silent/clean + 1 diagnostic pair). Named
+params admit as opaque definition-side: the annotated gate already
+accepts every annotated param, and no value-type facts about the param
+flow anywhere (H-002). Body positions touching the param ride the
+existing gates (`return p` declines whole-decl via the non-literal
+position gate; `const y: T = p` declines per-position via the `t3`
+identifier gate — both unit-pinned, never forced verdicts). Call-site
+args against named params decline distinctly per site (corpus-pinned in
+check-calls). Generic `T`, union, and complex param annotations decline
+exactly as before. Probes in `.agent/scratch/p046-probes/`.
