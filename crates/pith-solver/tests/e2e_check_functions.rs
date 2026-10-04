@@ -75,6 +75,13 @@
 //! `elseif-complex-branch-declined` (the oracle is clean where the subset
 //! declines — each pins the clean baseline plus one unsupported note with
 //! its distinct reason).
+//! Named (interface/alias) params admit as opaque (P046):
+//! `named-param-clean` (interface + alias + primitive params) and
+//! `named-param-unused` (untouched named param alongside checked positions)
+//! are silent with zero notes; `named-param-body-wrong` matches its oracle
+//! `TS2322`. No value-type facts about params flow anywhere: `return p`
+//! rides the existing non-literal position gate and `const y: T = p` the
+//! `t3` identifier gate (both unit-pinned in `pith-solver`).
 //! One fixture still diverges by design
 //! (the oracle errors where the subset declines): `unannotated-param`
 //! (oracle `TS7006`). That pins the divergence explicitly — oracle error
@@ -820,6 +827,24 @@ fixture_test!(
     elseif_two_wrong_matches_ts2322_twice,
     "elseif-two-wrong.ts",
     "elseif-two-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    named_param_clean_is_silent,
+    "named-param-clean.ts",
+    "named-param-clean.expected.txt",
+    0
+);
+fixture_test!(
+    named_param_body_wrong_matches_ts2322,
+    "named-param-body-wrong.ts",
+    "named-param-body-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    named_param_unused_is_silent,
+    "named-param-unused.ts",
+    "named-param-unused.expected.txt",
     0
 );
 

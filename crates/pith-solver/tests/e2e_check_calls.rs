@@ -30,7 +30,13 @@
 //! A third pins the generic exclusion: `overload-generic-declined` (oracle
 //! `TS2769`, solver one unsupported — generic signatures decline with a
 //! distinct reason). Those pin the divergence explicitly instead of forcing
-//! a false match. Overload any-match, union arities, and the gap spelling
+//! a false match. Named (interface/alias) params decline distinctly (P046):
+//! `named-param-call-declined` (matching object arg, clean in tsc) records
+//! one unsupported note with the opaque reason while the primitive control
+//! still diagnoses; `generic-param-declined` pins the legacy `T` decline
+//! against a clean oracle. The named scope is driver-collected from the
+//! adapter's interface/alias facts (names only — opaque reads nothing
+//! else). Overload any-match, union arities, and the gap spelling
 //! all match (P044 converted the old `overloads-declined` divergence into
 //! a `TS2554` match). Ranges, rest minima, and rest-element checks all
 //! match (P037 converted the old `rest-param-declined` divergence into a
@@ -42,8 +48,9 @@ use pith_frontend::{
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_solver::{
-    check_calls, CallArg, CallSite, FileReport, FunctionBody, FunctionDecl, FunctionParam,
-    FunctionReturn, InitKind, JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    check_calls, check_calls_with_named_types, CallArg, CallSite, FileReport, FunctionBody,
+    FunctionDecl, FunctionParam, FunctionReturn, InitKind, JoinedReturns, NamedTypeScope,
+    ObjectInit, ObjectMemberInit, ObjectMemberKind,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -321,6 +328,32 @@ fn run_pipeline(source: &str) -> (ParsedFile, FileReport) {
     let decls = functions_from_facts(&parsed, &binder);
     let calls = calls_from_facts(&parsed);
     let report = check_calls(FILE, &decls, &calls, &binder);
+    (parsed, report)
+}
+
+/// Runs the full real pipeline with the file's named types in scope:
+/// interface and alias names driver-collected from the adapter's
+/// interface/alias facts (opaque means only names are ever read — no
+/// member or target facts flow, mirroring the zero-hand-feeding rule).
+fn run_pipeline_named(source: &str) -> (ParsedFile, FileReport) {
+    let parsed = parse_module(FILE, "fixture.ts", source);
+    let frontend_errors = &parsed.errors;
+    assert!(
+        parsed.errors.is_empty(),
+        "frontend errors: {frontend_errors:?}"
+    );
+    let binder = build_binder(&parsed);
+    let decls = functions_from_facts(&parsed, &binder);
+    let calls = calls_from_facts(&parsed);
+    let mut owned: Vec<String> = parsed
+        .interfaces
+        .iter()
+        .map(|interface| interface.name.clone())
+        .collect();
+    owned.extend(parsed.aliases.iter().map(|alias| alias.name.clone()));
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let scope = NamedTypeScope { names: &refs };
+    let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
     (parsed, report)
 }
 
@@ -633,6 +666,62 @@ fn required_after_optional_declines_and_pins_ts1016() {
             .contains("follows an optional parameter"),
         "reason: {}",
         report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn named_param_call_declines_distinctly_and_pins_ts2345() {
+    // P046: the `show` call (matching object arg, clean in tsc — probed
+    // 7.0.2 `d`) declines distinctly instead of checking, while the
+    // primitive control still diagnoses `TS2345`.
+    let source = include_str!("../../../corpus/check-calls/named-param-call-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/named-param-call-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2345".to_owned(),
+            "Argument of type 'string' is not assignable to parameter of type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the primitive control"
+    );
+    let (_, report) = run_pipeline_named(source);
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].code, "PITH2345");
+    assert_eq!(
+        report.diagnostics[0].message,
+        "Argument of type 'string' is not assignable to parameter of type 'number'."
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("opaque named type"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+    assert_eq!(report.unsupported[0].file, FILE);
+    assert!(report.unsupported[0].span.lo < report.unsupported[0].span.hi);
+}
+
+#[test]
+fn generic_param_call_declines_as_before_and_pins_clean_oracle() {
+    // P046 regression guard: `T` never takes the opaque reason — the call
+    // declines with the legacy wording while tsc is clean (probed 7.0.2).
+    let source = include_str!("../../../corpus/check-calls/generic-param-declined.ts");
+    let expected = include_str!("../../../corpus/check-calls/generic-param-declined.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on the generic call"
+    );
+    let (_, report) = run_pipeline_named(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason,
+        "call to 'identity': parameter type 'T' for 'x' is outside the subset"
     );
 }
 
