@@ -1,2 +1,2 @@
-// Solver verdict: UNSUPPORTED (unannotated consts need inference).
+// Solver verdict: silent (P060: the unannotated literal kind infers; tsc silent).
 const inferred = 1;

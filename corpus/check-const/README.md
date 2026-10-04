@@ -12,7 +12,7 @@ annotations. Oracle baselines are tsc 7.0.2 via
 | mismatch-boolean.ts | 1x TS2322 | 1x PITH2322 |
 | unknown-annotation.ts | 1x TS2304 | 1x PITH2304 (message identical to tsc) |
 | union-annotation.ts | clean | UNSUPPORTED (union outside subset) |
-| no-annotation.ts | clean | UNSUPPORTED (inference outside subset) |
+| no-annotation.ts | clean | silent (P060: the unannotated literal kind infers) |
 | multi-declarator.ts | 1x TS2322 | 1x PITH2322 on `third` |
 | alias-primitive-correct.ts | clean | silent (primitive aliases check like targets) |
 | alias-primitive-wrong.ts | 1x TS2322 | 1x PITH2322 spelling the target |
@@ -67,3 +67,25 @@ expression facts). Union elaboration detail lines are stripped from
 baselines: the differential compares diagnostic headers (the solver's
 message contract is first-line, like every existing fixture). Probes in
 `.agent/scratch/p051-probes/`.
+
+## P060 widened-kind inference for unannotated consts
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| no-annotation.ts | clean | silent (P060 flip: the literal kind infers) |
+| unannotated-null-undefined-silent.ts | clean | silent (`null`/`undefined` infer) |
+| unannotated-regex-silent.ts | clean | silent (`RegExp` infers) |
+| regex-mismatch.ts | 2x TS2322 (`RegExp`) | 2x PITH2322 (mismatches spell `RegExp`) |
+| regex-annotation-declined.ts | clean + 1x TS2322 | 2 UNSUPPORTED (`: RegExp` lib-declined, pinned) |
+| unannotated-array-declined.ts | clean | 1 UNSUPPORTED (pinned oracle-clean divergence: no shape inference) |
+| unannotated-object-declined.ts | clean | 1 UNSUPPORTED (pinned oracle-clean divergence: no shape inference) |
+
+Differential: 7/7 match-or-pin (4 silent/diagnostic pairs + 3 pinned
+divergences — 2 oracle-clean where unannotated shapes keep the historical
+decline, 1 oracle-error where the oracle checks a `: RegExp` mismatch the
+subset refuses to spell). Only unannotated-literal pins flip (the
+`no-annotation` fixture, three unit asserts — two P048 source notes plus
+the merged-pair delegation note — one converted out-of-subset shape, and
+one interfaces-differential count);
+unannotated `let`/array/object/call/spread/index/destructured verdicts stay
+byte-identical. Probes in `.agent/scratch/p060-probes/`.

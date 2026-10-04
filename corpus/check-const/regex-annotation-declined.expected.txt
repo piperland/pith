@@ -1,0 +1,1 @@
+regex-annotation-declined.ts:TS2322: Type 'string' is not assignable to type 'RegExp'.

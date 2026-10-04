@@ -1,0 +1,2 @@
+regex-mismatch.ts:TS2322: Type 'RegExp' is not assignable to type 'string'.
+regex-mismatch.ts:TS2322: Type 'RegExp' is not assignable to type 'number'.
