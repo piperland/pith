@@ -134,6 +134,12 @@
 //! only: tsc elaborates const-position unions with an indented detail line
 //! that the header-only differential (and the solver's first-line message
 //! contract) excludes — see the check-const P051 section.
+//! Ambient declarations (P063) carry no body to check: `ambient-declared-declined`
+//! (one `declare function`) pins the clean baseline plus one unsupported
+//! note, `ambient-overload-declared-declined` (two ambient signatures) pins
+//! the clean baseline plus two notes, and `ts2391-impl-less-declined` pins
+//! the oracle `TS2391` plus two notes — never a declaration diagnostic for
+//! the missing body.
 
 use pith_frontend::{
     parse_module, CastFact as FrontendCastFact, CastKind as FrontendCastKind,
@@ -1905,6 +1911,52 @@ fn pipeline_is_deterministic_across_runs() {
     let (_, first) = run_pipeline(source);
     let (_, second) = run_pipeline(source);
     assert_eq!(first, second);
+}
+
+fixture_test!(
+    ambient_declared_declines_with_note,
+    "ambient-declared-declined.ts",
+    "ambient-declared-declined.expected.txt",
+    1
+);
+fixture_test!(
+    ambient_overload_declared_declines_per_signature,
+    "ambient-overload-declared-declined.ts",
+    "ambient-overload-declared-declined.expected.txt",
+    2
+);
+
+#[test]
+fn ts2391_impl_less_declines_declaration_diagnostic() {
+    // P063: the subset spells no declaration diagnostics — tsc reports
+    // `TS2391` on the missing implementation while the solver records one
+    // unsupported note per signature and stays silent.
+    let source = include_str!("../../../corpus/check-functions/ts2391-impl-less-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-functions/ts2391-impl-less-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2391".to_owned(),
+            "Function implementation is missing or not immediately following the declaration."
+                .to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 2);
+    for note in &report.unsupported {
+        assert!(
+            note.reason.contains("has no body to check"),
+            "reason: {}",
+            note.reason
+        );
+    }
 }
 
 #[test]

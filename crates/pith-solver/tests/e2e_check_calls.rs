@@ -53,7 +53,18 @@
 //! all match (P044 converted the old `overloads-declined` divergence into
 //! a `TS2554` match). Ranges, rest minima, and rest-element checks all
 //! match (P037 converted the old `rest-param-declined` divergence into a
-//! silent match).
+//! silent match). Ambient declarations (P063) check through the same paths:
+//! single `declare function` sites (`ambient-clean`/`wrong-type`/`too-few`/
+//! `too-many`) and ambient overload groups (`ambient-overload-clean`/
+//! `wrong`) match their oracle families with zero unsupported, while
+//! `ts2391-impl-less-group` (oracle `TS2391` on the declaration plus
+//! `TS2769` on the call — solver one `PITH2769`, never a declaration
+//! diagnostic), `overload-impl-excluded` (the implementation signature
+//! never participates — solver one `PITH2345` like the oracle),
+//! `ambient-overload-generic-declined` (generic exclusion against a clean
+//! oracle), and `non-callable-ambient-declined` (oracle `TS2349`, solver
+//! one unsupported with the no-signature reason) pin their divergences
+//! explicitly.
 
 use pith_frontend::{
     parse_module, CallArgFact as FrontendCallArg, CallArgKind as FrontendCallArgKind,
@@ -857,6 +868,145 @@ fn required_after_optional_declines_and_pins_ts1016() {
             .contains("follows an optional parameter"),
         "reason: {}",
         report.unsupported[0].reason
+    );
+}
+
+fixture_test!(
+    ambient_clean_calls_are_silent,
+    "ambient-clean.ts",
+    "ambient-clean.expected.txt",
+    0
+);
+fixture_test!(
+    ambient_wrong_type_matches_ts2345,
+    "ambient-wrong-type.ts",
+    "ambient-wrong-type.expected.txt",
+    0
+);
+fixture_test!(
+    ambient_too_few_matches_ts2554,
+    "ambient-too-few.ts",
+    "ambient-too-few.expected.txt",
+    0
+);
+fixture_test!(
+    ambient_too_many_matches_ts2554,
+    "ambient-too-many.ts",
+    "ambient-too-many.expected.txt",
+    0
+);
+fixture_test!(
+    ambient_overload_clean_calls_are_silent,
+    "ambient-overload-clean.ts",
+    "ambient-overload-clean.expected.txt",
+    0
+);
+fixture_test!(
+    ambient_overload_wrong_all_matches_ts2769,
+    "ambient-overload-wrong.ts",
+    "ambient-overload-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    overload_impl_excluded_matches_ts2345,
+    "overload-impl-excluded.ts",
+    "overload-impl-excluded.expected.txt",
+    0
+);
+
+#[test]
+fn ambient_overload_generic_declines_and_pins_clean_oracle() {
+    // P063: the generic ambient signature rides the existing exclusion —
+    // the first call stays silent through the remaining checkable signature
+    // while the second records one unsupported note (the oracle instantiates
+    // `T` and stays clean on both — pinned divergence, never a forced
+    // `TS2769`).
+    let source = include_str!("../../../corpus/check-calls/ambient-overload-generic-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/ambient-overload-generic-declined.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on both calls"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("generic type parameters"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn ts2391_impl_less_group_resolves_calls_and_pins_ts2391() {
+    // P063: calls over an implementation-less group still resolve by
+    // any-match (one `PITH2769` on the wrong call) while the oracle's
+    // `TS2391` on the declaration stays declined — the solver spells no
+    // declaration diagnostics.
+    let source = include_str!("../../../corpus/check-calls/ts2391-impl-less-group.ts");
+    let expected = include_str!("../../../corpus/check-calls/ts2391-impl-less-group.expected.txt");
+    let last_error = concat!(
+        "No overload matches this call.\n",
+        "  The last overload gave the following error.\n",
+        "    Argument of type 'boolean' is not assignable to parameter of type 'string'."
+    );
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            (
+                "TS2391".to_owned(),
+                "Function implementation is missing or not immediately following the declaration."
+                    .to_owned()
+            ),
+            ("TS2769".to_owned(), last_error.to_owned()),
+        ],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].code, "PITH2769");
+    assert_eq!(report.diagnostics[0].message, last_error);
+    assert!(
+        report.unsupported.is_empty(),
+        "unsupported: {:?}",
+        report.unsupported
+    );
+}
+
+#[test]
+fn non_callable_ambient_declines_distinctly_and_pins_ts2349() {
+    // P063: `declare const` binds the name with no function signature — tsc
+    // spells `TS2349` (plus a lib-spelled continuation) while the solver
+    // records one unsupported note with its own reason (never a forced
+    // verdict, never the undeclared-name skew).
+    let source = include_str!("../../../corpus/check-calls/non-callable-ambient-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/non-callable-ambient-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2349".to_owned(),
+            "This expression is not callable.\n  Type 'Number' has no call signatures.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason,
+        "call to 'nc': the name declares no function signature: outside the subset"
     );
 }
 
