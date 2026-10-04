@@ -83,6 +83,16 @@
 //! straight bodies holding at least one `throw`
 //! ([`FunctionBodyFact::StraightThrow`], throws skipped while leading and
 //! tail positions check — a lone `throw` is the empty, tail-less form).
+//! P049 void-effect bodies: a lone effect-call statement
+//! ([`FunctionBodyFact::EffectOnly`], the call emits no verdict solver-side
+//! — only P024 allowlist member calls with admitted arity check silently,
+//! probed tsc 7.0.2), and an `if`-without-`else` guard arm holding exactly
+//! one effect call plus a bare `return` with a trailing `return`
+//! ([`FunctionBodyFact::GuardEffect`], the arm emits nothing while the tail
+//! checks like any other return — void-ish annotations only, probed tsc
+//! 7.0.2). Malformed effect arms (a `throw`, several effect calls, a valued
+//! arm return) are [`FunctionBodyFact::EffectUnsupported`] with the recorded
+//! reason; every other effect shape keeps [`FunctionBodyFact::Complex`].
 //! Bodies without a node are
 //! [`FunctionBodyFact::NoBody`], statement-less bodies are
 //! [`FunctionBodyFact::Empty`], and everything else (longer/multi-path
@@ -689,6 +699,30 @@ pub struct InnerDeclFact {
     pub members: Option<Vec<ReturnMemberFact>>,
 }
 
+/// One effect call's allowlist-membership facts: who is called plus how
+/// many arguments travel (arity-only — argument literal kinds never ride:
+/// effect calls emit no verdict, so `console.warn` templated arguments need
+/// no literal facts, probed tsc 7.0.2 P049).
+///
+/// `receiver` is `Some` for `console.warn(...)`-shaped member calls and
+/// `None` for direct `helper(...)` calls; `member` names the member or the
+/// direct callee. Only shape-eligible calls record (plain-identifier
+/// callees, static non-optional members on plain-identifier receivers, no
+/// spreads — the P024 emission gates): anything else keeps the body
+/// [`FunctionBodyFact::Complex`], never a wrong fact. Allowlist membership
+/// itself is solver-side (P024 tables over these names); the frontend never
+/// allowlists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectCallFact {
+    /// Receiver name as written (`Some("console")` above); `None` for
+    /// direct calls.
+    pub receiver: Option<String>,
+    /// Member name as written (`warn` above), or the direct callee name.
+    pub member: String,
+    /// Argument count (spreads never reach facts, so the count is exact).
+    pub arg_count: u32,
+}
+
 /// Body shape of one function declaration.
 ///
 /// Only [`FunctionBodyFact::SingleReturn`], the P023 joins
@@ -699,7 +733,9 @@ pub struct InnerDeclFact {
 /// ([`FunctionBodyFact::TryCatch`]), the P040 switch bodies
 /// ([`FunctionBodyFact::Switch`]), the P041 counted-`for` bodies
 /// ([`FunctionBodyFact::CountedFor`]), and the P043 throw bodies
-/// ([`FunctionBodyFact::GuardThrow`], [`FunctionBodyFact::StraightThrow`])
+/// ([`FunctionBodyFact::GuardThrow`], [`FunctionBodyFact::StraightThrow`]),
+/// and the P049 void-effect bodies ([`FunctionBodyFact::EffectOnly`],
+/// [`FunctionBodyFact::GuardEffect`])
 /// feed the solver; every other shape declines to a solver `UnsupportedDecl`
 /// with a distinct reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -873,6 +909,38 @@ pub enum FunctionBodyFact {
         /// The terminal `return`'s expression facts, when present (a
         /// terminal `throw` leaves no tail to check).
         tail: Option<SingleReturnFact>,
+    },
+    /// A lone effect-call statement (`console.warn("x");`): the call emits
+    /// no verdict solver-side (probed tsc 7.0.2 P049 — the call still
+    /// type-checks in tsc, so only allowlist member calls with admitted
+    /// arity check silently there; everything else declines solver-side
+    /// with a distinct reason, never a forced verdict).
+    EffectOnly {
+        /// The call's receiver/member (or direct callee) plus arg count.
+        call: EffectCallFact,
+    },
+    /// Exactly two statements, `if (c) { <effect call>; return; }` with no
+    /// `else` plus a trailing `return` (valued or bare): the arm emits
+    /// nothing solver-side while the tail checks like any other return
+    /// (probed tsc 7.0.2 P049). Only void-ish (`void`/`undefined`/`any`)
+    /// functions admit the shape solver-side — tsc checks the bare arm
+    /// return against the annotation (`TS2322` under any other annotation),
+    /// so those decline with a distinct reason instead of mis-skipping.
+    GuardEffect {
+        /// The guard arm's call (receiver/member plus arg count).
+        call: EffectCallFact,
+        /// The trailing `return`'s expression facts (`None` for a bare
+        /// trailing `return;`, which checks trivially under void-ish
+        /// annotations).
+        tail: Option<SingleReturnFact>,
+    },
+    /// An effect shape outside the checkable [`FunctionBodyFact::EffectOnly`]
+    /// and [`FunctionBodyFact::GuardEffect`] forms. The solver declines
+    /// with `reason` verbatim — never a partial verdict over the tail.
+    EffectUnsupported {
+        /// Why the effect shape is outside the subset (a `throw` in the
+        /// guard arm, several effect calls, or a valued arm return).
+        reason: String,
     },
     /// A body with no statements (directives do not count).
     Empty,
@@ -2249,6 +2317,13 @@ fn return_members(
 /// [`FunctionBodyFact::GuardThrow`], and straight bodies holding at least
 /// one `throw` (throws skipped, other positions check — a lone `throw` is
 /// the empty, tail-less form) into [`FunctionBodyFact::StraightThrow`].
+/// P049 void-effect bodies classify two ways: a lone effect-call statement
+/// into [`FunctionBodyFact::EffectOnly`], and an `if`-without-`else` guard
+/// arm holding exactly one effect call plus a bare `return` with a trailing
+/// `return` (valued or bare) into [`FunctionBodyFact::GuardEffect`].
+/// Malformed effect arms (a `throw`, several effect calls, a valued arm
+/// return) are [`FunctionBodyFact::EffectUnsupported`] with the recorded
+/// reason; every other effect shape keeps [`FunctionBodyFact::Complex`].
 /// P039 try/catch bodies (a lone `try` statement, or a `try` statement plus
 /// a trailing literal `return`) classify into [`FunctionBodyFact::TryCatch`] or
 /// [`FunctionBodyFact::TryUnsupported`]. P040 switch bodies (a lone
@@ -2271,6 +2346,7 @@ fn function_body_fact(
     match body.statements.as_slice() {
         [] => FunctionBodyFact::Empty,
         [Statement::ReturnStatement(ret)] => single_statement_return(collector, ret),
+        [Statement::ExpressionStatement(stmt)] => effect_only_body(&stmt.expression),
         [Statement::IfStatement(it)] => {
             branch_returns(collector, it).unwrap_or_else(|| else_if_chain(collector, it))
         }
@@ -2612,8 +2688,9 @@ fn straight_declarator(
 }
 
 /// Two-statement bodies beyond straight-line single returns: two sequential
-/// returns, then guard-then-tail, then guard-throw-then-tail. Anything else
-/// yields `None` (the caller marks the body [`FunctionBodyFact::Complex`]).
+/// returns, then guard-then-tail, then guard-throw-then-tail, then
+/// guard-effect-then-tail. Anything else yields `None` (the caller marks
+/// the body [`FunctionBodyFact::Complex`]).
 #[must_use]
 fn joined_pair(
     collector: &DeclCollector<'_>,
@@ -2623,6 +2700,7 @@ fn joined_pair(
     sequence_returns(collector, first, second)
         .or_else(|| guard_tail_returns(collector, first, second))
         .or_else(|| guard_throw_tail(collector, first, second))
+        .or_else(|| guard_effect_tail(collector, first, second))
 }
 
 /// Two top-level `return <expr>;` statements: tsc checks both, unreachable
@@ -2715,6 +2793,169 @@ fn guard_throw_tail(
     let tail_arg = tail.argument.as_ref()?;
     Some(FunctionBodyFact::GuardThrow {
         tail: single_return_fact(collector, tail_arg)?,
+    })
+}
+
+/// Records one effect call's allowlist-membership facts, or `None` for any
+/// other expression.
+///
+/// Parenthesized layers peel transparently (mirroring [`cast_fact`]'s
+/// transparency); only the outermost call records. Direct callees must be
+/// plain identifiers and member callees static non-optional members on
+/// plain-identifier receivers, all non-optional and spread-free (the P024
+/// emission gates minus the allowlist itself — membership is solver-side).
+/// Anything else (computed members, optional chains, chained receivers,
+/// spreads, non-call expressions) yields `None`: the caller keeps the body
+/// [`FunctionBodyFact::Complex`] instead of mis-keying.
+#[must_use]
+fn effect_call_fact(expression: &Expression<'_>) -> Option<EffectCallFact> {
+    let mut inner = expression;
+    while let Expression::ParenthesizedExpression(parenthesized) = inner {
+        inner = &parenthesized.expression;
+    }
+    let Expression::CallExpression(call) = inner else {
+        return None;
+    };
+    if call.optional || call.arguments.iter().any(Argument::is_spread) {
+        return None;
+    }
+    let arg_count = sat_u32(call.arguments.len());
+    if let Expression::Identifier(callee) = &call.callee {
+        return Some(EffectCallFact {
+            receiver: None,
+            member: callee.name.to_string(),
+            arg_count,
+        });
+    }
+    let Expression::StaticMemberExpression(member) = &call.callee else {
+        return None;
+    };
+    if member.optional {
+        return None;
+    }
+    let Expression::Identifier(object) = &member.object else {
+        return None;
+    };
+    Some(EffectCallFact {
+        receiver: Some(object.name.to_string()),
+        member: member.property.name.to_string(),
+        arg_count,
+    })
+}
+
+/// A lone effect-call statement body (P049): the call emits no verdict
+/// solver-side while only allowlist member calls admit there (probed tsc
+/// 7.0.2). Non-call statements keep [`FunctionBodyFact::Complex`] (the
+/// straight-body fallthrough admits no expression statement, so this
+/// steals nothing).
+fn effect_only_body(effect: &Expression<'_>) -> FunctionBodyFact {
+    effect_call_fact(effect).map_or(FunctionBodyFact::Complex, |call| {
+        FunctionBodyFact::EffectOnly { call }
+    })
+}
+
+/// Peels single-statement block wrappers off one guard-arm consequent (the
+/// [`is_throw`] block transparency): each layer holding exactly one
+/// statement unwraps, so `{ { warn(); return; } }` classifies like
+/// `{ warn(); return; }`. A lone non-block statement yields `None` (a
+/// braceless arm holds one statement, never a call-plus-return pair).
+#[must_use]
+fn guard_arm_statements<'a>(statement: &'a Statement<'a>) -> Option<&'a [Statement<'a>]> {
+    let mut current = statement;
+    loop {
+        let Statement::BlockStatement(block) = current else {
+            return None;
+        };
+        if block.body.len() == 1 {
+            current = &block.body[0];
+            continue;
+        }
+        return Some(block.body.as_slice());
+    }
+}
+
+/// `if (c) { <effect call>; return; }` with no `else` plus a trailing
+/// `return` (valued or bare): the arm emits nothing solver-side while the
+/// tail checks like any other return (probed tsc 7.0.2 P049). An `else`
+/// disqualifies — `if/else` with an effect branch is multi-path,
+/// [`FunctionBodyFact::Complex`].
+///
+/// Malformed arms decline with distinct reasons instead of mis-keying: a
+/// `throw` anywhere in the arm, several effect calls, or a valued arm
+/// return are [`FunctionBodyFact::EffectUnsupported`]. Anything else (a
+/// call-free arm, a call with no `return`, a misordered pair, a non-call
+/// statement, or a non-return tail) yields `None`: the caller falls through
+/// to the straight body, then [`FunctionBodyFact::Complex`] — today's
+/// behavior for all of those, so the gate steals nothing.
+#[must_use]
+fn guard_effect_tail(
+    collector: &DeclCollector<'_>,
+    first: &Statement<'_>,
+    second: &Statement<'_>,
+) -> Option<FunctionBodyFact> {
+    let Statement::IfStatement(it) = first else {
+        return None;
+    };
+    if it.alternate.is_some() {
+        return None;
+    }
+    let arm = guard_arm_statements(&it.consequent)?;
+    if arm
+        .iter()
+        .any(|statement| matches!(statement, Statement::ThrowStatement(_)))
+    {
+        return Some(FunctionBodyFact::EffectUnsupported {
+            reason: "throw statement in effect guard arm is outside the subset".to_owned(),
+        });
+    }
+    let mut calls = Vec::with_capacity(arm.len());
+    let mut bare_returns = 0u32;
+    let mut valued_returns = 0u32;
+    for statement in arm {
+        match statement {
+            Statement::ExpressionStatement(effect) => {
+                let call = effect_call_fact(&effect.expression)?;
+                calls.push(call);
+            }
+            Statement::ReturnStatement(ret) => {
+                if ret.argument.is_some() {
+                    valued_returns = valued_returns.saturating_add(1);
+                } else {
+                    bare_returns = bare_returns.saturating_add(1);
+                }
+            }
+            _ => return None,
+        }
+    }
+    if calls.len() > 1 {
+        return Some(FunctionBodyFact::EffectUnsupported {
+            reason: "several effect calls in guard arm are outside the subset".to_owned(),
+        });
+    }
+    let [call] = calls.as_slice() else {
+        return None;
+    };
+    if valued_returns > 0 {
+        return Some(FunctionBodyFact::EffectUnsupported {
+            reason: "valued return in effect guard arm is outside the subset".to_owned(),
+        });
+    }
+    if bare_returns != 1 || arm.len() != 2 {
+        return None;
+    }
+    let Statement::ExpressionStatement(_) = &arm[0] else {
+        return None;
+    };
+    let Statement::ReturnStatement(tail) = second else {
+        return None;
+    };
+    let tail = match tail.argument.as_ref() {
+        None => None,
+        Some(argument) => Some(single_return_fact(collector, argument)?),
+    };
+    Some(FunctionBodyFact::GuardEffect {
+        call: call.clone(),
+        tail,
     })
 }
 
@@ -5748,9 +5989,18 @@ export function f(a: string): string { return a + b; }
             names,
             ["multi", "branch", "bare", "silent", "ident", "outer", "inner"]
         );
-        for fact in pf.functions.iter().skip(2).take(2) {
+        for fact in pf.functions.iter().skip(2).take(1) {
             assert_eq!(fact.body, FunctionBodyFact::Complex);
         }
+        // P049: a lone allowlist effect call admits silently (zero
+        // positions) instead of declining Complex — `console.log` rides
+        // the P024 allowlist, so `silent` checks while `bare` declines.
+        let FunctionBodyFact::EffectOnly { call } = &pf.functions[3].body else {
+            panic!("expected effect-only, got {:?}", pf.functions[3].body);
+        };
+        assert_eq!(call.receiver.as_deref(), Some("console"));
+        assert_eq!(call.member.as_str(), "log");
+        assert_eq!(call.arg_count, 1);
         // Two sequential returns classify (each checks independently
         // solver-side): literal kinds plus exact expression spans.
         let FunctionBodyFact::SequenceReturns { first, second } = &pf.functions[0].body else {
@@ -6333,6 +6583,82 @@ export function f(a: string): string { return a + b; }
         for fact in &pf.functions {
             assert_eq!(fact.body, FunctionBodyFact::Complex);
         }
+    }
+
+    #[test]
+    fn function_facts_effect_bodies_classify() {
+        // A lone allowlist-shaped member call records receiver/member plus
+        // the arg count (no arg kinds — effects emit no verdict); a lone
+        // direct call records no receiver; a guard arm with one effect
+        // call plus a bare return records the call with the tail.
+        let src = "function warn(key: string): void {\n  console.warn(key);\n}\n\
+                    function helper(key: string): void {\n  helper(key);\n}\n\
+                    function guarded(drop: boolean): void {\n  if (drop) {\n\
+                    console.warn(\"x\");\n    return;\n  }\n  return;\n}\n";
+        let pf = parse_module(FileId(0), "e.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 3);
+        let FunctionBodyFact::EffectOnly { call } = &pf.functions[0].body else {
+            panic!("expected effect only, got {:?}", pf.functions[0].body);
+        };
+        assert_eq!(call.receiver.as_deref(), Some("console"));
+        assert_eq!(call.member, "warn");
+        assert_eq!(call.arg_count, 1);
+        let FunctionBodyFact::EffectOnly { call } = &pf.functions[1].body else {
+            panic!("expected effect only, got {:?}", pf.functions[1].body);
+        };
+        assert_eq!(call.receiver, None);
+        assert_eq!(call.member, "helper");
+        assert_eq!(call.arg_count, 1);
+        let FunctionBodyFact::GuardEffect { call, tail } = &pf.functions[2].body else {
+            panic!("expected guard effect, got {:?}", pf.functions[2].body);
+        };
+        assert_eq!(call.receiver.as_deref(), Some("console"));
+        assert_eq!(call.member, "warn");
+        assert!(tail.is_none(), "bare trailing return parks no facts");
+    }
+
+    #[test]
+    fn function_facts_effect_malformed_arms_decline() {
+        // A throw in the arm, several effect calls, and a valued arm return
+        // each decline with a distinct recorded reason; a call with no
+        // return and a non-call statement keep Complex (today's behavior).
+        let src = "function thrown(drop: boolean): void {\n  if (drop) {\n\
+                    console.warn(\"x\");\n    throw new Error(\"y\");\n  }\n  return;\n}\n\
+                    function twice(drop: boolean): void {\n  if (drop) {\n\
+                    console.warn(\"a\");\n    console.warn(\"b\");\n    return;\n  }\n\
+                    return;\n}\n\
+                    function valued(drop: boolean): number {\n  if (drop) {\n\
+                    console.warn(\"x\");\n    return 1;\n  }\n  return 2;\n}\n\
+                    function noreturn(drop: boolean): number {\n  if (drop) {\n\
+                    console.warn(\"x\");\n  }\n  return 1;\n}\n\
+                    function assign(drop: boolean): number {\n  if (drop) {\n\
+                    drop = false;\n    return;\n  }\n  return 1;\n}\n";
+        let pf = parse_module(FileId(0), "m.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 5);
+        let reasons: Vec<&str> = pf.functions[..3]
+            .iter()
+            .map(|fact| {
+                let FunctionBodyFact::EffectUnsupported { reason } = &fact.body else {
+                    panic!("expected effect decline, got {:?}", fact.body);
+                };
+                reason.as_str()
+            })
+            .collect();
+        assert!(reasons[0].contains("throw"), "throw reason: {}", reasons[0]);
+        assert!(
+            reasons[1].contains("several"),
+            "multi-call reason: {}",
+            reasons[1]
+        );
+        assert!(
+            reasons[2].contains("valued"),
+            "valued reason: {}",
+            reasons[2]
+        );
+        assert_eq!(pf.functions[3].body, FunctionBodyFact::Complex);
+        assert_eq!(pf.functions[4].body, FunctionBodyFact::Complex);
     }
 
     #[test]
