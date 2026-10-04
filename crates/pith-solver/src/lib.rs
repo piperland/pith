@@ -271,6 +271,36 @@
 //!   [`FunctionBody::Complex`] — today's behavior, so longer bodies like
 //!   `isPlainObject` and destr's main `destr` keep their exact reasons.
 //!
+//! Sequential guard-return chains (P050, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p050-probes/`):
+//!
+//! - N consecutive `if (c) return X;` guards with no `else` (at least two —
+//!   a lone guard plus straight-line code keeps [`FunctionBody::Complex`],
+//!   probe `e` shape) plus a terminal valued `return` is clean when every
+//!   position is (probe `a`); a wrong guard reports one `TS2322` at its own
+//!   position (probe `b`: the second guard) and a wrong tail one at the tail
+//!   (probe `c`), and two wrong positions report twice (probe `g`) — each
+//!   position checks independently through the same synthetic delegation as
+//!   joins (no fixpoint, single pass). Any condition qualifies (the P023
+//!   precedent — conditions never narrow, so member-call and `in`-operator
+//!   tests guard exactly like plain ones).
+//! - Guards without a tail decline (probed `d`: tsc spells `TS2366` — the
+//!   subset has no declaration-completeness family, so the checkable guards
+//!   stay silent plus one note, like the missing `else`/`default`), as do
+//!   non-guard statements breaking the run (probed `e`: clean in tsc —
+//!   pinned oracle-clean divergence), complex guards (an `if` that is not a
+//!   valued-return guard, probe `h`: clean in tsc — same pinned divergence),
+//!   and bare tails — each with a distinct reason, never a partial verdict
+//!   over the remaining positions. Unrepresentable tails keep
+//!   [`FunctionBody::Complex`] (the single-return precedent).
+//! - Guard-effect ident tails compose with P048 (probe `f`): `return key`
+//!   over a primitively annotated parameter resolves one level and checks
+//!   like a literal, so `: void` diagnoses `TS2322` exactly like tsc while
+//!   `: any` stays silent. Only guard-effect tails feed
+//!   [`FunctionReturn::init_ident`] — every other return position keeps its
+//!   historical path (notably `return p`'s whole-decl non-literal decline,
+//!   and the used catch binding's arm gate).
+//!
 //! Else-if chains (P045, probed on tsc 7.0.2 `--strict --pretty false`;
 //! probes in `.agent/scratch/p045-probes/`):
 //!
@@ -1224,6 +1254,15 @@ pub struct FunctionParam {
 pub struct FunctionReturn {
     /// Literal kind; `None` iff the return is an object or array literal.
     pub kind: Option<InitKind>,
+    /// Referenced name when the return is a bare identifier (`None`
+    /// otherwise). P050 seam, driver-sliced from the return span exactly
+    /// like [`ConstDecl::init_ident`] (the adapter emits no identifier facts
+    /// for returns either): only guard-effect tails feed `Some` — every
+    /// other position feeds `None` and keeps its historical path — so the
+    /// name rides the synthetic [`ConstDecl`] into [`check_one`], resolving
+    /// one level through the P048 table (unresolvable names ride the
+    /// existing per-position decline there, never a forced verdict).
+    pub init_ident: Option<String>,
     /// Object-literal members when the return is `{ ... }`; `None` otherwise.
     pub init_object: Option<ObjectInit>,
     /// Array-literal members when the return is `[ ... ]`; `None` otherwise.
@@ -1310,7 +1349,8 @@ pub struct StraightBody {
 /// [`FunctionBody::StraightThrow`] leadings (plus the optional tail), and
 /// the P045 [`FunctionBody::ElseIfChain`] per branch (the `if`, each
 /// `else if`, then the terminal `else`), and the P049
-/// [`FunctionBody::GuardEffect`] tail (the guard arm emits nothing); the
+/// [`FunctionBody::GuardEffect`] tail (the guard arm emits nothing), and the
+/// P050 [`FunctionBody::GuardChain`] per guard plus the tail; the
 /// rest decline to [`UnsupportedDecl`] with distinct reasons.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionBody {
@@ -1323,6 +1363,13 @@ pub enum FunctionBody {
     /// plus a trailing `return <expr>;`: tsc checks the guard-branch return
     /// and the tail return independently (probed 7.0.2).
     GuardReturn(JoinedReturns),
+    /// N consecutive `if (c) return <expr>;` guards with no `else` (at least
+    /// two) plus a terminal `return`: tsc checks each position independently
+    /// (probed 7.0.2 P050). Each position delegates through its own
+    /// synthetic [`ConstDecl`] with its own occurrence node, exactly like
+    /// the P023 joins (no fixpoint, single pass — any condition qualifies,
+    /// so guards carry no condition facts).
+    GuardChain(GuardChainBody),
     /// Exactly one statement, `if (c) { return A; } else { return B; }`:
     /// tsc checks each branch return independently (probed 7.0.2).
     BranchReturns(JoinedReturns),
@@ -1427,6 +1474,15 @@ pub enum FunctionBody {
     /// chain, or a complex branch). Shaping declines with the reason
     /// verbatim — never a partial verdict.
     ElseIfUnsupported {
+        /// Frontend-recorded decline reason.
+        reason: String,
+    },
+    /// A guard chain outside the checkable [`FunctionBody::GuardChain`]
+    /// shape: the frontend recorded why (a missing tail return, a non-guard
+    /// statement between the guards, a complex guard, or a bare tail).
+    /// Shaping declines with the reason verbatim — never a partial verdict
+    /// over the remaining positions.
+    GuardChainUnsupported {
         /// Frontend-recorded decline reason.
         reason: String,
     },
@@ -1603,6 +1659,26 @@ pub struct GuardEffectBody {
     /// The trailing `return`'s expression facts (`None` for a bare
     /// trailing `return;`).
     pub tail: Option<FunctionReturn>,
+}
+
+/// A checkable guard chain body (P050): one return per guard in source
+/// order plus the terminal return, each checked independently.
+///
+/// Driver-mapped from the adapter's guard-chain fact variant (mechanical
+/// field copies, each position exactly like [`FunctionReturn`]). Each
+/// position delegates through its own synthetic [`ConstDecl`] with its own
+/// occurrence node (see [`check_functions`]), so per-occurrence state stays
+/// in [`FreshnessTable`] and the [`QueryDb`] memo à la H-002, and
+/// counts/messages match tsc's per-position verdicts (no fixpoint, single
+/// pass — the P023 join semantics; any condition qualifies, so guards carry
+/// no condition facts).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardChainBody {
+    /// One `return` position per `if (c) return <expr>;` guard, in source
+    /// order (at least two — a lone guard never reaches facts).
+    pub guards: Vec<FunctionReturn>,
+    /// The terminal `return`'s expression facts.
+    pub tail: FunctionReturn,
 }
 
 /// One `function name(params): ret` declaration to check.
@@ -2534,6 +2610,15 @@ fn resolve_ident(
         return IdentResolution::Keep;
     }
     let Some(target) = binder.resolve(file, decl.scope, name) else {
+        // Unresolvable names still consult function parameters by name:
+        // params bind in a child scope the upward walk can miss, and the
+        // per-function table makes name matching scope-safe (a same-name
+        // param always wins by language semantics; anything else keeps
+        // the historical gate). Outside functions the table holds no
+        // params, so this falls through to `Keep` there.
+        if let Some(resolution) = resolve_param_source(table, name) {
+            return resolution;
+        }
         return IdentResolution::Keep;
     };
     // A resolved symbol always lives in the checking file (resolution
@@ -2804,7 +2889,8 @@ fn sort_report(report: &mut FileReport) {
 /// [`UnsupportedDecl`]. Checkable declarations (identifier params all
 /// annotated, return annotated, single literal `return`, one of the three
 /// P023 joins, a P031 straight body, a P039 try/catch, a P040 switch, a
-/// P041 counted-`for`, or a P043 guard-throw or straight-with-throw)
+/// P041 counted-`for`, a P043 guard-throw or straight-with-throw, a P045
+/// else-if chain, a P049 guard-effect, or a P050 guard chain)
 /// delegate to the same [`check_one`]
 /// path as [`check_file`]
 /// through synthetic [`ConstDecl`]s — one per return position, each with its
@@ -2983,7 +3069,7 @@ struct SynthReturn {
 /// declarators plus the tail return for P031 straight bodies, arms plus the
 /// tail for P039 try/catch, cases plus the default for P040 switch, the
 /// loop body plus the tail for P041 counted-`for`, one per branch for P045
-/// else-if chains — all in
+/// else-if chains, guards plus the tail for P050 guard chains — all in
 /// source order).
 #[derive(Debug)]
 struct ShapedBody {
@@ -3131,6 +3217,33 @@ fn shape_else_if(
             return_site(decl, effective),
         )?);
     }
+    Ok(positions)
+}
+
+/// Shapes one guard chain body for [`function_shape`]: one [`SynthReturn`]
+/// per guard in source order, then the tail — like the P023 join arms (no
+/// fixpoint, single pass; see the module-level guard-chain rules).
+/// Positions name their 1-based guard so a non-literal decline points at
+/// its guard (mirroring [`shape_else_if`]).
+fn shape_guard_chain(
+    decl: &FunctionDecl,
+    body: &GuardChainBody,
+    effective: &str,
+) -> Result<Vec<SynthReturn>, String> {
+    let mut positions = Vec::with_capacity(body.guards.len().saturating_add(1));
+    for (index, guard) in body.guards.iter().enumerate() {
+        let position = format!("guard {} return", index.saturating_add(1));
+        positions.push(shape_return(
+            guard,
+            &position,
+            return_site(decl, effective),
+        )?);
+    }
+    positions.push(shape_return(
+        &body.tail,
+        "tail return",
+        return_site(decl, effective),
+    )?);
     Ok(positions)
 }
 
@@ -3344,6 +3457,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         FunctionBody::Switch(body) => shape_switch(decl, body, &effective)?,
         FunctionBody::CountedFor(body) => shape_counted_for(decl, body, &effective)?,
         FunctionBody::ElseIfChain(body) => shape_else_if(decl, body, &effective)?,
+        FunctionBody::GuardChain(body) => shape_guard_chain(decl, body, &effective)?,
         FunctionBody::GuardThrow(body) => shape_guard_throw(decl, body, &effective)?,
         FunctionBody::StraightThrow(body) => shape_straight_throw(decl, body, &effective)?,
         FunctionBody::EffectOnly(call) => shape_effect_only(decl, call, &effective)?,
@@ -3384,6 +3498,7 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         | FunctionBody::SwitchUnsupported { reason }
         | FunctionBody::LoopUnsupported { reason }
         | FunctionBody::ElseIfUnsupported { reason }
+        | FunctionBody::GuardChainUnsupported { reason }
         | FunctionBody::EffectUnsupported { reason } => {
             return Err(reason.clone());
         }
@@ -3431,7 +3546,10 @@ fn shape_leading(inner: &InnerDecl, leading_index: usize) -> Option<SynthReturn>
 /// returns decline the whole declaration with a position-naming reason
 /// (never a partial verdict over the remaining positions). Assertion
 /// returns ride through instead: their facts evaluate solver-side in
-/// [`check_one`], so the gate must not swallow them. Object and array
+/// [`check_one`], so the gate must not swallow them — as do P050
+/// guard-effect ident tails, whose names resolve one level through the P048
+/// table in [`check_one`] (only those tails feed `init_ident`; every other
+/// position feeds `None` and keeps the historical gate). Object and array
 /// returns carry their shapes alongside (a bare `NonLiteral` kind with a
 /// shape rides into the shared contradictory path in [`check_one`]). The
 /// impossible kind/member pairs (`Some` + `Some`, `None` + `None`) pass
@@ -3442,11 +3560,11 @@ fn shape_return(
     position: &str,
     site: SynthSite,
 ) -> Result<SynthReturn, String> {
-    if body.cast.is_some() {
+    if body.cast.is_some() || body.init_ident.is_some() {
         return Ok(SynthReturn {
             site,
             kind: body.kind,
-            init_ident: None,
+            init_ident: body.init_ident.clone(),
             leading_index: None,
             init_object: body.init_object.clone(),
             init_array: body.init_array.clone(),
@@ -5630,6 +5748,8 @@ fn check_generic_decl(
         | FunctionBody::GuardThrow(_)
         | FunctionBody::ElseIfChain(_)
         | FunctionBody::ElseIfUnsupported { .. }
+        | FunctionBody::GuardChain(_)
+        | FunctionBody::GuardChainUnsupported { .. }
         | FunctionBody::EffectOnly(_)
         | FunctionBody::GuardEffect(_)
         | FunctionBody::EffectUnsupported { .. }
@@ -12801,6 +12921,7 @@ mod tests {
     fn single(kind: InitKind) -> FunctionBody {
         FunctionBody::SingleReturn(FunctionReturn {
             kind: Some(kind),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -12899,6 +13020,7 @@ mod tests {
     fn object_return(members: Vec<(&str, ObjectMemberKind)>) -> FunctionBody {
         FunctionBody::SingleReturn(FunctionReturn {
             kind: None,
+            init_ident: None,
             init_object: Some(ObjectInit {
                 members: members
                     .into_iter()
@@ -12918,6 +13040,7 @@ mod tests {
     fn lit(kind: InitKind) -> FunctionReturn {
         FunctionReturn {
             kind: Some(kind),
+            init_ident: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -12929,6 +13052,7 @@ mod tests {
     fn obj(members: Vec<(&str, ObjectMemberKind)>) -> FunctionReturn {
         FunctionReturn {
             kind: None,
+            init_ident: None,
             init_object: Some(ObjectInit {
                 members: members
                     .into_iter()
@@ -12955,6 +13079,23 @@ mod tests {
             first: guard,
             second: tail,
         })
+    }
+
+    /// A guard chain for chain tests: guards plus the tail, in order.
+    fn chain(guards: Vec<FunctionReturn>, tail: FunctionReturn) -> FunctionBody {
+        FunctionBody::GuardChain(GuardChainBody { guards, tail })
+    }
+
+    /// One bare-identifier return position for ident-tail tests: only
+    /// guard-effect tails feed `Some` (every other position feeds `None`).
+    fn ident_tail(name: &str) -> FunctionReturn {
+        FunctionReturn {
+            kind: Some(InitKind::NonLiteral),
+            init_ident: Some(name.to_owned()),
+            init_object: None,
+            init_array: None,
+            cast: None,
+        }
     }
 
     /// An if/else branch join for join tests.
@@ -13215,6 +13356,112 @@ mod tests {
         assert!(reasons[0].contains("arity"), "reason: {}", reasons[0]);
         assert!(reasons[1].contains("direct"), "reason: {}", reasons[1]);
         assert!(reasons[2].contains("TS2355"), "reason: {}", reasons[2]);
+    }
+
+    #[test]
+    fn guard_chain_checks_per_position_like_joins() {
+        // Probed tsc 7.0.2 (P050 `b`): each chain position checks
+        // independently through the same synthetic delegation as joins — a
+        // wrong second guard reports once at its own position while the
+        // other positions stay silent.
+        let binder = binder_with(&[("chained", span(0, 20))]);
+        let decls = [function(
+            "chained",
+            0,
+            20,
+            Vec::new(),
+            Some("number"),
+            chain(
+                vec![
+                    lit(InitKind::Number),
+                    lit(InitKind::String),
+                    lit(InitKind::Number),
+                ],
+                lit(InitKind::Number),
+            ),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn guard_chain_non_literal_guard_names_its_guard() {
+        // A non-literal guard declines the whole declaration with the
+        // position-naming reason (never a partial verdict over the other
+        // positions).
+        let binder = binder_with(&[("chained", span(0, 20))]);
+        let decls = [function(
+            "chained",
+            0,
+            20,
+            Vec::new(),
+            Some("number"),
+            chain(
+                vec![lit(InitKind::Number), lit(InitKind::NonLiteral)],
+                lit(InitKind::Number),
+            ),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("non-literal guard 2 return"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn guard_effect_ident_tail_resolves_param_like_literal() {
+        // V049 composition gap (probed tsc 7.0.2 P050 probe `f`): a
+        // bare-identifier guard-effect tail resolves one level through P048
+        // and checks like a literal — the string parameter against `: void`
+        // diagnoses exactly like tsc.
+        let binder = binder_with(&[("guarded", span(0, 20)), ("key", span(21, 24))]);
+        let decls = [FunctionDecl {
+            name: "guarded".to_owned(),
+            span: span(0, 20),
+            scope: 0,
+            symbol: None,
+            params: vec![FunctionParam {
+                name: "key".to_owned(),
+                annotated: true,
+                annotation: Some("string".to_owned()),
+                optional: false,
+                is_rest: false,
+            }],
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("void".to_owned()),
+            body: FunctionBody::GuardEffect(GuardEffectBody {
+                call: warn_call(),
+                tail: Some(ident_tail("key")),
+            }),
+        }];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'void'."
+        );
+        assert!(report.unsupported.is_empty());
     }
 
     #[test]
@@ -15442,6 +15689,7 @@ mod tests {
             Some("T"),
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -15613,6 +15861,7 @@ mod tests {
             Some("T"),
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::String),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -15650,6 +15899,7 @@ mod tests {
             Some("T"),
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: None,
+                init_ident: None,
                 init_object: Some(ObjectInit {
                     members: vec![ObjectMemberInit {
                         name: "v".to_owned(),
@@ -15683,6 +15933,7 @@ mod tests {
             Some("U"),
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::Number),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -15740,6 +15991,7 @@ mod tests {
                 return_annotation: Some("T".to_owned()),
                 body: FunctionBody::SingleReturn(FunctionReturn {
                     kind: Some(InitKind::NonLiteral),
+                    init_ident: None,
                     init_object: None,
                     init_array: None,
                     cast: None,
@@ -16130,6 +16382,7 @@ mod tests {
                 return_annotation: Some("A".to_owned()),
                 body: FunctionBody::SingleReturn(FunctionReturn {
                     kind: Some(InitKind::NonLiteral),
+                    init_ident: None,
                     init_object: None,
                     init_array: None,
                     cast: None,
@@ -16324,6 +16577,7 @@ mod tests {
             Some("T"),
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -16531,6 +16785,7 @@ mod tests {
         let body = || {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -16598,6 +16853,7 @@ mod tests {
         let body = || {
             FunctionBody::SingleReturn(FunctionReturn {
                 kind: Some(InitKind::NonLiteral),
+                init_ident: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
