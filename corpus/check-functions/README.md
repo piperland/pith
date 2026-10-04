@@ -246,3 +246,25 @@ guard-effect tails resolve one level through P048 and check like
 literals (the V049 composition gap — `: void` diagnoses exactly like tsc
 while `: any` stays silent). Probes in
 `.agent/scratch/p050-probes/`.
+
+## P051 ternary returns
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| ternary-return-clean.ts | clean | silent, 0 notes (arms per position) |
+| ternary-return-wrong-then.ts | 1x TS2322 (then arm) | 1x PITH2322 |
+| ternary-return-wrong-else.ts | 1x TS2322 (else arm) | 1x PITH2322 |
+| ternary-return-both-wrong.ts | 2x TS2322 | 2x PITH2322 (arms independent) |
+| ternary-return-ident.ts | 1x TS2322 (parameter arm) | 1x PITH2322 (P048 resolution) |
+| ternary-return-nested-declined.ts | 1x TS2322 (inner arm) | silent + 1 UNSUPPORTED (pinned) |
+| ternary-return-complex-declined.ts | 1x TS2322 (literal arm) | silent + 1 UNSUPPORTED (pinned) |
+| ternary-return-any-arm.ts | 1x TS2322 (literal arm) | 1x PITH2322 (accept-all arm emits nothing) |
+| ternary-return-unknown-arm.ts | 1x TS2322 (`unknown` arm) | 1x PITH2322 |
+| ternary-return-never-arm.ts | 1x TS2322 (literal arm) | 1x PITH2322 (`never` arm vanishes) |
+
+Differential: 10/10 match-or-pin (8 diagnostic/silent pairs + 2 pinned
+oracle-error divergences — nested/complex arms decline whole-declaration
+where the oracle still checks the checkable arm). Return arms diagnose at
+arm spans through dotted synthetic names; const-position joins diagnose
+once at the declaration (see the check-const P051 section). Probes in
+`.agent/scratch/p051-probes/`.

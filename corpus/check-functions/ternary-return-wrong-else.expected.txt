@@ -1,0 +1,1 @@
+ternary-return-wrong-else.ts:TS2322: Type 'string' is not assignable to type 'number'.

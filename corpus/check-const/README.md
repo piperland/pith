@@ -37,3 +37,28 @@ reasons, and local consts win over alias names (never hijack a value
 binding). Alias-to-interface/enum checks through the `check_enums` entry
 (see `crates/pith-solver/tests/e2e_check_enums_namespaces.rs`); the
 `check_file` entry used here declines those with an entry-point reason.
+
+## P051 ternary initializers
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| ternary-clean.ts | clean | silent (both literal arms check) |
+| ternary-wrong-then.ts | 1x TS2322 (`string \| number`) | 1x PITH2322 (join spells once) |
+| ternary-wrong-else.ts | 1x TS2322 (`string \| number`) | 1x PITH2322 (order never surfaces) |
+| ternary-both-wrong.ts | 1x TS2322 (`string`) | 1x PITH2322 (dedup to one name) |
+| ternary-ident-clean.ts | clean | silent (identifier arms resolve, then check) |
+| ternary-ident-agree-wrong.ts | 1x TS2322 (`number`) | 1x PITH2322 (agree path) |
+| ternary-nested-declined.ts | 1x TS2322 | silent + 1 UNSUPPORTED (pinned divergence) |
+| ternary-complex-arm-declined.ts | clean | silent + 1 UNSUPPORTED (pinned divergence) |
+| ternary-fresh-mix-declined.ts | 1x TS2322 (fresh `number \| "ok"`) | silent + 1 UNSUPPORTED (pinned divergence) |
+| ternary-any-arm-clean.ts | clean | silent (`any` absorbs the union) |
+| ternary-unknown-arm.ts | 1x TS2322 (`unknown`) | 1x PITH2322 (`unknown` absorbs the spelling) |
+| ternary-call-cond.ts | 1x TS2322 (`string \| number`) | 1x PITH2322 (conditions never narrow) |
+
+Differential: 12/12 match-or-pin (9 diagnostic/silent pairs + 3 pinned
+divergences — 2 oracle-error where the oracle still checks nested/fresh
+shapes the subset refuses to spell, 1 oracle-clean where a call arm needs
+expression facts). Union elaboration detail lines are stripped from
+baselines: the differential compares diagnostic headers (the solver's
+message contract is first-line, like every existing fixture). Probes in
+`.agent/scratch/p051-probes/`.

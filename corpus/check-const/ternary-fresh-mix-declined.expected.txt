@@ -1,0 +1,2 @@
+ternary-fresh-mix-declined.ts:TS2322: Type 'number | "ok"' is not assignable to type 'string'.
+  Type 'number' is not assignable to type 'string'.
