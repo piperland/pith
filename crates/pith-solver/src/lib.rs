@@ -577,6 +577,66 @@
 //!   `j`/`k`) decline distinctly (tsc spells `TS2349` plus `Type 'Number'
 //!   has no call signatures.` — lib wrapper names the subset never spells).
 //!
+//! Contextual typing of unannotated arrow params (P064, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p064-probes/`):
+//!
+//! - Arrows in contextually-typed positions bind their unannotated params
+//!   from the expected signature, single pass, no fixpoint: call arguments
+//!   against named (alias-to-function, single non-generic link, resolved by
+//!   name like the opaque rule) or admitted inline `(p: T, ...) => R`
+//!   parameters, and initializers (top-level consts plus straight-body
+//!   leading declarators, which ride the same synthetic delegation) against
+//!   admitted inline annotations. Admitted signatures carry only
+//!   identifier params with primitive-or-boundary types (`any`/`unknown`
+//!   bind accept-all) and a primitive-or-boundary-or-`void` return; bodies
+//!   then check through the existing delegation (each arrow gets its own
+//!   per-occurrence side-table entries à la H-002 — a distinct occurrence
+//!   node per arrow argument, the declaration node for initializer arrows).
+//!   Clean bodies stay silent (`a`, `g`, `i`, `k`, `m`, `z`); wrong bodies
+//!   diagnose once at the body span through the existing families (`b`,
+//!   `h`, `l`, `z2` spell `TS2322`; `t`, `p1`–`p3` spell `TS2322`/`TS2345`
+//!   naming the annotation or alias as written). Fewer arrow params than
+//!   expected admit positionally (`o`); `void` returns skip the body check
+//!   (the return is unobservable — probed `v2` clean) while shape gates
+//!   still run.
+//! - Declines, each with a distinct reason, never a forced verdict and
+//!   never a partial one: rest arrow params (`c`, clean in tsc), destructured
+//!   arrow params (`d`, `TS2339` in tsc), annotated arrow params (`j`, `x`
+//!   — `TS2345` in tsc, compatibility is uncheckable in-subset), extra arrow
+//!   params (`n`, `TS2345` plus `TS7006`s in tsc — context is lost),
+//!   block-bodied or object-bodied arrows (`y`, clean in tsc), curried or
+//!   otherwise complex signatures (nested function types, optional/rest/
+//!   `this`/destructured/`void`/`never`/union/complex positions — probe `s`
+//!   stays declined while tsc checks), identifier arguments against
+//!   function-typed params (`u`, clean in tsc — no value-type facts),
+//!   overload groups with any arrow argument (soundness: any-match could
+//!   claim clean through a `NonLiteral` skip without ever checking the body),
+//!   and returns-dependent inference (generic `T`-typed signatures like
+//!   probes `f`/`r`, clean in tsc — the `T` positions never admit).
+//!   Free-standing arrows decline exactly as before: unannotated-callee
+//!   call sites keep the unannotated-parameter gate (probe `w`), return
+//!   positions keep the non-literal gate (probe `v`: `TS2322` plus `TS7006`
+//!   in tsc), and unannotated const arrows keep the no-annotation note
+//!   (probe `e`: `TS7006` in tsc).
+//! - Hard gates: narrowing facts never flow into params (the body delegation
+//!   threads only [`IdentTable`] inputs plus the bound contextual params —
+//!   no narrowing environment is consulted on any arrow path); no narrowing
+//!   of any kind crosses the arrow boundary. One family per site holds:
+//!   arrow-body diagnostics stop the call positionally (first mismatch),
+//!   while decline notes never stop the walk.
+//! - Anchor notes: tsc anchors wrong members at the member name and missing
+//!   members at the literal brace, while structural call verdicts anchor at
+//!   the argument span (the P062 precedent); arrow-gate notes anchor at the
+//!   arrow span and body diagnostics at the body-expression span, so
+//!   differentials compare codes plus messages only.
+//! - Pinned gaps carried forward: alias-named annotations on the const path
+//!   keep the existing non-identifier-target decline (only the call path
+//!   threads alias tables); `check_interfaces`/`check_enums` entries keep
+//!   their own routing (function-typed annotations there keep today's
+//!   verdicts); member calls, `new` expressions aside from their shared
+//!   call tail, and generic-inference positions keep the historical
+//!   `NonLiteral` skip for arrows.
+//!
 //! Member calls on known values (P024, probed on tsc 7.0.2
 //! `--strict --pretty false`; probes in `.agent/scratch/p024-probes/`)):
 //! - The adapter emits member facts only for static member calls on a closed
@@ -1561,6 +1621,16 @@ pub struct ConstDecl {
     /// anything else is contradictory input and becomes an
     /// [`UnsupportedDecl`].
     pub init_member_ref: Option<MemberRef>,
+    /// Arrow facts when the initializer is an `=>` expression (`None`
+    /// otherwise). Hand-fed per fixture — the adapter emits no arrow facts,
+    /// so drivers feed `Some` only for direct arrow expressions (asserted
+    /// `NonLiteral` with no cast in tests; the kind stays
+    /// [`InitKind::NonLiteral`] either way, exactly like the frontend
+    /// classifies). `Some` marks a syntactic arrow, so initializers against
+    /// admitted function-typed annotations bind and check contextually (see
+    /// the module-level P064 rules) while every other position keeps its
+    /// historical path. The seam vanishes when the adapter emits the facts.
+    pub init_arrow: Option<ArrowInit>,
 }
 
 /// One function parameter: name + whether it carries a type annotation.
@@ -1688,6 +1758,13 @@ pub struct InnerDecl {
     /// it into the enum member-reference check, so leading positions
     /// resolve exactly like top-level consts.
     pub member_ref: Option<MemberRef>,
+    /// Arrow facts when the initializer is an `=>` expression (`None`
+    /// otherwise). Same hand-fed driver seam as
+    /// [`ConstDecl::init_arrow`]: the synthetic [`ConstDecl`] carries it
+    /// into [`check_one`], so leading positions against admitted
+    /// function-typed annotations bind and check contextually (see the
+    /// module-level P064 rules).
+    pub init_arrow: Option<ArrowInit>,
 }
 
 /// A straight-line body: leading declarators plus the terminal return.
@@ -3433,6 +3510,7 @@ fn check_shaped_function(run: &mut FunctionRun<'_, '_>) {
             cast: shaped_return.cast.clone(),
             init_ternary: None,
             init_member_ref: shaped_return.member_ref.clone(),
+            init_arrow: shaped_return.init_arrow.clone(),
         };
         if let Some(init) = synth.init_object.as_ref() {
             run.freshness.fresh.insert((run.file, node), init.fresh);
@@ -3547,6 +3625,10 @@ struct SynthReturn {
     /// Member-reference facts riding into the synthetic [`ConstDecl`]
     /// (return and leading positions alike).
     member_ref: Option<MemberRef>,
+    /// Arrow facts riding into the synthetic [`ConstDecl`] (leading
+    /// positions only — returns never carry arrows, so those feed `None`
+    /// and keep their historical gates).
+    init_arrow: Option<ArrowInit>,
 }
 
 /// A checkable function shape: one [`SynthReturn`] per checkable position
@@ -4026,6 +4108,7 @@ fn shape_leading(inner: &InnerDecl, leading_index: usize) -> Option<SynthReturn>
         init_array: inner.init_array.clone(),
         cast: inner.cast.clone(),
         member_ref: inner.member_ref.clone(),
+        init_arrow: inner.init_arrow.clone(),
     })
 }
 
@@ -4059,6 +4142,7 @@ fn shape_return(
             init_array: body.init_array.clone(),
             cast: body.cast.clone(),
             member_ref: body.member_ref.clone(),
+            init_arrow: None,
         });
     }
     if body.kind == Some(InitKind::NonLiteral)
@@ -4079,6 +4163,7 @@ fn shape_return(
         init_array: body.init_array.clone(),
         cast: None,
         member_ref: None,
+        init_arrow: None,
     })
 }
 
@@ -4115,6 +4200,7 @@ fn shape_ternary_arm(
         init_array: None,
         cast: None,
         member_ref: None,
+        init_arrow: None,
     })
 }
 
@@ -4148,6 +4234,79 @@ fn shape_ternary_return(
         shape_ternary_arm(&ternary.then_arm, "then-arm return", &decl.name, then_site)?,
         shape_ternary_arm(&ternary.else_arm, "else-arm return", &decl.name, else_site)?,
     ])
+}
+
+/// One unannotated-or-annotated identifier parameter of a contextually-typed
+/// arrow function (P064).
+///
+/// Driver-fed per arrow argument or initializer (mechanical name +
+/// annotated-ness + annotation-text + rest-marker copies, exactly like
+/// [`FunctionParam`): the adapter emits no arrow facts, so drivers feed one
+/// entry per arrow position (asserted `NonLiteral` with no cast, like the
+/// [`CallArg::arg_object`] seam) and the seam vanishes when the adapter
+/// emits the facts. Only all-unannotated identifier params bind: annotated,
+/// rest, or missing entries decline distinctly solver-side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrowParam {
+    /// Parameter name as written.
+    pub name: String,
+    /// Whether the arrow parameter carries its own type annotation.
+    pub annotated: bool,
+    /// Raw annotation text (`Some("string")`); `None` when unannotated.
+    pub annotation: Option<String>,
+    /// `true` for `...rest` arrow parameters (destructured patterns never
+    /// reach this list — they set [`ArrowInit::params_complex`] instead).
+    pub is_rest: bool,
+}
+
+/// The expression body of a contextually-typed arrow function (P064).
+///
+/// Driver-fed alongside [`ArrowInit`]: literal bodies (plus bare-identifier
+/// bodies, whose name rides `ident` through the P048 seam) check through the
+/// existing delegation; block bodies and object-literal bodies never reach
+/// this shape — drivers feed [`ArrowInit::body_complex`] for those and the
+/// solver declines distinctly instead of mis-checking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrowBody {
+    /// Literal kind of the body expression.
+    pub kind: InitKind,
+    /// Span of the body expression (the wrong-body diagnostic anchor).
+    pub span: Span,
+    /// Referenced name when the body is a bare identifier (`None`
+    /// otherwise). Driver-fed explicitly per arrow (no source slicing —
+    /// unlike [`ConstDecl::init_ident` — the body span is itself hand-fed,
+    /// so names ride the same explicit table); resolves one level through
+    /// the P048 table against the bound contextual params.
+    pub ident: Option<String>,
+}
+
+/// One arrow function in a contextually-typed position (P064).
+///
+/// Driver-fed per arrow argument (`None` for every other argument) or per
+/// arrow initializer (`None` for every other initializer): the adapter
+/// classifies arrows [`InitKind::NonLiteral`] with no finer facts, so the
+/// kind stays `NonLiteral` either way and this shape carries what spans
+/// cannot (parameter annotated-ness plus the body shape) without
+/// string-searching. Spans are fact spans for the arrow itself
+/// (`CallArg::span`, the init fact span); the body span approximates to the
+/// arrow span until the adapter emits body facts (differentials compare
+/// codes plus messages only, so baselines still match exactly).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrowInit {
+    /// Identifier parameters in source order (a prefix when
+    /// `params_complex`).
+    pub params: Vec<ArrowParam>,
+    /// `true` when the parameter list holds a pattern no name can represent
+    /// (destructured or non-identifier rest): `params` is then a prefix and
+    /// the solver declines instead of checking it.
+    pub params_complex: bool,
+    /// The expression body to check against the expected return.
+    pub body: ArrowBody,
+    /// `true` for block bodies (`=> { return 1; }`) and object-literal
+    /// bodies: the solver declines instead of checking them.
+    pub body_complex: bool,
+    /// Span of the whole arrow expression (the gate-note anchor).
+    pub span: Span,
 }
 
 /// One call-site argument: literal kind plus span.
@@ -4186,6 +4345,16 @@ pub struct CallArg {
     /// degrade per the named-shape rules). The seam vanishes when the
     /// adapter emits the facts.
     pub arg_object: Option<ObjectInit>,
+    /// Arrow facts when the argument is an `=>` expression (`None`
+    /// otherwise). Hand-fed per fixture — the adapter emits no arrow facts,
+    /// so drivers feed `Some` only for direct arrow expressions (asserted
+    /// `NonLiteral` with no cast in tests; the kind stays
+    /// [`InitKind::NonLiteral`] either way, exactly like the frontend
+    /// classifies). `Some` marks a syntactic arrow, so positions against
+    /// admitted function-typed parameters bind and check contextually (see
+    /// the module-level P064 rules) while every other position keeps its
+    /// historical path. The seam vanishes when the adapter emits the facts.
+    pub arg_arrow: Option<ArrowInit>,
 }
 
 /// One direct `f(...)` call site to check.
@@ -4219,12 +4388,21 @@ pub struct CallSite {
 /// classes) keep the opaque decline. Unknown, generic (`T`), union, and
 /// complex annotations never match and keep today's verdicts by
 /// construction. Definition side stays opaque throughout (P046).
+///
+/// `aliases` carries the local [`TypeAliasShape`]s (driver-mapped from the
+/// adapter's alias facts, mechanical name + target copies): a bare-name
+/// annotation claimed by exactly one non-generic alias whose target parses
+/// as an admitted function type (P064) admits the contextual arrow check
+/// at call sites, while every other alias-named annotation keeps the
+/// opaque decline (single level only — chains never advance, no fixpoint).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NamedTypeScope<'a> {
     /// Interface and alias names in scope, as written.
     pub names: &'a [&'a str],
     /// Local interface shapes available for structural admission.
     pub interfaces: &'a [InterfaceShape],
+    /// Local type aliases available for function-type admission.
+    pub aliases: &'a [TypeAliasShape],
 }
 
 impl NamedTypeScope<'static> {
@@ -4234,6 +4412,7 @@ impl NamedTypeScope<'static> {
     pub const EMPTY: Self = Self {
         names: &[],
         interfaces: &[],
+        aliases: &[],
     };
 }
 
@@ -4415,6 +4594,7 @@ fn check_single_call(
         anchor: call.callee_span,
         args: &call.args,
         callee: call.callee.as_str(),
+        binder: Some(binder),
     };
     let view = CallTarget {
         fixed: &target.fixed,
@@ -4443,6 +4623,11 @@ fn check_single_call(
 /// tail (the expectation reads [`TypeStore::ANY` — no literal kind inhabits
 /// it, so every bearing literal diagnoses), and other argument shapes
 /// degrade per-argument with distinct reasons.
+/// `func` carries the admitted function-type signature for params spelling
+/// one (P064): arrow arguments bind their unannotated params from it and
+/// check their bodies through the existing delegation, identifier arguments
+/// decline with a distinct reason, and every other argument shape keeps its
+/// historical path.
 #[derive(Clone, Debug)]
 struct CallParam {
     /// Expected builtin [`TypeId`], or `None` when this position never
@@ -4458,6 +4643,10 @@ struct CallParam {
     /// Resolved local shape for P062 structural positions (`None` for every
     /// other position, including all overload and member-call params).
     shape: Option<InterfaceShape>,
+    /// Admitted function-type signature for P064 contextual positions
+    /// (`None` for every other position, including all overload and
+    /// member-call params).
+    func: Option<FnSignature>,
 }
 
 /// One anchored call site for the shared verdict tail: direct calls anchor at
@@ -4472,6 +4661,10 @@ struct VerdictSite<'a> {
     /// function; member sites name the member — those params never carry
     /// shapes, so member reasons never surface).
     callee: &'a str,
+    /// Checking binder for contextual arrow bodies (`Some` on the single-call
+    /// path only — overload and member paths never admit function-typed
+    /// params, so those thread `None`).
+    binder: Option<&'a Binder>,
 }
 
 /// Admitted arity of one call target: `min` required arguments plus the
@@ -4582,8 +4775,13 @@ fn range_text(arity: CallArity) -> String {
 /// Params naming a local shape (P062) check positionally in the same walk:
 /// object-literal arguments run the shared comparison (first mismatch stops
 /// the call, like `TS2345`), identifier arguments decline with their own
-/// reason, unshaped non-literals keep the opaque decline, and primitive
+/// reason, unshaped non-literals keep the legacy opaque decline, and primitive
 /// literals mismatch through the existing tail below.
+///
+/// Params spelling an admitted function type (P064) check in the same walk
+/// right after: arrow arguments bind and delegate (first body mismatch stops
+/// the call, like `TS2345`), identifier arguments decline with their own
+/// reason, and every other shape keeps its historical path.
 fn check_call_arguments(
     file: FileId,
     site: &VerdictSite<'_>,
@@ -4634,6 +4832,12 @@ fn check_call_arguments(
                 return;
             }
         }
+        if param.func.is_some() {
+            let ctx = structural.get_or_insert_with(|| StructuralCtx::fresh(file));
+            if check_fn_argument(ctx, site, param, argument, &mut *report) {
+                return;
+            }
+        }
         if kind == InitKind::NonLiteral {
             continue;
         }
@@ -4669,6 +4873,10 @@ fn check_call_arguments(
 /// args are direct syntactic literals by driver invariant, so excess members
 /// always diagnose here (the stale-literal decline never fires — only
 /// adapter-realizable freshness facts could say otherwise).
+///
+/// Contextual arrows (P064) share the database: each arrow argument takes
+/// its own occurrence node (see [`arrow_occurrence_node`]), so body memos
+/// stay per-occurrence (H-002) with no cross-argument aliasing.
 struct StructuralCtx {
     /// File owning the call site.
     file: FileId,
@@ -4680,6 +4888,8 @@ struct StructuralCtx {
     freshness: FreshnessTable,
     /// Empty identifier table (calls thread no P048 sources on this path).
     idents: IdentTable,
+    /// How many arrow arguments have taken occurrence nodes this call.
+    arrows: usize,
 }
 
 impl StructuralCtx {
@@ -4697,7 +4907,16 @@ impl StructuralCtx {
             db: QueryDb::new(),
             freshness,
             idents: IdentTable::default(),
+            arrows: 0,
         }
+    }
+
+    /// Takes the next per-arrow occurrence node for this call (see
+    /// [`arrow_occurrence_node`]).
+    fn arrow_node(&mut self) -> NodeId {
+        let node = arrow_occurrence_node(self.arrows);
+        self.arrows = self.arrows.saturating_add(1);
+        node
     }
 }
 
@@ -4720,6 +4939,11 @@ fn check_shaped_argument(
     let Some(shape) = param.shape.as_ref() else {
         return false;
     };
+    if param.func.is_some() && argument.arg_arrow.is_some() {
+        // Arrows against dual shape-plus-function positions belong to the
+        // P064 path (objects still check structurally below).
+        return false;
+    }
     if let Some(object) = argument.arg_object.as_ref() {
         return check_structural_call_arg(structural, shape, argument, object, report);
     }
@@ -4780,6 +5004,7 @@ fn check_structural_call_arg(
         cast: None,
         init_ternary: None,
         init_member_ref: None,
+        init_arrow: None,
     };
     let before = report.diagnostics.len();
     let mut ctx = CheckCtx {
@@ -4793,6 +5018,217 @@ fn check_structural_call_arg(
     };
     check_interface_shape(&synth, argument.span, shape.name.as_str(), shape, &mut ctx);
     ctx.report.diagnostics.len() != before
+}
+
+/// Occurrence [`NodeId`] for the `index`-th arrow argument of one call
+/// (P064).
+///
+/// Call checking threads a throwaway per-call memo database (see
+/// [`StructuralCtx`]), so the value only needs per-call distinctness: each
+/// arrow of a call takes the next node below a fixed ceiling that never
+/// equals the shared structural placeholder (saturating, so skewed inputs
+/// pin the floor instead of aliasing it). Per-occurrence entries, never
+/// cached across calls (H-002).
+fn arrow_occurrence_node(index: usize) -> NodeId {
+    NodeId(
+        u32::MAX
+            .saturating_sub(1)
+            .saturating_sub(u32::try_from(index).unwrap_or(u32::MAX)),
+    )
+}
+
+/// Gates one contextual arrow against its expected signature (P064):
+/// `Ok` carries the positionally bound parameters (unannotated identifier
+/// params take the expected kinds, in order — fewer arrow params than
+/// expected admit positionally, probed tsc 7.0.2 `o`); `Err` carries the
+/// bare decline reason (destructured patterns, annotated or rest params,
+/// extra params, and block/object bodies each decline distinctly, never a
+/// forced verdict).
+fn gate_contextual_arrow(
+    arrow: &ArrowInit,
+    signature: &FnSignature,
+) -> Result<Vec<FunctionParam>, String> {
+    if arrow.params_complex {
+        return Err("non-identifier arrow parameter pattern is outside the subset".to_owned());
+    }
+    if let Some(param) = arrow.params.iter().find(|param| param.annotated) {
+        return Err(format!(
+            "annotated arrow parameter '{}' is outside the subset: \
+            explicitly annotated arrow parameters need compatibility checks",
+            param.name
+        ));
+    }
+    if let Some(param) = arrow.params.iter().find(|param| param.is_rest) {
+        return Err(format!(
+            "rest arrow parameter '{}' is outside the subset",
+            param.name
+        ));
+    }
+    if arrow.params.len() > signature.params.len() {
+        return Err(format!(
+            "arrow with {} parameters for a {}-parameter function type is outside the subset",
+            arrow.params.len(),
+            signature.params.len()
+        ));
+    }
+    if arrow.body_complex {
+        return Err("non-expression arrow body is outside the subset".to_owned());
+    }
+    Ok(arrow
+        .params
+        .iter()
+        .zip(signature.params.iter())
+        .map(|(param, expected)| FunctionParam {
+            name: param.name.clone(),
+            annotated: true,
+            annotation: Some(expected.display.clone()),
+            optional: false,
+            is_rest: false,
+        })
+        .collect())
+}
+
+/// Mutable checking state for one contextual arrow-body delegation (P064),
+/// bundled so the call and const paths share one function (pedantic arity
+/// discipline, mirroring [`FunctionRun`]).
+struct ArrowRun<'a, 'b> {
+    file: FileId,
+    node: NodeId,
+    binder: &'a Binder,
+    /// Identifier table: the bound contextual params plus (const path only)
+    /// the visible leading inputs — never any narrowing state (the P064
+    /// hard gate: narrowing facts do not flow into params).
+    idents: IdentTable,
+    signature: &'a FnSignature,
+    arrow: &'a ArrowInit,
+    db: &'b mut QueryDb,
+    freshness: &'b FreshnessTable,
+    report: &'b mut FileReport,
+}
+
+/// Checks one gated arrow body through the existing delegation (P064): a
+/// synthetic [`ConstDecl`] carrying the expected return plus the body shape
+/// checks through [`check_one`] with the bound contextual params in scope,
+/// so wrong bodies diagnose exactly like any other position (the P013
+/// delegation — no new verdict logic). `void` returns skip silently (the
+/// value is unobservable — probed tsc 7.0.2 `v2`); the synthetic name
+/// never resolves, so diagnostics anchor at the body span (the P020
+/// dotted-name precedent).
+fn delegate_arrow_body(run: &mut ArrowRun<'_, '_>) {
+    if run.signature.returns_void {
+        return;
+    }
+    let body = &run.arrow.body;
+    let synth = ConstDecl {
+        name: String::new(),
+        span: body.span,
+        scope: 0,
+        symbol: None,
+        kind: DeclKind::Function,
+        annotation: Some(run.signature.return_text.clone()),
+        init: Some(body.kind),
+        init_ident: body.ident.clone(),
+        init_object: None,
+        init_array: None,
+        cast: None,
+        init_ternary: None,
+        init_member_ref: None,
+        init_arrow: None,
+    };
+    let mut ctx = CheckCtx {
+        file: run.file,
+        node: run.node,
+        db: &mut *run.db,
+        freshness: run.freshness,
+        report: &mut *run.report,
+        extra: &[],
+        idents: &run.idents,
+    };
+    // Arrow bodies thread no alias tables (the bound texts are primitive —
+    // admitted signatures never spell aliases — so expansion is a no-op;
+    // the P038 precedent).
+    check_one(&synth, run.binder, &mut ctx, &LocalAliasScope::EMPTY);
+}
+
+/// Checks one argument against its function-typed parameter (P064).
+///
+/// Non-arrow arguments keep their historical paths (literals diagnose
+/// through the `ANY` expectation; other non-literals skip), except bare
+/// identifiers, which decline distinctly: a function-typed value carries
+/// no checkable facts. Arrow arguments gate (distinct notes, never forced)
+/// then delegate their bodies; `void` returns stay silent.
+///
+/// Returns whether a diagnostic fired (the caller stops the call on the
+/// first mismatch — probed tsc 7.0.2 `l`/`q`); decline notes never stop
+/// the walk, so later positions still check.
+fn check_fn_argument(
+    structural: &mut StructuralCtx,
+    site: &VerdictSite<'_>,
+    param: &CallParam,
+    argument: &CallArg,
+    report: &mut FileReport,
+) -> bool {
+    let Some(signature) = param.func.as_ref() else {
+        return false;
+    };
+    let Some(arrow) = argument.arg_arrow.as_ref() else {
+        if argument.ident.is_some() {
+            report.unsupported.push(UnsupportedDecl {
+                file: structural.file,
+                span: argument.span,
+                reason: format!(
+                    "call to '{}': identifier argument for '{}' of function type '{}' is \
+                    outside the subset: identifiers carry no value-type facts",
+                    site.callee, param.name, param.display,
+                ),
+            });
+        }
+        return false;
+    };
+    let Some(binder) = site.binder else {
+        // Unreachable on every path that admits `func` (single-call only):
+        // decline instead of forcing a verdict.
+        report.unsupported.push(UnsupportedDecl {
+            file: structural.file,
+            span: arrow.span,
+            reason: format!(
+                "call to '{}': arrow argument for '{}' is outside the subset",
+                site.callee, param.name,
+            ),
+        });
+        return false;
+    };
+    let node = structural.arrow_node();
+    let bound = match gate_contextual_arrow(arrow, signature) {
+        Ok(bound) => bound,
+        Err(reason) => {
+            report.unsupported.push(UnsupportedDecl {
+                file: structural.file,
+                span: arrow.span,
+                reason: format!("call to '{}': {reason}", site.callee),
+            });
+            return false;
+        }
+    };
+    let idents = IdentTable {
+        inputs: Vec::new(),
+        params: ident_params_from_function(&bound),
+        checked: 0,
+    };
+    let before = report.diagnostics.len();
+    let mut run = ArrowRun {
+        file: structural.file,
+        node,
+        binder,
+        idents,
+        signature,
+        arrow,
+        db: &mut structural.db,
+        freshness: &structural.freshness,
+        report: &mut *report,
+    };
+    delegate_arrow_body(&mut run);
+    run.report.diagnostics.len() != before
 }
 
 /// One admitted parameter list for [`check_one_call`]: fixed positions in
@@ -4813,6 +5249,10 @@ struct ResolvedFixed {
     /// Resolved local shape for P062 structural positions (`None` for every
     /// other position).
     shape: Option<InterfaceShape>,
+    /// Admitted function-type signature for P064 contextual positions
+    /// (`None` for every other position, including all overload and
+    /// member-call params).
+    func: Option<FnSignature>,
 }
 
 struct ResolvedCallParams {
@@ -4940,12 +5380,13 @@ fn resolve_params(
             ));
         }
         match classify_param(param, scope, decl.scope, lookup) {
-            Ok((expected, display, shape)) => fixed.push(ResolvedFixed {
+            Ok((expected, display, shape, func)) => fixed.push(ResolvedFixed {
                 expected,
                 display,
                 optional: param.optional,
                 name: param.name.clone(),
                 shape,
+                func,
             }),
             Err(reason) => return Err(reason),
         }
@@ -4999,6 +5440,7 @@ fn owned_target(resolved: ResolvedCallParams) -> OwnedTarget {
             optional: slot.optional,
             name: slot.name,
             shape: slot.shape,
+            func: slot.func,
         })
         .collect();
     let rest = resolved.rest.map(|(expected, display)| CallParam {
@@ -5007,6 +5449,7 @@ fn owned_target(resolved: ResolvedCallParams) -> OwnedTarget {
         optional: false,
         name: String::new(),
         shape: None,
+        func: None,
     });
     OwnedTarget {
         fixed,
@@ -5072,6 +5515,22 @@ fn check_overload_call(run: &mut OverloadRun<'_>, candidates: &[usize]) {
             span: run.call.callee_span,
             reason: format!(
                 "multiple declarations with bodies for '{}': shadowing is outside the subset",
+                run.call.callee
+            ),
+        });
+        return;
+    }
+    if run.call.args.iter().any(|arg| arg.arg_arrow.is_some()) {
+        // Arrow arguments against overload groups stay declined: any-match
+        // could claim clean through a `NonLiteral` skip without ever
+        // checking the body (unsound silence), and forcing `TS2769` would
+        // mis-verdict clean arrows — so one note, never a verdict (P064).
+        run.report.unsupported.push(UnsupportedDecl {
+            file: run.file,
+            span: run.call.callee_span,
+            reason: format!(
+                "call to '{}': arrow function argument against an overload group is outside \
+                the subset",
                 run.call.callee
             ),
         });
@@ -5167,12 +5626,16 @@ fn check_resolved_call(
             // Overload signatures never carry shapes (P062 structural
             // admission is single-call only), so member facts never ride.
             arg_object: None,
+            // Overload calls with arrow arguments decline upfront (see
+            // `check_overload_call`), so arrow facts never ride either.
+            arg_arrow: None,
         })
         .collect();
     let site = VerdictSite {
         anchor: run.call.callee_span,
         args: &synth,
         callee: run.call.callee.as_str(),
+        binder: None,
     };
     let view = CallTarget {
         fixed: &target.fixed,
@@ -5496,6 +5959,167 @@ fn classify_rest_element(param: &FunctionParam) -> Result<(Option<TypeId>, Strin
         }
     }
 }
+/// One admitted parameter of a function-typed annotation (P064): the
+/// display text for messages (expected kinds re-derive from the text
+/// through the shared classifiers wherever positions check).
+#[derive(Clone, Debug)]
+struct FnParam {
+    /// Parameter type text as written (`"number"`, `"any"`, ...).
+    display: String,
+}
+
+/// One admitted function-typed annotation (P064): `(p: T, ...) => R` with
+/// primitive-or-boundary positions throughout.
+#[derive(Clone, Debug)]
+struct FnSignature {
+    /// Expected parameters in source order.
+    params: Vec<FnParam>,
+    /// Verbatim return text (`"number"`, `"void"`, `"any"`, ...).
+    return_text: String,
+    /// `true` when the return is `void`: bodies need no check (the value is
+    /// unobservable — probed tsc 7.0.2 `v2`).
+    returns_void: bool,
+}
+
+/// Splits one annotation at its top-level `=>` (depth over `()`, `[]`,
+/// `{}`): `Some((params, return))` when a function-type arrow is present,
+/// `None` otherwise. Single pass, no fixpoint; nested arrows sit below the
+/// top level and never split here.
+fn split_top_level_arrow(text: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'=' if depth == 0 && bytes.get(index + 1) == Some(&b'>') => {
+                return Some((text[..index].trim(), text[index + 2..].trim()));
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Splits one parenthesized parameter list at top-level commas (same depth
+/// rule as [`split_top_level_arrow`]): single pass, no fixpoint.
+fn split_top_level_commas(inner: &str) -> Vec<&str> {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut pieces = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                pieces.push(inner[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    pieces.push(inner[start..].trim());
+    pieces
+}
+
+/// Parses one `name: Type` parameter piece of an admitted function type:
+/// identifier names with primitive-or-boundary types only (`any`/`unknown`
+/// bind accept-all). `Err` names the complexity (optional, rest, `this`,
+/// `void`/`never`, union, nested, or unknown shapes all decline).
+fn parse_fn_param(piece: &str) -> Result<FnParam, String> {
+    let Some((name, ty)) = piece.split_once(':') else {
+        return Err(format!("parameter '{piece}' has no type annotation"));
+    };
+    let name = name.trim();
+    let ty = ty.trim();
+    if !is_name_segment(name) || name == "this" {
+        return Err(format!("parameter '{piece}' is not a plain identifier"));
+    }
+    if let Some(id) = annotation_type(ty) {
+        if id == TypeStore::VOID {
+            return Err(format!("parameter '{name}' is void-typed"));
+        }
+        return Ok(FnParam {
+            display: ty.to_owned(),
+        });
+    }
+    if let Some(id) = boundary_annotation_type(ty) {
+        if id == TypeStore::ANY || id == TypeStore::UNKNOWN {
+            return Ok(FnParam {
+                display: ty.to_owned(),
+            });
+        }
+        return Err(format!("parameter '{name}' is never-typed"));
+    }
+    Err(format!("parameter '{name}' has type '{ty}'"))
+}
+
+/// Parses one function-typed annotation into its admitted signature
+/// (P064): `None` when the text carries no top-level `=>` (not a function
+/// type — existing paths apply, including parenthesized non-functions
+/// like `(x: number)`); `Some(Ok)` for admitted `(p: T, ...) => R`
+/// spellings; `Some(Err)` for function-shaped but complex spellings
+/// (generics, optional/rest/`this`/destructured params, non-primitive
+/// positions, missing or complex returns — each declines distinctly,
+/// never a forced verdict).
+fn parse_fn_signature(text: &str) -> Option<Result<FnSignature, String>> {
+    let text = text.trim();
+    let (params_part, return_part) = split_top_level_arrow(text)?;
+    if text.starts_with('<') {
+        return Some(Err(
+            "generic function types are outside the subset".to_owned()
+        ));
+    }
+    let inner = params_part
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'));
+    let Some(inner) = inner else {
+        return Some(Err(format!("function type '{text}' has no parameter list")));
+    };
+    let mut params = Vec::new();
+    if !inner.is_empty() {
+        for piece in split_top_level_commas(inner) {
+            match parse_fn_param(piece) {
+                Ok(param) => params.push(param),
+                Err(reason) => {
+                    return Some(Err(format!("function type '{text}': {reason}")));
+                }
+            }
+        }
+    }
+    let Some(id) = annotation_type(return_part).or_else(|| boundary_annotation_type(return_part))
+    else {
+        return Some(Err(format!(
+            "function type '{text}' returns '{return_part}'"
+        )));
+    };
+    Some(Ok(FnSignature {
+        params,
+        return_text: return_part.to_owned(),
+        returns_void: id == TypeStore::VOID,
+    }))
+}
+
+/// Resolves one bare-name annotation to an admitted function-type signature
+/// through the call path's alias tables (P064): exactly one non-generic
+/// alias must claim the name and its target must parse directly (single
+/// level — chains never advance, so no fixpoint). `None` keeps today's
+/// decline (duplicates, generics, and non-function targets all stay
+/// opaque, exactly as before).
+fn resolve_fn_alias(aliases: &[TypeAliasShape], text: &str) -> Option<FnSignature> {
+    let mut claimed = aliases.iter().filter(|shape| shape.name == text);
+    let alias = claimed.next()?;
+    if claimed.next().is_some() || alias.has_type_params {
+        return None;
+    }
+    parse_fn_signature(alias.target.trim()).and_then(Result::ok)
+}
+
 /// Classifies one annotated fixed parameter into its
 /// expected ([`TypeId`], display text, resolved shape): `Err` carries the
 /// decline reason (union, object, unknown, or missing type text the subset
@@ -5512,12 +6136,30 @@ fn classify_rest_element(param: &FunctionParam) -> Result<(Option<TypeId>, Strin
 /// [`TypeStore::ANY` so every bearing literal mismatches through the
 /// existing `TS2345` tail, while object literals run the shared comparison;
 /// see [`ShapeLookup`]); everything else keeps its legacy decline.
+///
+/// Function-typed annotations admit contextually (P064, single-call only —
+/// `None` lookups keep today's verdicts by construction): inline
+/// `(p: T, ...) => R` spellings parse directly, while bare names resolve
+/// one alias level through [`resolve_fn_alias`]. Admitted positions expect
+/// [`TypeStore::ANY`] (no literal kind inhabits a function type, so every
+/// bearing literal diagnoses `TS2345` naming the annotation as written)
+/// and carry the signature for arrow arguments; function-shaped but complex
+/// spellings decline distinctly, never forced.
+/// One classified call parameter: expected type, display text, an optional
+/// structural shape, and an optional admitted function signature.
+type ClassifiedParam = (
+    Option<TypeId>,
+    String,
+    Option<InterfaceShape>,
+    Option<FnSignature>,
+);
+
 fn classify_param(
     param: &FunctionParam,
     scope: &NamedTypeScope<'_>,
     decl_scope: u32,
     lookup: Option<ShapeLookup<'_>>,
-) -> Result<(Option<TypeId>, String, Option<InterfaceShape>), String> {
+) -> Result<ClassifiedParam, String> {
     let text = param.annotation.as_deref().map_or("", str::trim);
     if text.contains('|') {
         return Err(format!(
@@ -5528,14 +6170,34 @@ fn classify_param(
         boundary_annotation_type(text),
         Some(id) if id == TypeStore::ANY || id == TypeStore::UNKNOWN
     ) {
-        return Ok((None, text.to_owned(), None));
+        return Ok((None, text.to_owned(), None, None));
     }
     if let Some(expected) = annotation_type(text) {
-        return Ok((Some(expected), text.to_owned(), None));
+        return Ok((Some(expected), text.to_owned(), None, None));
+    }
+    if lookup.is_some() {
+        if let Some(parsed) = parse_fn_signature(text) {
+            match parsed {
+                Ok(signature) => {
+                    return Ok((Some(TypeStore::ANY), text.to_owned(), None, Some(signature)));
+                }
+                Err(reason) => {
+                    return Err(format!(
+                        "function type '{text}' for '{}' is outside the subset: {reason}",
+                        param.name
+                    ));
+                }
+            }
+        }
     }
     if scope.names.contains(&text) {
+        if lookup.is_some() {
+            if let Some(signature) = resolve_fn_alias(scope.aliases, text) {
+                return Ok((Some(TypeStore::ANY), text.to_owned(), None, Some(signature)));
+            }
+        }
         if let Some(shape) = lookup_named_shape(lookup, decl_scope, text, scope) {
-            return Ok((Some(TypeStore::ANY), shape.name.clone(), Some(shape)));
+            return Ok((Some(TypeStore::ANY), shape.name.clone(), Some(shape), None));
         }
         return Err(format!(
             "parameter type '{text}' for '{}' is an opaque named type: outside the subset",
@@ -5595,6 +6257,7 @@ fn exact_sig(arity: usize, params: &[(Option<TypeId>, &str)]) -> OpaqueSig {
             // ever names them.
             name: String::new(),
             shape: None,
+            func: None,
         });
     }
     OpaqueSig { arity, params: out }
@@ -5731,6 +6394,7 @@ fn check_one_member_call(run: &mut MemberRun<'_>, call: &MemberCallSite) {
             anchor: call.member_span,
             args: &call.args,
             callee: call.member.as_str(),
+            binder: None,
         };
         let target = CallTarget {
             fixed: &sig.params,
@@ -6136,6 +6800,7 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         };
         let mut ctx = CheckCtx {
             file: run.file,
@@ -9072,6 +9737,7 @@ fn unannotated_infers_silently(decl: &ConstDecl) -> bool {
         && decl.init_array.is_none()
         && decl.init_ternary.is_none()
         && decl.init_member_ref.is_none()
+        && decl.init_arrow.is_none()
         && matches!(
             decl.init,
             Some(
@@ -9189,7 +9855,10 @@ fn check_contradictory_member_ref(
 
 /// Rejects contradictory initializer facts for [`check_one`]: at most one
 /// of primitive kind, object members, and array members may be present.
-/// Returns true when a note was pushed and the declaration is done.
+/// Arrow facts ride only a bare `NonLiteral` (or missing) `init` (the
+/// adapter emits them for arrow expressions, which never classify as
+/// literals). Returns true when a note was pushed and the declaration is
+/// done.
 fn check_contradictory_inits(
     decl: &ConstDecl,
     span: Span,
@@ -9198,6 +9867,24 @@ fn check_contradictory_inits(
 ) -> bool {
     if check_contradictory_member_ref(decl, span, file, report) {
         return true;
+    }
+    if decl.init_arrow.is_some() {
+        let paired = decl.init_object.is_some()
+            || decl.init_array.is_some()
+            || decl.cast.is_some()
+            || decl.init_ternary.is_some()
+            || decl.init_member_ref.is_some()
+            || matches!(decl.init, Some(kind) if kind != InitKind::NonLiteral);
+        if paired {
+            report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: "contradictory initializer facts: arrow expression with \
+                    another initializer shape"
+                    .to_owned(),
+            });
+            return true;
+        }
     }
     if decl.init.is_some() && decl.init_object.is_some() {
         report.unsupported.push(UnsupportedDecl {
@@ -9756,6 +10443,7 @@ fn resolve_ternary_arm(step: &TernaryArmStep<'_, '_, '_, '_, '_>) -> Result<Join
         cast: None,
         init_ternary: None,
         init_member_ref: None,
+        init_arrow: None,
     };
     match resolve_ident(&probe, binder, scope, idents, file) {
         IdentResolution::Keep => Err(format!(
@@ -10141,6 +10829,165 @@ fn check_ternary(
 /// Finishes an annotated declaration for [`check_one`]: alias expansion,
 /// then the boundary path and the shared primitive tail. Split out so
 /// `check_one` stays within the line budget; behavior identical.
+/// One function-typed annotation ready to check (P064): the admitted
+/// signature plus the spelling messages name.
+struct FnAnnotation {
+    /// The admitted parameter and return expectations.
+    signature: FnSignature,
+    /// Annotation spelling for messages (the inline text or the alias name,
+    /// as written — probed tsc 7.0.2 `p1`–`p3`).
+    display: String,
+}
+
+/// Resolves one annotation to a checkable function type (P064):
+/// `Some(Ok)` for admitted inline spellings and single-level alias targets
+/// (see [`resolve_fn_alias`] — chains never advance, so no fixpoint);
+/// `Some(Err)` for function-shaped but complex spellings (decline
+/// distinctly, never a forced verdict); `None` for everything else
+/// (existing paths apply, exactly as before — including the alias
+/// machinery's shadowing and chain declines).
+fn resolve_fn_annotation(
+    annotation: &str,
+    scope: &LocalAliasScope<'_, '_>,
+) -> Option<Result<FnAnnotation, String>> {
+    if let Some(parsed) = parse_fn_signature(annotation) {
+        let outcome: Result<FnAnnotation, String> = match parsed {
+            Ok(signature) => Ok(FnAnnotation {
+                signature,
+                display: annotation.to_owned(),
+            }),
+            Err(reason) => Err(format!(
+                "function type '{annotation}' is outside the subset: {reason}"
+            )),
+        };
+        return Some(outcome);
+    }
+    if annotation_type(annotation).is_some()
+        || boundary_annotation_type(annotation).is_some()
+        || !is_name_segment(annotation)
+    {
+        return None;
+    }
+    if scope.const_names.contains(&annotation) {
+        // A shadowing value keeps the existing alias decline (the
+        // `expand_local_alias` precedent — never hijack a value binding).
+        return None;
+    }
+    let signature = resolve_fn_alias(scope.aliases, annotation)?;
+    Some(Ok(FnAnnotation {
+        signature,
+        display: annotation.to_owned(),
+    }))
+}
+
+/// Inputs for one function-typed annotation check (P064), bundled so the
+/// per-outcome helpers stay lean (pedantic arity discipline).
+struct FnCheck<'a> {
+    /// The declaration under check.
+    decl: &'a ConstDecl,
+    /// Declaration span (decline notes anchor here; body diagnostics anchor
+    /// at the body span through the delegation).
+    span: Span,
+    /// The resolved annotation (or the complexity reason).
+    outcome: Result<FnAnnotation, String>,
+    /// Asserted initializer kind after the prefix gates.
+    init: Option<InitKind>,
+}
+
+/// Checks one declaration against an admitted function-typed annotation
+/// (P064): complex spellings decline; arrow initializers gate (distinct
+/// notes, never forced) then delegate their bodies through
+/// [`delegate_arrow_body`]; literal initializers diagnose `TS2322` naming
+/// the annotation as written (probed tsc 7.0.2 `p1`–`p2`); identifier-held
+/// and other non-literal initializers decline distinctly (no value-type
+/// facts); missing initializers decline like every other annotation.
+///
+/// The body delegation memos at the declaration node (like the primitive
+/// path): the function-typed path memos nothing itself and admits a single
+/// body position, so no memo key ever aliases (H-002).
+fn check_fn_annotation(check: &FnCheck<'_>, binder: &Binder, ctx: &mut CheckCtx<'_>) {
+    let resolved = match check.outcome.as_ref() {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            ctx.report.unsupported.push(UnsupportedDecl {
+                file: ctx.file,
+                span: check.span,
+                reason: reason.clone(),
+            });
+            return;
+        }
+    };
+    let (decl, span) = (check.decl, check.span);
+    if let Some(arrow) = decl.init_arrow.as_ref() {
+        let bound = match gate_contextual_arrow(arrow, &resolved.signature) {
+            Ok(bound) => bound,
+            Err(reason) => {
+                ctx.report.unsupported.push(UnsupportedDecl {
+                    file: ctx.file,
+                    span: arrow.span,
+                    reason,
+                });
+                return;
+            }
+        };
+        let idents = IdentTable {
+            inputs: ctx.idents.inputs.clone(),
+            params: ident_params_from_function(&bound),
+            checked: ctx.idents.checked,
+        };
+        let mut run = ArrowRun {
+            file: ctx.file,
+            node: ctx.node,
+            binder,
+            idents,
+            signature: &resolved.signature,
+            arrow,
+            db: &mut *ctx.db,
+            freshness: ctx.freshness,
+            report: &mut *ctx.report,
+        };
+        delegate_arrow_body(&mut run);
+        return;
+    }
+    match check.init {
+        Some(kind) if kind != InitKind::NonLiteral => {
+            ctx.report.diagnostics.push(PithDiagnostic {
+                code: CODE_MISMATCH.to_owned(),
+                file: ctx.file,
+                span,
+                message: format!(
+                    "Type '{}' is not assignable to type '{}'.",
+                    kind.name(),
+                    resolved.display
+                ),
+            });
+        }
+        _ if decl.init_ident.is_some() => {
+            ctx.report.unsupported.push(UnsupportedDecl {
+                file: ctx.file,
+                span,
+                reason: "identifier-held function value is outside the subset: \
+                    identifiers carry no value-type facts"
+                    .to_owned(),
+            });
+        }
+        None => {
+            ctx.report.unsupported.push(UnsupportedDecl {
+                file: ctx.file,
+                span,
+                reason: "missing initializer: nothing to check against".to_owned(),
+            });
+        }
+        Some(_) => {
+            ctx.report.unsupported.push(UnsupportedDecl {
+                file: ctx.file,
+                span,
+                reason: "non-literal initializer is outside the subset".to_owned(),
+            });
+        }
+    }
+}
+
 fn finish_annotated_check(
     decl: &ConstDecl,
     span: Span,
@@ -10338,6 +11185,45 @@ fn check_prefix<'a>(
     }
 }
 
+/// Inputs for one [`check_fn_routing`] step, bundled (the [`IdentStep`]
+/// precedent).
+struct FnRoute<'a, 'b, 'c, 'd, 'e> {
+    decl: &'a ConstDecl,
+    binder: &'b Binder,
+    scope: &'c LocalAliasScope<'d, 'e>,
+    span: Span,
+    annotation: &'a str,
+    init: Option<InitKind>,
+}
+
+/// Function-typed annotation routing for [`check_one`] (P064; see
+/// `resolve_fn_annotation`): admitted inline spellings and single-level
+/// alias targets check through `check_fn_annotation` (contextual arrows
+/// bind and delegate; literals diagnose; everything else declines
+/// distinctly), while all other annotations keep the existing path below,
+/// exactly as before. Returns true when the declaration is done.
+fn check_fn_routing(route: &FnRoute<'_, '_, '_, '_, '_>, ctx: &mut CheckCtx<'_>) -> bool {
+    let FnRoute {
+        decl,
+        binder,
+        scope,
+        span,
+        annotation,
+        init,
+    } = *route;
+    let Some(outcome) = resolve_fn_annotation(annotation, scope) else {
+        return false;
+    };
+    let check = FnCheck {
+        decl,
+        span,
+        outcome,
+        init,
+    };
+    check_fn_annotation(&check, binder, ctx);
+    true
+}
+
 /// Takes the shared [`CheckCtx`] (file, node, memo store, freshness table,
 /// report, and extra cross-file edges) so the arity stays flat as the
 /// subset grows; `binder` and `decl` ride alongside.
@@ -10348,13 +11234,7 @@ fn check_one(
     scope: &LocalAliasScope<'_, '_>,
 ) {
     let file = ctx.file;
-    let node = ctx.node;
-    let db: &mut QueryDb = &mut *ctx.db;
-    let freshness = ctx.freshness;
-    let report: &mut FileReport = &mut *ctx.report;
-    let extra = ctx.extra;
-    let idents = ctx.idents;
-    let Some(prefix) = check_prefix(decl, binder, file, &mut *report) else {
+    let Some(prefix) = check_prefix(decl, binder, file, &mut *ctx.report) else {
         return;
     };
     let span = prefix.span;
@@ -10371,59 +11251,23 @@ fn check_one(
             span,
             annotation,
         };
-        let mut ctx = CheckCtx {
-            file,
-            node,
-            db: &mut *db,
-            freshness,
-            report: &mut *report,
-            extra,
-            idents,
-        };
-        if resolve_ternary_init(ternary, &use_, &mut ctx, &mut init) {
+        if resolve_ternary_init(ternary, &use_, &mut *ctx, &mut init) {
             return;
         }
     }
     if annotation.starts_with('{') {
-        let mut ctx = CheckCtx {
-            file,
-            node,
-            db,
-            freshness,
-            report,
-            extra,
-            idents,
-        };
-        check_object_routing(decl, span, annotation, init, &mut ctx);
+        check_object_routing(decl, span, annotation, init, &mut *ctx);
         return;
     }
     if let Some(array) = classify_array_annotation(annotation) {
-        let mut ctx = CheckCtx {
-            file,
-            node,
-            db,
-            freshness,
-            report,
-            extra,
-            idents,
-        };
-        check_array_annotation(decl, span, &array, init, &mut ctx);
+        check_array_annotation(decl, span, &array, init, &mut *ctx);
         return;
     }
     if let Some(promise) = classify_promise_annotation(annotation) {
-        let mut ctx = CheckCtx {
-            file,
-            node,
-            db,
-            freshness,
-            report,
-            extra,
-            idents,
-        };
-        decline_promise_annotation(&promise, annotation, span, &mut ctx);
+        decline_promise_annotation(&promise, annotation, span, &mut *ctx);
         return;
     }
-    if decline_shaped_annotation(annotation, file, span, &mut *report) {
+    if decline_shaped_annotation(annotation, file, span, &mut *ctx.report) {
         return;
     }
     // Single-level identifier propagation (P048; see
@@ -10433,24 +11277,28 @@ fn check_one(
         decl,
         binder,
         scope,
-        idents,
+        idents: ctx.idents,
         file,
         span,
-        report: &mut *report,
+        report: &mut *ctx.report,
         init: &mut init,
     }) {
         return;
     }
-    let mut ctx = CheckCtx {
-        file,
-        node,
-        db: &mut *db,
-        freshness,
-        report: &mut *report,
-        extra,
-        idents,
-    };
-    finish_annotated_check(decl, span, annotation, init, scope, &mut ctx);
+    if check_fn_routing(
+        &FnRoute {
+            decl,
+            binder,
+            scope,
+            span,
+            annotation,
+            init,
+        },
+        &mut *ctx,
+    ) {
+        return;
+    }
+    finish_annotated_check(decl, span, annotation, init, scope, &mut *ctx);
 }
 
 /// Primitive annotation with an object-literal initializer (oracle spells
@@ -13005,6 +13853,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -13038,6 +13887,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -13395,6 +14245,7 @@ mod tests {
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
             },
             // An interface-annotated use resolves through the merged id.
             object_decl("ok", 50, 52, "Foo", vec![("a", ObjectMemberKind::Number)]),
@@ -13488,6 +14339,7 @@ mod tests {
             }),
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -13510,6 +14362,8 @@ mod tests {
                 ident: None,
                 // Assertion tests never feed object members.
                 arg_object: None,
+                // Assertion tests never feed arrow expressions.
+                arg_arrow: None,
             }],
         }
     }
@@ -13560,6 +14414,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }];
         let mut db = QueryDb::new();
         let report = check_file(FILE, &decls, &binder, &mut db);
@@ -13948,6 +14803,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &[],
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Point")])];
         let calls = [call(
@@ -13999,6 +14855,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &[],
+            aliases: &[],
         };
         let decls = [
             callable("generic", vec![("x", "T")]),
@@ -14054,6 +14911,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &[],
+            aliases: &[],
         };
         let decls = [
             signature("show", "p", "Point"),
@@ -14087,6 +14945,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Point")])];
         let calls = [object_call(
@@ -14127,6 +14986,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Point")])];
         let calls = [object_call(
@@ -14169,6 +15029,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Point")])];
         let calls = [object_call(
@@ -14218,6 +15079,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point", "Big"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [
             callable("one", vec![("p", "Point")]),
@@ -14260,6 +15122,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Point")])];
         let wrong_excess = [object_call(
@@ -14309,6 +15172,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [FunctionDecl {
             name: "show".to_owned(),
@@ -14348,6 +15212,7 @@ mod tests {
                     cast: None,
                     ident: None,
                     arg_object: None,
+                    arg_arrow: None,
                 },
                 CallArg {
                     kind: InitKind::NonLiteral,
@@ -14361,6 +15226,7 @@ mod tests {
                         }],
                         fresh: true,
                     }),
+                    arg_arrow: None,
                 },
             ],
         }];
@@ -14385,6 +15251,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let reversed = [FunctionDecl {
             name: "wave".to_owned(),
@@ -14430,6 +15297,7 @@ mod tests {
                         }],
                         fresh: true,
                     }),
+                    arg_arrow: None,
                 },
                 CallArg {
                     kind: InitKind::String,
@@ -14437,6 +15305,7 @@ mod tests {
                     cast: None,
                     ident: None,
                     arg_object: None,
+                    arg_arrow: None,
                 },
             ],
         }];
@@ -14463,6 +15332,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("take", vec![("p", "Point")])];
         let calls = [call(
@@ -14494,6 +15364,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Point")])];
         let missing = [call("show", span(0, 4), vec![])];
@@ -14518,6 +15389,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Point")])];
         let calls = [ident_call("show", span(0, 4), "obj", span(5, 8))];
@@ -14552,6 +15424,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Point")])];
         let calls = [call(
@@ -14584,6 +15457,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point", "Local"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [
             callable("show", vec![("p", "Point")]),
@@ -14627,6 +15501,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Svc"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Svc")])];
         let calls = [object_call(
@@ -14658,6 +15533,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Point"],
             interfaces: &shapes,
+            aliases: &[],
         };
         let mut decl = callable("show", vec![("p", "Point")]);
         decl.has_type_params = true;
@@ -14685,6 +15561,7 @@ mod tests {
         let scope = NamedTypeScope {
             names: &["Alias"],
             interfaces: &[],
+            aliases: &[],
         };
         let decls = [callable("show", vec![("p", "Alias")])];
         let calls = [object_call(
@@ -14700,6 +15577,557 @@ mod tests {
             "reason: {}",
             report.unsupported[0].reason
         );
+    }
+
+    /// One unannotated arrow parameter for contextual tests.
+    fn arrow_param(name: &str) -> ArrowParam {
+        ArrowParam {
+            name: name.to_owned(),
+            annotated: false,
+            annotation: None,
+            is_rest: false,
+        }
+    }
+
+    /// One call site whose single argument is an arrow expression (P064):
+    /// the kind stays [`InitKind::NonLiteral`] (the frontend
+    /// classification); only the hand-fed shape marks the arrow. Body and
+    /// arrow spans approximate to the argument span (differentials compare
+    /// codes plus messages only).
+    fn arrow_call(
+        callee: &str,
+        params: Vec<ArrowParam>,
+        params_complex: bool,
+        body_kind: InitKind,
+        body_ident: Option<&str>,
+        body_complex: bool,
+    ) -> CallSite {
+        let arg_span = span(7, 18);
+        CallSite {
+            callee: callee.to_owned(),
+            callee_span: span(0, 5),
+            span: span(0, 19),
+            args: vec![CallArg {
+                kind: InitKind::NonLiteral,
+                span: arg_span,
+                cast: None,
+                ident: None,
+                arg_object: None,
+                arg_arrow: Some(ArrowInit {
+                    params,
+                    params_complex,
+                    body: ArrowBody {
+                        kind: body_kind,
+                        span: arg_span,
+                        ident: body_ident.map(str::to_owned),
+                    },
+                    body_complex,
+                    span: arg_span,
+                }),
+            }],
+        }
+    }
+
+    /// One alias shape for named function-type tests.
+    fn fn_alias(name: &str, target: &str) -> TypeAliasShape {
+        TypeAliasShape {
+            name: name.to_owned(),
+            target: target.to_owned(),
+            has_type_params: false,
+        }
+    }
+
+    /// One const declaration initialized by an arrow expression (P064).
+    fn arrow_decl(name: &str, annotation: &str, arrow: ArrowInit) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(0, 30),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: Some(annotation.to_owned()),
+            init: Some(InitKind::NonLiteral),
+            init_ident: None,
+            init_object: None,
+            init_array: None,
+            cast: None,
+            init_ternary: None,
+            init_member_ref: None,
+            init_arrow: Some(arrow),
+        }
+    }
+
+    /// One arrow initializer over unannotated identifier params.
+    fn arrow_init(names: &[&str], body_kind: InitKind, body_ident: Option<&str>) -> ArrowInit {
+        let arg_span = span(20, 30);
+        ArrowInit {
+            params: names.iter().map(|&name| arrow_param(name)).collect(),
+            params_complex: false,
+            body: ArrowBody {
+                kind: body_kind,
+                span: arg_span,
+                ident: body_ident.map(str::to_owned),
+            },
+            body_complex: false,
+            span: arg_span,
+        }
+    }
+
+    #[test]
+    fn fn_signature_parser_admits_primitive_positions() {
+        // Admitted spellings: primitives, `any`/`unknown` (accept-all),
+        // `void` returns, and empty parameter lists.
+        let clean = parse_fn_signature("(x: number) => number");
+        assert!(matches!(clean, Some(Ok(_))), "clean: {clean:?}");
+        let two = parse_fn_signature("(x: number, y: string) => boolean");
+        let two = two.expect("parses").expect("admits");
+        assert_eq!(two.params.len(), 2);
+        assert_eq!(two.return_text, "boolean");
+        assert!(!two.returns_void);
+        let accept_all = parse_fn_signature("(x: any, y: unknown) => any");
+        let accept_all = accept_all.expect("parses").expect("admits");
+        assert!(accept_all
+            .params
+            .iter()
+            .all(|param| param.display == "any" || param.display == "unknown"));
+        let empty = parse_fn_signature("() => number");
+        let empty = empty.expect("parses").expect("admits");
+        assert!(empty.params.is_empty());
+        let voided = parse_fn_signature("(x: number) => void");
+        let voided = voided.expect("parses").expect("admits");
+        assert!(voided.returns_void);
+        assert!(parse_fn_signature("number").is_none());
+        assert!(parse_fn_signature("(x: number)").is_none());
+    }
+
+    #[test]
+    fn fn_signature_parser_declines_complex_shapes() {
+        // Function-shaped but complex spellings decline distinctly (never a
+        // forced verdict): generics, optional/rest/`this`/destructured
+        // params, `void`/`never`/union/nested/unknown positions, and missing
+        // or complex returns.
+        for text in [
+            "<T>(x: T) => T",
+            "(x?: number) => number",
+            "(...args: number[]) => number",
+            "(this: Foo, x: number) => number",
+            "({ x }: Point) => number",
+            "(x: void) => number",
+            "(x: never) => number",
+            "(x: number | string) => number",
+            "(cb: (x: number) => void) => void",
+            "(x: Point) => number",
+            "(x: number) => Point",
+            "(x: number) => number | string",
+            "x => number",
+        ] {
+            assert!(matches!(parse_fn_signature(text), Some(Err(_))), "{text}");
+        }
+    }
+
+    #[test]
+    fn contextual_arrow_clean_body_is_silent() {
+        // Probed tsc 7.0.2 `a`: the unannotated param binds `number` and
+        // the literal body checks silently.
+        let binder = Binder::new();
+        let decls = [callable("apply", vec![("f", "(x: number) => number")])];
+        let calls = [arrow_call(
+            "apply",
+            vec![arrow_param("x")],
+            false,
+            InitKind::Number,
+            None,
+            false,
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn contextual_arrow_wrong_body_diagnoses() {
+        // Probed tsc 7.0.2 `b`: one `TS2322` at the body span.
+        let binder = Binder::new();
+        let decls = [callable("apply", vec![("f", "(x: number) => number")])];
+        let calls = [arrow_call(
+            "apply",
+            vec![arrow_param("x")],
+            false,
+            InitKind::String,
+            None,
+            false,
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(7, 18));
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn contextual_arrow_ident_body_resolves_param() {
+        // Probed tsc 7.0.2 `m`: `return x` resolves one level through the
+        // bound contextual param (the P048 table — no narrowing flows).
+        let binder = Binder::new();
+        let decls = [callable("apply", vec![("f", "(x: number) => number")])];
+        let calls = [arrow_call(
+            "apply",
+            vec![arrow_param("x")],
+            false,
+            InitKind::NonLiteral,
+            Some("x"),
+            false,
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn contextual_arrow_fewer_params_admits_positionally() {
+        // Probed tsc 7.0.2 `o`: fewer arrow params than expected admit.
+        let binder = Binder::new();
+        let decls = [callable("apply", vec![("f", "(x: number) => number")])];
+        let calls = [arrow_call(
+            "apply",
+            Vec::new(),
+            false,
+            InitKind::Number,
+            None,
+            false,
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn contextual_arrow_gates_decline_distinctly() {
+        // Probed tsc 7.0.2 `c` (clean), `d` (`TS2339`), `n` (`TS2345` plus
+        // `TS7006`s), `y` (clean): rest, destructured, annotated, extra,
+        // and block-bodied arrows each decline with a distinct reason —
+        // never a forced verdict, never silent.
+        let binder = Binder::new();
+        let decls = [callable("apply", vec![("f", "(x: number) => number")])];
+        let rest = ArrowParam {
+            name: "args".to_owned(),
+            annotated: false,
+            annotation: None,
+            is_rest: true,
+        };
+        let annotated = ArrowParam {
+            name: "x".to_owned(),
+            annotated: true,
+            annotation: Some("string".to_owned()),
+            is_rest: false,
+        };
+        let cases = [
+            arrow_call("apply", vec![rest], false, InitKind::Number, None, false),
+            arrow_call("apply", Vec::new(), true, InitKind::Number, None, false),
+            arrow_call(
+                "apply",
+                vec![annotated],
+                false,
+                InitKind::Number,
+                None,
+                false,
+            ),
+            arrow_call(
+                "apply",
+                vec![arrow_param("x"), arrow_param("y")],
+                false,
+                InitKind::Number,
+                None,
+                false,
+            ),
+            arrow_call(
+                "apply",
+                vec![arrow_param("x")],
+                false,
+                InitKind::Number,
+                None,
+                true,
+            ),
+        ];
+        for calls in [&cases[0], &cases[1], &cases[2], &cases[3], &cases[4]] {
+            let report = check_calls(FILE, &decls, std::slice::from_ref(calls), &binder);
+            assert!(
+                report.diagnostics.is_empty(),
+                "diagnostics: {:?}",
+                report.diagnostics
+            );
+            assert_eq!(report.unsupported.len(), 1);
+        }
+        let texts = [
+            "rest",
+            "non-identifier",
+            "annotated",
+            "2 parameters",
+            "non-expression",
+        ];
+        for (index, text) in texts.into_iter().enumerate() {
+            let report = check_calls(FILE, &decls, std::slice::from_ref(&cases[index]), &binder);
+            assert!(
+                report.unsupported[0].reason.contains(text),
+                "reason: {}",
+                report.unsupported[0].reason
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_alias_named_param_admits() {
+        // Probed tsc 7.0.2 `i`: a bare name claimed by exactly one
+        // non-generic alias to an admitted function type binds
+        // contextually; anything else keeps the opaque decline.
+        let binder = Binder::new();
+        let aliases = [fn_alias("F", "(x: number) => number")];
+        let scope = NamedTypeScope {
+            names: &["F"],
+            interfaces: &[],
+            aliases: &aliases,
+        };
+        let decls = [callable("apply", vec![("f", "F")])];
+        let calls = [arrow_call(
+            "apply",
+            vec![arrow_param("x")],
+            false,
+            InitKind::Number,
+            None,
+            false,
+        )];
+        let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn contextual_literal_arg_diagnoses_naming_annotation() {
+        // Probed tsc 7.0.2 `t`/`p3`: bearing literals against function-typed
+        // params diagnose naming the annotation as written.
+        let binder = Binder::new();
+        let decls = [callable("apply", vec![("f", "(x: number) => number")])];
+        let calls = [call(
+            "apply",
+            span(0, 5),
+            vec![(InitKind::Number, span(6, 7))],
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'number' is not assignable to parameter of type \
+            '(x: number) => number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn contextual_identifier_arg_declines_distinctly() {
+        // Probed tsc 7.0.2 `u` (clean): identifiers carry no value-type
+        // facts, so the position declines instead of checking.
+        let binder = Binder::new();
+        let decls = [callable("apply", vec![("f", "(x: number) => number")])];
+        let calls = [ident_call("apply", span(0, 5), "fn", span(6, 8))];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("identifier argument"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn contextual_overload_with_arrow_declines() {
+        // Overload groups with any arrow argument decline (soundness:
+        // any-match must never claim clean without checking the body, and
+        // forcing `TS2769` would mis-verdict clean arrows).
+        let binder = Binder::new();
+        let decls = [
+            signature("ov", "f", "(x: number) => number"),
+            signature("ov", "f", "string"),
+        ];
+        let calls = [arrow_call(
+            "ov",
+            vec![arrow_param("x")],
+            false,
+            InitKind::Number,
+            None,
+            false,
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].reason.contains("overload group"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn contextual_void_return_skips_body() {
+        // Probed tsc 7.0.2 `v2` (clean): `void` returns ignore the body
+        // value, so even a wrong-typed body stays silent.
+        let binder = Binder::new();
+        let decls = [callable("apply", vec![("f", "(x: number) => void")])];
+        let calls = [arrow_call(
+            "apply",
+            vec![arrow_param("x")],
+            false,
+            InitKind::String,
+            None,
+            false,
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn contextual_returns_dependent_stays_declined() {
+        // Probed tsc 7.0.2 `f`/`r` (clean): generic `T` positions never
+        // admit, so returns-dependent inference declines as before.
+        let binder = Binder::new();
+        let decls = [callable("idem", vec![("f", "(x: T) => T")])];
+        let calls = [arrow_call(
+            "idem",
+            vec![arrow_param("x")],
+            false,
+            InitKind::Number,
+            None,
+            false,
+        )];
+        let report = check_calls(FILE, &decls, &calls, &binder);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn contextual_const_init_binds_and_diagnoses() {
+        // Probed tsc 7.0.2 `g`/`h`: initializers against admitted function
+        // types bind contextually — clean bodies stay silent, wrong bodies
+        // diagnose `TS2322` at the body span.
+        let binder = Binder::new();
+        let mut db = QueryDb::new();
+        let clean = [arrow_decl(
+            "f",
+            "(x: number) => number",
+            arrow_init(&["x"], InitKind::Number, None),
+        )];
+        let report = check_file(FILE, &clean, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        let wrong = [arrow_decl(
+            "f",
+            "(x: number) => number",
+            arrow_init(&["x"], InitKind::String, None),
+        )];
+        let report = check_file(FILE, &wrong, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn contextual_const_alias_init_binds() {
+        // Named annotations on the const path resolve one alias level
+        // (probed tsc 7.0.2 `g`-shaped): the clean body stays silent.
+        let binder = Binder::new();
+        let mut db = QueryDb::new();
+        let aliases = [fn_alias("F", "(x: number) => number")];
+        let decls = [arrow_decl(
+            "f",
+            "F",
+            arrow_init(&["x"], InitKind::Number, None),
+        )];
+        let report = check_file_with_aliases(FILE, &decls, &binder, &mut db, &aliases);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn contextual_const_literal_init_names_annotation() {
+        // Probed tsc 7.0.2 `p1`–`p2`: bearing literals against
+        // function-typed annotations diagnose naming the annotation.
+        let binder = Binder::new();
+        let mut db = QueryDb::new();
+        let decls = [decl("f", 0, 12, "(x: number) => number", InitKind::Number)];
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type '(x: number) => number'."
+        );
+        assert!(report.unsupported.is_empty());
     }
 
     #[test]
@@ -14864,6 +16292,7 @@ mod tests {
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
             },
             decl("e", 18, 26, "number", InitKind::NonLiteral),
             ConstDecl {
@@ -14880,6 +16309,7 @@ mod tests {
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
             },
         ];
         let mut db = QueryDb::new();
@@ -14986,6 +16416,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -15032,6 +16463,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[decl], &binder, &mut db);
@@ -15062,6 +16494,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[decl], &binder, &mut db);
@@ -15090,6 +16523,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         };
         let mut db = QueryDb::new();
         let other = FileId(41);
@@ -15109,6 +16543,7 @@ mod tests {
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
                 ..decl("a", 0, 10, "number", InitKind::Number)
             },
             ConstDecl {
@@ -15116,6 +16551,7 @@ mod tests {
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
                 ..decl("b", 11, 21, "number", InitKind::String)
             },
         ];
@@ -15514,6 +16950,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         };
         let mut db = QueryDb::new();
         let report = check_file(FILE, &[object_init, primitive_init], &binder, &mut db);
@@ -15617,6 +17054,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -15957,6 +17395,7 @@ mod tests {
                     // Plain call tests never feed object members (see
                     // `object_call` for the structural seam).
                     arg_object: None,
+                    arg_arrow: None,
                 })
                 .collect(),
         }
@@ -15992,6 +17431,7 @@ mod tests {
                             .collect(),
                         fresh: true,
                     }),
+                    arg_arrow: None,
                 })
                 .collect(),
         }
@@ -16010,6 +17450,7 @@ mod tests {
                 cast: None,
                 ident: Some(name.to_owned()),
                 arg_object: None,
+                arg_arrow: None,
             }],
         }
     }
@@ -16205,6 +17646,7 @@ mod tests {
             cast: None,
             init_ternary: Some(TernaryInit { then_arm, else_arm }),
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -16496,6 +17938,7 @@ mod tests {
                 cast: Some(never_cast),
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
             },
             decl("uv", 22, 32, "unknown", InitKind::String),
             ternary_decl(
@@ -18384,6 +19827,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -18402,6 +19846,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -18897,6 +20342,7 @@ mod tests {
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
             },
         ];
         let uses = [narrowing_use("a", 40, 50, "string", "x", 48, 49)];
@@ -19200,6 +20646,7 @@ mod tests {
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
             },
         ];
         let uses = [narrowing_use("h", 40, 50, "string", "g", 48, 49)];
@@ -19348,6 +20795,8 @@ mod tests {
                         ident: None,
                         // Generic tests never feed object members.
                         arg_object: None,
+                        // Generic tests never feed arrow expressions.
+                        arg_arrow: None,
                     })
                     .collect(),
             },
@@ -19383,6 +20832,8 @@ mod tests {
                         ident: ident.map(str::to_owned),
                         // Generic tests never feed object members.
                         arg_object: None,
+                        // Generic tests never feed arrow expressions.
+                        arg_arrow: None,
                     })
                     .collect(),
             },
@@ -19438,6 +20889,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -21221,6 +22673,7 @@ mod tests {
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
             },
             init_text: text.map(str::to_owned),
             cross_file_deps: Vec::new(),
@@ -22667,6 +24120,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -22687,6 +24141,7 @@ mod tests {
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         }
     }
 
@@ -22909,6 +24364,7 @@ mod tests {
             annotation: Some("number".to_owned()),
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
             ..literal_source("a", 0, 10, InitKind::Number)
         };
         let decls = [source, ident_use("b", 11, 21, "number", "a")];
@@ -22968,6 +24424,7 @@ mod tests {
             annotation: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
             ..ident_use("c", 22, 32, "number", "a")
         };
         let decls = [decl("a", 0, 10, "number", InitKind::Number), use_decl];
@@ -23145,6 +24602,7 @@ mod tests {
             }),
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
             ..literal_source("a", 0, 10, InitKind::Number)
         };
         let decls = [source, ident_use("b", 11, 21, "string", "a")];
@@ -23205,6 +24663,7 @@ mod tests {
             annotation: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
             ..literal_source("l", 0, 10, InitKind::Number)
         }];
         let mut db = QueryDb::new();
