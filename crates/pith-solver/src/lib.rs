@@ -934,12 +934,14 @@
 //!   same-name interface/enum shapes win automatically (the binder merges
 //!   same-scope redeclarations, so the shape claim fires first — probed: the
 //!   use still checks as the interface alongside tsc's `TS2300`s).
-//! - Entry coverage: [`check_enums_with_aliases`] relinks shapes;
-//!   [`check_file_with_aliases`] rewrites primitives but declines
-//!   named-shape targets — it holds no shape tables — with an entry-point
-//!   reason. The base [`check_file`]/[`check_enums`] entries thread empty
-//!   tables and keep today's verdicts, as does [`multifile`] (which keeps
-//!   its own import-alias rules and never calls the variants — a pinned
+//! - Entry coverage: [`check_enums_with_aliases`] relinks shapes and,
+//!   since P078, threads [`IdentTable`] inputs built from its declarators
+//!   (params empty — pinned gap); [`check_file_with_aliases`] rewrites
+//!   primitives but declines named-shape targets — it holds no shape
+//!   tables — with an entry-point reason. The base [`check_file`]/
+//!   [`check_enums`] entries thread empty alias tables and keep the
+//!   same shapes, as does [`multifile`] (which keeps its own
+//!   import-alias rules and never calls the variants — a pinned
 //!   gap: multifile-local aliases keep today's declines). Qualified
 //!   (`NS.Alias`), union-member, narrowing, function-return, class, and
 //!   legacy-interface-entry sites keep today's verdicts (pinned gaps: those
@@ -13412,9 +13414,9 @@ pub fn check_enums(
 /// annotations rewrite and check as if written, alias-to-interface/enum
 /// annotations relink the underlying shape and check through the existing
 /// shape paths spelling the underlying name, and unexpandable targets
-/// decline with distinct reasons. [`check_enums`] threads an empty table;
-/// [`multifile`] keeps its own import-alias rules and never calls this
-/// entry.
+/// decline with distinct reasons. [`check_enums`] threads an empty alias
+/// table; [`multifile`] keeps its own import-alias rules and never calls
+/// this entry.
 #[must_use]
 pub fn check_enums_with_aliases(
     file: FileId,
@@ -13432,14 +13434,20 @@ pub fn check_enums_with_aliases(
                 .insert((file, occurrence_node(index)), init.fresh);
         }
     }
-    let mut report = FileReport::default();
     let const_names: Vec<&str> = decls.iter().map(|decl| decl.decl.name.as_str()).collect();
     let alias_scope = LocalAliasScope {
         aliases,
         const_names: &const_names,
     };
-    let empty_idents = IdentTable::default();
+    let const_decls: Vec<ConstDecl> = decls.iter().map(|decl| decl.decl.clone()).collect();
+    let mut idents = IdentTable {
+        inputs: ident_inputs_from_decls(binder, file, &const_decls, &alias_scope),
+        params: Vec::new(),
+        checked: 0,
+    };
+    let mut report = FileReport::default();
     for (index, decl) in decls.iter().enumerate() {
+        idents.checked = index;
         let mut route = EnumDeclCtx {
             file,
             node: occurrence_node(index),
@@ -13450,7 +13458,7 @@ pub fn check_enums_with_aliases(
             db: &mut *db,
             freshness: &freshness,
             report: &mut report,
-            idents: &empty_idents,
+            idents: &idents,
         };
         route_enum_declaration(&mut route);
     }
@@ -13472,8 +13480,10 @@ struct EnumDeclCtx<'a, 'b, 'c> {
     db: &'a mut QueryDb,
     freshness: &'a FreshnessTable,
     report: &'a mut FileReport,
-    /// Identifier sources (empty on the enum entry — pinned gap: those
-    /// declarations keep today's verdicts).
+    /// Identifier sources, built from the declarators through the same
+    /// [`ident_inputs_from_decls`] builder as the const entry; params stay
+    /// empty here (pinned gap: function-parameter/body idents still resolve
+    /// only on function entries).
     idents: &'a IdentTable,
 }
 
@@ -25467,6 +25477,45 @@ mod tests {
             ident_use("b", 22, 32, "number", "t"),
         ];
         let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn enum_entry_threads_idents_for_bare_receiver() {
+        // P078: the enum entry builds IdentTable inputs from its declarators
+        // through the same builder as the const path, so a bare-identifier
+        // receiver call (`s.trim()`) upgrades and its result feeds one
+        // level; params stay empty (pinned gap), so a receiver naming a
+        // function parameter would NOT resolve here.
+        let binder = binder_with(&[("s", span(0, 10)), ("t", span(11, 21)), ("b", span(22, 32))]);
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[],
+        };
+        let wrap = |decl: ConstDecl| EnumDecl {
+            decl,
+            init_text: None,
+            cross_file_deps: Vec::new(),
+        };
+        let decls = [
+            wrap(literal_source("s", 0, 10, InitKind::String)),
+            wrap(call_use(
+                "t",
+                11,
+                21,
+                None,
+                "trim",
+                Some(bare_receiver("s")),
+            )),
+            wrap(ident_use("b", 22, 32, "number", "t")),
+        ];
+        let report = enums_report(&decls, &input, &binder);
         assert_eq!(report.diagnostics.len(), 1);
         assert_eq!(
             report.diagnostics[0].message,
