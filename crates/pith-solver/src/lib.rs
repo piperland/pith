@@ -6998,9 +6998,17 @@ fn class_occurrence_node(base: u32, offset: usize) -> NodeId {
 ///   shape), and duplicate
 ///   bare names keep their per-position silence (`same(a, "s")` stays
 ///   silent where tsc spells the literal `1` — the P036 divergence above).
-///   The explicit-list path ignores identifier names entirely, so
-///   `id<string>(a)` keeps its historical per-argument skip (oracle
-///   `TS2345` — pinned divergence); mis-substitution wording is untouched.
+///   The explicit-list path resolves identifier names one level through the
+///   same per-call table (P069, probed on tsc 7.0.2 `--strict --pretty
+///   false`; probes in `.agent/scratch/p069-probes/`): `const numIdent =
+///   1; id<number>(numIdent)` is clean (p17), `id<string>(numIdent)`
+///   diagnoses `TS2345` at the argument exactly like a literal (p18 — the
+///   P061 pinned divergence now closed), and `id<string>(nope)` keeps the
+///   historical per-argument skip where tsc spells `TS2304` (p19 — pinned
+///   divergence on this path only). `SilentAny`/`SilentNever` stay silent
+///   and every other decline keeps the skip, so the explicit path still
+///   never diagnoses names — only types — and the priority chain is
+///   unchanged; mis-substitution wording is untouched.
 ///   Visibility counts the source-order prefix whose binder span ends before
 ///   the call starts (the single-pass order, no flow analysis); each call
 ///   builds its own table, so no resolution state crosses call sites.
@@ -7794,11 +7802,13 @@ struct ResolvedCall {
     /// Display text per type parameter.
     displays: Vec<String>,
     /// Effective literal kind per VALUE position, in argument order (`Some`
-    /// only for inferred identifier arguments that substituted a checkable
-    /// kind — P061): the argument check runs these against the declared
-    /// constraint exactly like literals, so `idc(a)` diagnoses where tsc
-    /// does. Literal positions read their own kind; explicit calls and
-    /// silent (`any`/`never`) bindings read `None` and skip as before.
+    /// only for identifier arguments that substituted a checkable kind —
+    /// P061 on the inferred path, P069 on the explicit path): the argument
+    /// check runs these against the declared constraint (inferred) or the
+    /// resolved display (explicit) exactly like literals, so `idc(a)` and
+    /// `id<string>(numIdent)` diagnose where tsc does. Literal positions
+    /// read their own kind; silent (`any`/`never`) bindings and every
+    /// declined or unresolvable identifier read `None` and skip as before.
     ident_kinds: Vec<Option<InitKind>>,
 }
 
@@ -7982,8 +7992,12 @@ fn check_value_arity(view: &GenericCallView<'_>, ctx: &mut GenericCallCtx<'_, '_
 /// union/object texts decline (tsc admits them but the subset cannot spell
 /// checks against them — pinned oracle-clean divergence); every unknown
 /// name diagnoses `PITH2304` (all report, never just the first — probed
-/// tsc 7.0.2 P036). Returns `None` after a decline or when any name
-/// missed (satisfaction and argument checks then skip).
+/// tsc 7.0.2 P036). Bare-identifier arguments additionally resolve one level
+/// through the call's [`IdentTable`] (P069 — see [`fill_explicit_ident_kinds`]):
+/// substitutable kinds check per position with the unchanged `TS2345`
+/// wording, while anything else keeps the historical skip. Returns `None`
+/// after a decline or when any name missed (satisfaction and argument
+/// checks then skip).
 #[must_use]
 fn resolve_explicit(
     view: &GenericCallView<'_>,
@@ -7994,9 +8008,11 @@ fn resolve_explicit(
     let mut resolved = ResolvedCall {
         ids: Vec::with_capacity(view.shape.params.len()),
         displays: Vec::with_capacity(view.shape.params.len()),
-        // Explicit type arguments check against their own resolved display,
-        // so identifier arguments keep the historical per-argument skip here
-        // (P061 leaves the explicit path untouched).
+        // Explicit type arguments check against their own resolved display;
+        // identifier-argument kinds fill below (P069) so only substitutable
+        // names check — everything else keeps the historical skip here
+        // (P061 left the explicit path untouched; P069 fills it without
+        // ever diagnosing names).
         ident_kinds: vec![None; view.call.args.len()],
     };
     let mut missed = false;
@@ -8050,7 +8066,85 @@ fn resolve_explicit(
     if missed {
         return None;
     }
+    let table = ident_table_for_call(
+        ctx.binder,
+        file,
+        ctx.consts,
+        view.enclosing.as_ref(),
+        view.call.span.lo,
+    );
+    let scope = view
+        .enclosing
+        .as_ref()
+        .map_or(0, |enclosing| enclosing.scope);
+    let filler = ExplicitIdentFill {
+        view,
+        binder: ctx.binder,
+        file,
+        table: &table,
+        scope,
+    };
+    fill_explicit_ident_kinds(&filler, &mut resolved);
     Some(resolved)
+}
+
+/// What one explicit call's identifier-argument fill reads (P069): the
+/// call view plus its freshly built per-call resolution inputs, bundled so
+/// the filler stays lean.
+struct ExplicitIdentFill<'a> {
+    /// The admitted call whose identifier arguments resolve.
+    view: &'a GenericCallView<'a>,
+    /// Binder for name resolution.
+    binder: &'a Binder,
+    /// File under check.
+    file: FileId,
+    /// The call's freshly built per-call [`IdentTable`] (H-002: dropped
+    /// after the call, never shared across sites).
+    table: &'a IdentTable,
+    /// Scope identifier arguments resolve from (the enclosing function's
+    /// scope, or `0` for top-level calls).
+    scope: u32,
+}
+
+/// Resolves one explicit-path identifier argument one level (P069).
+///
+/// Reuses [`resolve_generic_ident`] (the P061 shared P048 path), so every
+/// P048 reason rides through automatically. Only a substitutable kind
+/// returns `Some`: `SilentAny`/`SilentNever` stay silent and every decline
+/// (unresolvable names, `let` bindings, depth-2+ chains,
+/// use-before-declaration, non-literal sources) keeps the historical
+/// per-argument skip — the explicit path never diagnoses names, only
+/// types, so the priority chain is unchanged.
+fn resolve_explicit_ident(fill: &ExplicitIdentFill<'_>, name: &str) -> Option<InitKind> {
+    match resolve_generic_ident(fill.binder, fill.file, fill.table, name, fill.scope) {
+        IdentResolution::Substitute(kind) => Some(kind),
+        IdentResolution::SilentAny
+        | IdentResolution::SilentNever
+        | IdentResolution::Decline(_)
+        | IdentResolution::Keep => None,
+    }
+}
+
+/// Fills one explicit call's identifier-argument kinds (P069).
+///
+/// Bare-identifier arguments resolve one level through the call's
+/// [`IdentTable`] exactly like the inferred path; substitutable kinds land
+/// in `resolved`'s per-position slots so [`check_arg_types`] diagnoses
+/// mismatches per position with the unchanged `TS2345` wording, while
+/// anything else keeps the historical skip (unresolvable included — the
+/// oracle's `TS2304` stays a pinned divergence on this path).
+fn fill_explicit_ident_kinds(fill: &ExplicitIdentFill<'_>, resolved: &mut ResolvedCall) {
+    for (position, argument) in fill.view.call.args.iter().enumerate() {
+        if argument.kind != InitKind::NonLiteral {
+            continue;
+        }
+        let Some(name) = argument.ident.as_deref() else {
+            continue;
+        };
+        if let Some(kind) = resolve_explicit_ident(fill, name) {
+            resolved.ident_kinds[position] = Some(kind);
+        }
+    }
 }
 
 /// Builds one generic call's identifier side table (P061, H-002).
@@ -21262,11 +21356,12 @@ mod tests {
     }
 
     #[test]
-    fn generic_ident_explicit_path_ignores_names() {
-        // `id<string>(a)` over `const a = 1`: the explicit path never
-        // resolves identifier names, so the historical per-argument skip
-        // holds (oracle TS2345 — pinned divergence, P061 leaves explicit
-        // lists untouched).
+    fn generic_ident_explicit_path_checks_resolved_kind() {
+        // `id<string>(a)` over `const a = 1`: P069 resolves the identifier
+        // one level through the per-call table (converting the P061 pinned
+        // divergence — the explicit path no longer skips), so the oracle's
+        // TS2345 fires at the argument exactly like a literal, plus the body
+        // note.
         let binder = binder_with(&[("id", span(0, 20)), ("a", span(22, 23))]);
         let decls = [identity_decl(0, 20)];
         let consts = [const_source(
@@ -21288,6 +21383,67 @@ mod tests {
             None,
         )];
         let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_ARG_TYPE);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Argument of type 'number' is not assignable to parameter of type 'string'."
+        );
+        assert_eq!(report.diagnostics[0].span, span(40, 41));
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_explicit_path_clean_matches() {
+        // `id<number>(a)` over `const a = 1`: the resolved `number` matches
+        // the explicit argument, so the call is silent (plus the body note).
+        let binder = binder_with(&[("id", span(0, 20)), ("a", span(22, 23))]);
+        let decls = [identity_decl(0, 20)];
+        let consts = [const_source(
+            "a",
+            22,
+            23,
+            DeclKind::Const,
+            None,
+            Some(InitKind::Number),
+            None,
+        )];
+        let args = vec![(InitKind::NonLiteral, 40, 41, Some("a"))];
+        let calls = [generic_call_args_ident(
+            "id",
+            30,
+            32,
+            args,
+            Some(vec!["number"]),
+            None,
+        )];
+        let report = generics_report_with_consts(&decls, &consts, &calls, &binder);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn generic_ident_explicit_path_unresolvable_skips() {
+        // `id<string>(nope)` with no source: the explicit path keeps the
+        // historical per-argument skip (never a decline note), plus the body
+        // note. The oracle spells TS2304 (pinned oracle-error divergence on
+        // this path only).
+        let binder = binder_with(&[("id", span(0, 20))]);
+        let decls = [identity_decl(0, 20)];
+        let args = vec![(InitKind::NonLiteral, 40, 44, Some("nope"))];
+        let calls = [generic_call_args_ident(
+            "id",
+            30,
+            32,
+            args,
+            Some(vec!["string"]),
+            None,
+        )];
+        let report = generics_report_with_consts(&decls, &[], &calls, &binder);
         assert!(
             report.diagnostics.is_empty(),
             "diagnostics: {:?}",
