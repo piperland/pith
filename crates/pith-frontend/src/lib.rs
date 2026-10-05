@@ -40,7 +40,10 @@
 //! only — patterns that are not plain identifiers set `params_complex`
 //! instead of mis-keying), the return annotation text + span
 //! ([`AnnotationFact`], `None` when unannotated), and the body shape
-//! ([`FunctionBodyFact`]). Straight-line single-`return` bodies with an
+//! ([`FunctionBodyFact`]). `body_scope` records the per-file index of the
+//! function body scope (the child of the owning scope holding the parameter
+//! bindings; `u32::MAX` when indeterminable), resolved post-pass exactly
+//! like [`NamespaceFact::body_scope`]. Straight-line single-`return` bodies with an
 //! argument are checkable, as are the three P023 joins (each return checks
 //! independently solver-side): two sequential returns
 //! ([`FunctionBodyFact::SequenceReturns`]), an `if`-without-`else`
@@ -609,6 +612,11 @@ pub struct FunctionFact {
     /// Body shape; single returns, the three P023 joins, and the P031
     /// straight bodies are checkable.
     pub body: FunctionBodyFact,
+    /// Per-file scope index of the function's body scope: the child of the
+    /// owning scope holding the parameter bindings (`u32::MAX` when
+    /// indeterminable, e.g. `declare function` or a body scope owning no
+    /// symbols). Parameter and inner binding resolution starts here.
+    pub body_scope: u32,
 }
 
 /// One declared type parameter: its name plus its bound texts.
@@ -1798,6 +1806,10 @@ struct DeclCollector<'a> {
     scopes: std::collections::HashMap<u32, u32>,
     decls: Vec<DeclFact>,
     functions: Vec<FunctionFact>,
+    /// Function declaration spans, parallel to `functions` (same order):
+    /// `body_scope` is resolved post-pass as the child scope owning
+    /// span-contained symbols, mirroring namespace facts.
+    function_spans: Vec<Span>,
     calls: Vec<CallFact>,
     member_calls: Vec<MemberCallFact>,
     guards: Vec<TypeofGuardFact>,
@@ -2136,6 +2148,37 @@ fn assign_namespace_body_scopes(
             });
             if owned {
                 namespace.body_scope = scope.index;
+                break;
+            }
+        }
+    }
+}
+
+/// Fills `body_scope` on each function fact: the child of the owning scope
+/// holding span-contained parameter/local symbols (mirrors
+/// [`assign_namespace_body_scopes`] through [`FunctionFact::body_scope`]).
+/// Scopes arrive root-first, so the first match wins deterministically;
+/// facts whose owning scope missed stay `u32::MAX` (body-less
+/// `declare function`, bodies whose scope owns no symbols).
+fn assign_function_body_scopes(
+    scopes: &[ScopeFact],
+    symbols: &[SymbolFact],
+    functions: &mut [FunctionFact],
+    spans: &[Span],
+) {
+    for (function, span) in functions.iter_mut().zip(spans.iter()) {
+        if function.scope == u32::MAX {
+            continue;
+        }
+        for scope in scopes {
+            if scope.parent != function.scope {
+                continue;
+            }
+            let owned = symbols
+                .iter()
+                .any(|symbol| symbol.scope == scope.index && span_contains(*span, symbol.span));
+            if owned {
+                function.body_scope = scope.index;
                 break;
             }
         }
@@ -4196,6 +4239,13 @@ impl DeclCollector<'_> {
             type_params_complex,
             return_annotation,
             body,
+            body_scope: u32::MAX,
+        });
+        // Parallel span for the post-pass (`assign_function_body_scopes`).
+        self.function_spans.push(Span {
+            file: self.file,
+            lo: func.span.start,
+            hi: func.span.end,
         });
     }
 
@@ -5471,8 +5521,9 @@ struct CollectedFacts {
 ///
 /// Symbol linkage resolves each declarator's `(name, binding start)` to the
 /// per-file [`SymbolFact`] index built above; facts come out in source
-/// (visitor) order, so the sequences are deterministic. Namespace
-/// `body_scope` values are filled post-pass from `scopes` plus `symbols`.
+/// (visitor) order, so the sequences are deterministic. Namespace and
+/// function `body_scope` values are filled post-pass from `scopes` plus
+/// `symbols`.
 fn collect_decls<'a>(
     file: FileId,
     source: &'a str,
@@ -5497,6 +5548,7 @@ fn collect_decls<'a>(
         scopes: scope_of,
         decls: Vec::new(),
         functions: Vec::new(),
+        function_spans: Vec::new(),
         calls: Vec::new(),
         member_calls: Vec::new(),
         guards: Vec::new(),
@@ -5515,7 +5567,8 @@ fn collect_decls<'a>(
     collector.visit_program(program);
     let DeclCollector {
         decls,
-        functions,
+        mut functions,
+        function_spans,
         calls,
         member_calls,
         guards,
@@ -5529,6 +5582,7 @@ fn collect_decls<'a>(
         ..
     } = collector;
     assign_namespace_body_scopes(scopes, symbols, &mut namespaces);
+    assign_function_body_scopes(scopes, symbols, &mut functions, &function_spans);
     CollectedFacts {
         decls,
         functions,
@@ -8218,6 +8272,57 @@ export function f(a: string): string { return a + b; }
             assert_eq!(fact.span.file, FileId(0));
             assert!(fact.span.lo < fact.span.hi);
         }
+    }
+
+    #[test]
+    fn function_facts_body_scope_holds_param_bindings() {
+        let src = "function greet(name: string): string { return name; }\n";
+        let pf = parse_module(FileId(0), "f.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        let fact = &pf.functions[0];
+        assert_ne!(fact.body_scope, u32::MAX, "body scope resolved");
+        let body = &pf.scopes[usize::try_from(fact.body_scope).expect("dense scope index")];
+        assert_eq!(body.parent, fact.scope);
+        // Binder resolution: the param symbol lives in the body scope.
+        let param = pf
+            .symbols
+            .iter()
+            .find(|s| s.name == "name")
+            .expect("name symbol");
+        assert_eq!(param.scope, fact.body_scope);
+        let greet = pf
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("greet symbol");
+        assert_eq!(fact.scope, greet.scope);
+    }
+
+    #[test]
+    fn function_facts_nested_own_innermost_body_scopes() {
+        let src =
+            "function outer(a: number) { function inner(b: number) { return b; } return a; }\n";
+        let pf = parse_module(FileId(0), "f.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 2);
+        let outer = &pf.functions[0];
+        let inner = &pf.functions[1];
+        assert_ne!(outer.body_scope, u32::MAX);
+        assert_ne!(inner.body_scope, u32::MAX);
+        // The nested function lives inside the outer body scope.
+        assert_eq!(inner.scope, outer.body_scope);
+        let inner_body = &pf.scopes[usize::try_from(inner.body_scope).expect("dense scope index")];
+        assert_eq!(inner_body.parent, inner.scope);
+        let b = pf.symbols.iter().find(|s| s.name == "b").expect("b symbol");
+        assert_eq!(b.scope, inner.body_scope);
+        let a = pf.symbols.iter().find(|s| s.name == "a").expect("a symbol");
+        assert_eq!(a.scope, outer.body_scope);
+        // Empty bodies own no symbols, so no body scope.
+        let pf2 = parse_module(FileId(0), "g.ts", "function empty() {}\n");
+        assert!(pf2.errors.is_empty(), "errors: {:?}", pf2.errors);
+        assert_eq!(pf2.functions.len(), 1);
+        assert_eq!(pf2.functions[0].body_scope, u32::MAX);
     }
 
     #[test]
