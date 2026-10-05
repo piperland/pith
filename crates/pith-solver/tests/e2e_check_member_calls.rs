@@ -105,6 +105,8 @@ fn member_calls_from_facts(parsed: &ParsedFile) -> Vec<MemberCallSite> {
                     ident: None,
                     // Member-call drivers never feed object members.
                     arg_object: None,
+                    // Member-call drivers never feed arrow expressions.
+                    arg_arrow: None,
                 })
                 .collect(),
         })

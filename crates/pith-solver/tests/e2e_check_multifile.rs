@@ -253,6 +253,7 @@ fn consts_from_facts(
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         });
         idents.push(ident.map(str::to_owned));
         texts.push(text);
@@ -400,6 +401,8 @@ fn calls_from_facts(parsed: &ParsedFile) -> Vec<CallSite> {
                     ident: None,
                     // Call drivers never feed object members.
                     arg_object: None,
+                    // Call drivers never feed arrow expressions.
+                    arg_arrow: None,
                 })
                 .collect(),
         })

@@ -259,6 +259,9 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<C
                 // threads no enum tables, so those positions keep today's
                 // whole-declaration non-literal decline).
                 init_member_ref: None,
+                // No arrow facts yet (arrows keep the historical
+                // non-literal decline on this path).
+                init_arrow: None,
             }
         })
         .collect()

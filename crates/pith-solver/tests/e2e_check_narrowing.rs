@@ -181,6 +181,7 @@ fn narrowing_inputs_from_facts(
             cast: None,
             init_ternary: None,
             init_member_ref: None,
+            init_arrow: None,
         });
     }
     let guards = parsed

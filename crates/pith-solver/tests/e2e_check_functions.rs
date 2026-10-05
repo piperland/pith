@@ -140,6 +140,12 @@
 //! the clean baseline plus two notes, and `ts2391-impl-less-declined` pins
 //! the oracle `TS2391` plus two notes — never a declaration diagnostic for
 //! the missing body.
+//! Contextual arrows (P064) bind leading-initializer params from admitted
+//! function-typed annotations: `leading-init-clean`/`wrong` match their
+//! oracle families with zero notes, while `return-arrow-declined` keeps the
+//! historical whole-declaration non-literal decline (oracle `TS2322` plus
+//! `TS7006` — pinned divergence). Arrow facts ride per-fixture hand-fed
+//! tables ([`LeadingArrowShape`] — the adapter emits no arrow facts).
 
 use pith_frontend::{
     parse_module, CastFact as FrontendCastFact, CastKind as FrontendCastKind,
@@ -152,11 +158,11 @@ use pith_frontend::{
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_functions, CastInput, CastKind, CountedForBody, DeclKind, EffectCall, ElseIfChainBody,
-    FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardChainBody,
-    GuardEffectBody, GuardThrowBody, InitKind, InnerDecl, JoinedReturns, ObjectInit,
-    ObjectMemberInit, ObjectMemberKind, StraightBody, StraightThrowBody, SwitchBody, TernaryArm,
-    TernaryInit, TryCatchBody,
+    check_functions, ArrowBody, ArrowInit, ArrowParam, CastInput, CastKind, CountedForBody,
+    DeclKind, EffectCall, ElseIfChainBody, FileReport, FunctionBody, FunctionDecl, FunctionParam,
+    FunctionReturn, GuardChainBody, GuardEffectBody, GuardThrowBody, InitKind, InnerDecl,
+    JoinedReturns, ObjectInit, ObjectMemberInit, ObjectMemberKind, StraightBody, StraightThrowBody,
+    SwitchBody, TernaryArm, TernaryInit, TryCatchBody,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -487,6 +493,9 @@ fn map_inner_decl(
         // No member-reference facts yet (the legacy function entry threads
         // no enum tables — see `map_function_return`).
         member_ref: None,
+        // No arrow facts yet here (see `attach_leading_arrows` for the
+        // hand-fed contextual seam).
+        init_arrow: None,
     }
 }
 
@@ -750,6 +759,95 @@ fn run_pipeline(source: &str) -> (ParsedFile, FileReport) {
     );
     let binder = build_binder(&parsed);
     let decls = functions_from_facts(&parsed, &binder, source);
+    let mut db = QueryDb::new();
+    let report = check_functions(FILE, &decls, &binder, &mut db);
+    (parsed, report)
+}
+
+/// One hand-fed leading arrow shape (P064): the `leading`-th leading
+/// declarator of the fixture's single straight-bodied function, plus the
+/// arrow facts the adapter cannot emit yet. Mirrors [`ArrowArgShape`] in
+/// the check-calls driver: asserted `NonLiteral` with no cast and no
+/// object members (exactly like the frontend classifies arrows), explicit
+/// parameter and body tables, init-fact spans standing in for arrow/body
+/// spans (differentials compare codes plus messages only). The seam
+/// vanishes when the adapter emits arrow facts.
+struct LeadingArrowShape<'a> {
+    /// Index into the straight body's leading declarators.
+    leading: usize,
+    /// Arrow parameters in source order: names plus whether each is a
+    /// `...rest` parameter (unannotated identifiers either way).
+    params: &'a [(&'a str, bool)],
+    /// Literal kind of the expression body.
+    body_kind: FrontendInitKind,
+    /// Bare-identifier body name (`Some("x")` for `(x) => x`); `None` for
+    /// literal bodies.
+    body_ident: Option<&'a str>,
+}
+
+/// Attaches hand-fed arrow facts to straight-body leading declarators
+/// (P064): each shape must name a `NonLiteral`, cast-less, member-less
+/// leading of the fixture's single straight-bodied function (asserted —
+/// exactly the arrow classification), whose init-fact span stands in for
+/// the arrow and body spans.
+fn attach_leading_arrows(decls: &mut [FunctionDecl], arrows: &[LeadingArrowShape<'_>]) {
+    assert_eq!(decls.len(), 1, "contextual fixtures hold one function");
+    let body = match &mut decls[0].body {
+        FunctionBody::StraightBody(straight) => &mut straight.leading,
+        FunctionBody::StraightThrow(straight) => &mut straight.leading,
+        _ => panic!("contextual fixtures hold a straight body"),
+    };
+    for shape in arrows {
+        let inner = body.get_mut(shape.leading).expect("leading index in range");
+        assert_eq!(
+            inner.init,
+            Some(InitKind::NonLiteral),
+            "arrow inits classify NonLiteral"
+        );
+        assert!(inner.cast.is_none(), "arrow inits carry no assertions");
+        assert!(inner.init_object.is_none(), "arrow inits carry no members");
+        assert!(
+            inner.init_ident.is_none(),
+            "arrow inits are never bare identifiers"
+        );
+        let span = inner.span;
+        inner.init_arrow = Some(ArrowInit {
+            params: shape
+                .params
+                .iter()
+                .map(|(name, is_rest)| ArrowParam {
+                    name: (*name).to_owned(),
+                    annotated: false,
+                    annotation: None,
+                    is_rest: *is_rest,
+                })
+                .collect(),
+            params_complex: false,
+            body: ArrowBody {
+                kind: map_inner_init_kind(shape.body_kind),
+                span,
+                ident: shape.body_ident.map(str::to_owned),
+            },
+            body_complex: false,
+            span,
+        });
+    }
+}
+
+/// Runs the contextual pipeline with hand-fed leading arrow shapes (P064).
+fn run_pipeline_leading(
+    source: &str,
+    arrows: &[LeadingArrowShape<'_>],
+) -> (ParsedFile, FileReport) {
+    let parsed = parse_module(FILE, "fixture.ts", source);
+    let frontend_errors = &parsed.errors;
+    assert!(
+        parsed.errors.is_empty(),
+        "frontend errors: {frontend_errors:?}"
+    );
+    let binder = build_binder(&parsed);
+    let mut decls = functions_from_facts(&parsed, &binder, source);
+    attach_leading_arrows(&mut decls, arrows);
     let mut db = QueryDb::new();
     let report = check_functions(FILE, &decls, &binder, &mut db);
     (parsed, report)
@@ -1903,6 +2001,131 @@ fn excluded_shapes_emit_no_facts_and_stay_silent() {
     );
     assert!(report.diagnostics.is_empty());
     assert!(report.unsupported.is_empty());
+}
+
+/// Asserts the contextual pipeline verdict differentially equals the
+/// recorded baseline with hand-fed leading arrow shapes (P064): same
+/// `(code-family, message)` multiset (`TS`/`PITH` prefixes folded) and the
+/// expected unsupported count, with sane anchored spans throughout.
+fn expect_differential_leading(
+    name: &str,
+    source: &str,
+    expected: &str,
+    unsupported: usize,
+    arrows: &[LeadingArrowShape<'_>],
+) {
+    let (_, report) = run_pipeline_leading(source, arrows);
+    let mut actual: Vec<(String, String)> = report
+        .diagnostics
+        .iter()
+        .map(|diag| {
+            let family = diag
+                .code
+                .strip_prefix("PITH")
+                .unwrap_or(diag.code.as_str())
+                .to_owned();
+            (format!("TS{family}"), diag.message.clone())
+        })
+        .collect();
+    actual.sort();
+    let want = parse_baseline(expected);
+    assert_eq!(
+        actual, want,
+        "{name}: pipeline diagnostics diverge from oracle baseline"
+    );
+    let unsupported_notes = &report.unsupported;
+    assert_eq!(
+        report.unsupported.len(),
+        unsupported,
+        "{name}: unsupported count: {unsupported_notes:?}"
+    );
+    for diag in &report.diagnostics {
+        assert_eq!(diag.file, FILE, "{name}: diagnostic file");
+        assert!(diag.span.lo < diag.span.hi, "{name}: degenerate span");
+    }
+    for note in &report.unsupported {
+        assert_eq!(note.file, FILE, "{name}: unsupported file");
+        assert!(note.span.lo < note.span.hi, "{name}: degenerate span");
+    }
+}
+
+#[test]
+fn leading_init_clean_matches_oracle() {
+    // P064: a leading initializer against an admitted function type binds
+    // contextually — the clean body stays silent like the oracle.
+    let source = include_str!("../../../corpus/check-functions/leading-init-clean.ts");
+    let expected = include_str!("../../../corpus/check-functions/leading-init-clean.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on the contextual leading"
+    );
+    expect_differential_leading(
+        "leading_init_clean_matches_oracle",
+        source,
+        expected,
+        0,
+        &[LeadingArrowShape {
+            leading: 0,
+            params: &[("x", false)],
+            body_kind: FrontendInitKind::Number,
+            body_ident: None,
+        }],
+    );
+}
+
+#[test]
+fn leading_init_wrong_matches_ts2322() {
+    // P064: a wrong contextual leading body diagnoses once at the body
+    // span (probed 7.0.2: `TS2322` naming the widened body kind).
+    let source = include_str!("../../../corpus/check-functions/leading-init-wrong.ts");
+    let expected = include_str!("../../../corpus/check-functions/leading-init-wrong.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2322".to_owned(),
+            "Type 'string' is not assignable to type 'number'.".to_owned()
+        )],
+        "oracle baseline pins the leading verdict"
+    );
+    expect_differential_leading(
+        "leading_init_wrong_matches_ts2322",
+        source,
+        expected,
+        0,
+        &[LeadingArrowShape {
+            leading: 0,
+            params: &[("x", false)],
+            body_kind: FrontendInitKind::String,
+            body_ident: None,
+        }],
+    );
+}
+
+#[test]
+fn return_arrow_declines_as_before() {
+    // P064: a return-position arrow has no function-type context, so it
+    // keeps the historical whole-declaration non-literal decline (the
+    // oracle spells `TS2322` plus `TS7006` — probed 7.0.2 `v`).
+    let source = include_str!("../../../corpus/check-functions/return-arrow-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-functions/return-arrow-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected).len(),
+        2,
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("non-literal return"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
 }
 
 #[test]

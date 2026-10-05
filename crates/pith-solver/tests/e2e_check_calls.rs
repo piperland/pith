@@ -64,7 +64,16 @@
 //! `ambient-overload-generic-declined` (generic exclusion against a clean
 //! oracle), and `non-callable-ambient-declined` (oracle `TS2349`, solver
 //! one unsupported with the no-signature reason) pin their divergences
-//! explicitly.
+//! explicitly. Contextual arrows (P064) bind unannotated params from
+//! admitted function-typed params (inline or one alias level) and check
+//! bodies through the existing delegation: `contextual-clean`/`wrong-body`
+//! and `named-alias-clean` match their oracle families with zero
+//! unsupported, while `rest-declined`, `destructured-declined`,
+//! `free-standing-declined` (unannotated-callee gate, as before), and
+//! `returns-dependent-declined` (generic `T` never admits) pin their
+//! divergences explicitly. Arrow facts ride per-fixture hand-fed tables
+//! ([`ArrowArgShape`] — the adapter emits no arrow facts); identifier
+//! names never slice for arrows (explicit tables only).
 
 use pith_frontend::{
     parse_module, CallArgFact as FrontendCallArg, CallArgKind as FrontendCallArgKind,
@@ -73,9 +82,10 @@ use pith_frontend::{
 };
 use pith_ids::{FileId, Span, SymbolId};
 use pith_solver::{
-    check_calls, check_calls_with_named_types, CallArg, CallSite, FileReport, FunctionBody,
-    FunctionDecl, FunctionParam, FunctionReturn, InitKind, InterfaceHeritage, InterfaceMember,
-    InterfaceShape, JoinedReturns, NamedTypeScope, ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    check_calls, check_calls_with_named_types, ArrowBody, ArrowInit, ArrowParam, CallArg, CallSite,
+    FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, InitKind,
+    InterfaceHeritage, InterfaceMember, InterfaceShape, JoinedReturns, NamedTypeScope, ObjectInit,
+    ObjectMemberInit, ObjectMemberKind, TypeAliasShape,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -326,6 +336,9 @@ fn calls_from_facts(parsed: &ParsedFile) -> Vec<CallSite> {
                     // Fact-only drivers never feed object members (see
                     // `calls_from_facts_named` for the hand-fed seam).
                     arg_object: None,
+                    // Fact-only drivers never feed arrow expressions (see
+                    // `calls_from_facts_contextual` for the hand-fed seam).
+                    arg_arrow: None,
                 })
                 .collect(),
         })
@@ -428,6 +441,9 @@ fn calls_from_facts_named(
                         cast: None,
                         ident: call_arg_ident(source, arg),
                         arg_object,
+                        // Contextual drivers never feed arrow expressions
+                        // here (see `calls_from_facts_contextual`).
+                        arg_arrow: None,
                     }
                 })
                 .collect(),
@@ -435,6 +451,120 @@ fn calls_from_facts_named(
         .collect()
 }
 
+/// One hand-fed arrow argument shape (P064): the `call`-th call in file
+/// order, its `arg`-th argument, and the arrow facts the adapter cannot
+/// emit yet. Drivers feed one entry per arrow argument in the fixture;
+/// every other argument keeps `arg_arrow: None` (literals check
+/// primitively, identifiers slice their name through the P061 seam,
+/// everything else stays unshaped). The kind stays
+/// [`FrontendCallArgKind::NonLiteral`] either way (asserted below —
+/// exactly like the frontend classifies arrows), casts never ride arrows,
+/// and body/arrow spans approximate to the argument span (differentials
+/// compare codes plus messages only). Both seams vanish when the adapter
+/// emits the facts.
+struct ArrowArgShape<'a> {
+    /// Index into [`ParsedFile::calls`] in file order.
+    call: usize,
+    /// Index into the call's arguments.
+    arg: usize,
+    /// Arrow parameters in source order: names plus whether each is a
+    /// `...rest` parameter (unannotated identifiers either way — annotated
+    /// arrow parameters are unit-tested only, never fixture-fed).
+    params: &'a [(&'a str, bool)],
+    /// `true` for destructured parameter patterns (the solver declines).
+    params_complex: bool,
+    /// Literal kind of the expression body.
+    body_kind: FrontendCallArgKind,
+    /// Bare-identifier body name (`Some("x")` for `(x) => x`); `None` for
+    /// literal bodies. Non-identifier non-literal bodies feed `None` and
+    /// ride the existing per-position decline.
+    body_ident: Option<&'a str>,
+    /// `true` for block bodies (the solver declines).
+    body_complex: bool,
+}
+
+/// The contextual call-site driver: adapter facts plus the hand-fed arrow
+/// seam ([`ArrowArgShape`] — asserted `NonLiteral` with no cast, like the
+/// P062 object seam). Arity and spans still come from facts; only the
+/// parameter lists and body shapes are hand-fed, and both vanish when the
+/// adapter emits arrow facts.
+fn calls_from_facts_contextual(parsed: &ParsedFile, arrows: &[ArrowArgShape<'_>]) -> Vec<CallSite> {
+    parsed
+        .calls
+        .iter()
+        .enumerate()
+        .map(|(call_index, call)| CallSite {
+            callee: call.callee.clone(),
+            callee_span: call.callee_span,
+            span: call.span,
+            args: call
+                .args
+                .iter()
+                .enumerate()
+                .map(|(arg_index, arg)| {
+                    let arg_arrow = arrows
+                        .iter()
+                        .find(|shape| shape.call == call_index && shape.arg == arg_index)
+                        .map(|shape| {
+                            assert_eq!(
+                                arg.kind,
+                                FrontendCallArgKind::NonLiteral,
+                                "arrow args classify NonLiteral"
+                            );
+                            assert!(arg.cast.is_none(), "arrow args carry no assertions");
+                            ArrowInit {
+                                params: shape
+                                    .params
+                                    .iter()
+                                    .map(|(name, is_rest)| ArrowParam {
+                                        name: (*name).to_owned(),
+                                        annotated: false,
+                                        annotation: None,
+                                        is_rest: *is_rest,
+                                    })
+                                    .collect(),
+                                params_complex: shape.params_complex,
+                                body: ArrowBody {
+                                    kind: map_call_arg_kind(shape.body_kind),
+                                    span: arg.span,
+                                    ident: shape.body_ident.map(str::to_owned),
+                                },
+                                body_complex: shape.body_complex,
+                                span: arg.span,
+                            }
+                        });
+                    CallArg {
+                        kind: map_call_arg_kind(arg.kind),
+                        span: arg.span,
+                        cast: None,
+                        // Contextual fixtures hold no bare-identifier
+                        // arguments (arrows never slice); every other shape
+                        // keeps the historical skip.
+                        ident: None,
+                        arg_object: None,
+                        arg_arrow,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Maps every [`ParsedFile::aliases`] fact onto a [`TypeAliasShape`]
+/// (mechanical name + target copy, mirroring the check-const driver;
+/// binding spans stay frontend-side — decline reasons anchor at use
+/// sites).
+fn aliases_from_facts(parsed: &ParsedFile) -> Vec<TypeAliasShape> {
+    parsed
+        .aliases
+        .iter()
+        .map(|fact| TypeAliasShape {
+            name: fact.name.clone(),
+            target: fact.target_text.clone(),
+            has_type_params: fact.has_type_params,
+        })
+        .collect()
+}
 /// Maps every [`ParsedFile::interfaces`] fact onto an [`InterfaceShape`]
 /// (mechanical copy of the check-interfaces driver, with the binder
 /// [`SymbolId`] resolved from the checking [`Binder`] — the linkage that
@@ -551,9 +681,43 @@ fn run_pipeline_named_shaped(
     owned.extend(parsed.aliases.iter().map(|alias| alias.name.clone()));
     let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
     let shapes = shapes_from_facts(&parsed, &binder);
+    let aliases = aliases_from_facts(&parsed);
     let scope = NamedTypeScope {
         names: &refs,
         interfaces: &shapes,
+        aliases: &aliases,
+    };
+    let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
+    (parsed, report)
+}
+
+/// Runs the contextual pipeline with hand-fed arrow argument shapes
+/// (P064): `arrows` feeds one [`ArrowArgShape`] per arrow argument (see the
+/// struct docs); interface shapes and alias shapes map from facts (see
+/// [`shapes_from_facts`] and [`aliases_from_facts`]).
+fn run_pipeline_contextual(source: &str, arrows: &[ArrowArgShape<'_>]) -> (ParsedFile, FileReport) {
+    let parsed = parse_module(FILE, "fixture.ts", source);
+    let frontend_errors = &parsed.errors;
+    assert!(
+        parsed.errors.is_empty(),
+        "frontend errors: {frontend_errors:?}"
+    );
+    let binder = build_binder(&parsed);
+    let decls = functions_from_facts(&parsed, &binder);
+    let calls = calls_from_facts_contextual(&parsed, arrows);
+    let mut owned: Vec<String> = parsed
+        .interfaces
+        .iter()
+        .map(|interface| interface.name.clone())
+        .collect();
+    owned.extend(parsed.aliases.iter().map(|alias| alias.name.clone()));
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let shapes = shapes_from_facts(&parsed, &binder);
+    let aliases = aliases_from_facts(&parsed);
+    let scope = NamedTypeScope {
+        names: &refs,
+        interfaces: &shapes,
+        aliases: &aliases,
     };
     let report = check_calls_with_named_types(FILE, &decls, &calls, &binder, &scope);
     (parsed, report)
@@ -1401,6 +1565,302 @@ fn named_alias_call_declines_and_pins_ts2322() {
         "reason: {}",
         report.unsupported[0].reason
     );
+}
+
+/// Asserts the contextual pipeline verdict differentially equals the
+/// recorded baseline with hand-fed arrow argument shapes (P064): same
+/// `(code-family, message)` multiset (`TS`/`PITH` prefixes folded) and the
+/// expected unsupported count, with sane anchored spans throughout.
+fn expect_differential_contextual(
+    name: &str,
+    source: &str,
+    expected: &str,
+    unsupported: usize,
+    arrows: &[ArrowArgShape<'_>],
+) {
+    let (_, report) = run_pipeline_contextual(source, arrows);
+    let mut actual: Vec<(String, String)> = report
+        .diagnostics
+        .iter()
+        .map(|diag| {
+            let family = diag
+                .code
+                .strip_prefix("PITH")
+                .unwrap_or(diag.code.as_str())
+                .to_owned();
+            (format!("TS{family}"), diag.message.clone())
+        })
+        .collect();
+    actual.sort();
+    let want = parse_baseline(expected);
+    assert_eq!(
+        actual, want,
+        "{name}: pipeline diagnostics diverge from oracle baseline"
+    );
+    let unsupported_notes = &report.unsupported;
+    assert_eq!(
+        report.unsupported.len(),
+        unsupported,
+        "{name}: unsupported count: {unsupported_notes:?}"
+    );
+    for diag in &report.diagnostics {
+        assert_eq!(diag.file, FILE, "{name}: diagnostic file");
+        assert!(diag.span.lo < diag.span.hi, "{name}: degenerate span");
+    }
+    for note in &report.unsupported {
+        assert_eq!(note.file, FILE, "{name}: unsupported file");
+        assert!(note.span.lo < note.span.hi, "{name}: degenerate span");
+    }
+}
+
+#[test]
+fn contextual_clean_matches_oracle() {
+    // P064: unannotated arrow params bind from the expected signature —
+    // literal bodies, identifier bodies resolving through the bound params,
+    // and multi-param arrows all stay silent like the oracle.
+    let source = include_str!("../../../corpus/check-calls/contextual-clean.ts");
+    let expected = include_str!("../../../corpus/check-calls/contextual-clean.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on all three calls"
+    );
+    expect_differential_contextual(
+        "contextual_clean_matches_oracle",
+        source,
+        expected,
+        0,
+        &[
+            ArrowArgShape {
+                call: 0,
+                arg: 0,
+                params: &[("x", false)],
+                params_complex: false,
+                body_kind: FrontendCallArgKind::Number,
+                body_ident: None,
+                body_complex: false,
+            },
+            ArrowArgShape {
+                call: 1,
+                arg: 0,
+                params: &[("x", false)],
+                params_complex: false,
+                body_kind: FrontendCallArgKind::NonLiteral,
+                body_ident: Some("x"),
+                body_complex: false,
+            },
+            ArrowArgShape {
+                call: 2,
+                arg: 0,
+                params: &[("x", false), ("y", false)],
+                params_complex: false,
+                body_kind: FrontendCallArgKind::Number,
+                body_ident: None,
+                body_complex: false,
+            },
+        ],
+    );
+}
+
+#[test]
+fn contextual_wrong_body_matches_ts2322() {
+    // P064: wrong arrow bodies diagnose once per call at the body span
+    // (probed 7.0.2: `TS2322` naming the widened body kind).
+    let source = include_str!("../../../corpus/check-calls/contextual-wrong-body.ts");
+    let expected = include_str!("../../../corpus/check-calls/contextual-wrong-body.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            (
+                "TS2322".to_owned(),
+                "Type 'string' is not assignable to type 'number'.".to_owned()
+            ),
+            (
+                "TS2322".to_owned(),
+                "Type 'string' is not assignable to type 'number'.".to_owned()
+            ),
+        ],
+        "oracle baseline pins the per-call verdicts"
+    );
+    expect_differential_contextual(
+        "contextual_wrong_body_matches_ts2322",
+        source,
+        expected,
+        0,
+        &[
+            ArrowArgShape {
+                call: 0,
+                arg: 0,
+                params: &[("x", false)],
+                params_complex: false,
+                body_kind: FrontendCallArgKind::String,
+                body_ident: None,
+                body_complex: false,
+            },
+            ArrowArgShape {
+                call: 1,
+                arg: 0,
+                params: &[("x", false), ("y", false)],
+                params_complex: false,
+                body_kind: FrontendCallArgKind::NonLiteral,
+                body_ident: Some("y"),
+                body_complex: false,
+            },
+        ],
+    );
+}
+
+#[test]
+fn named_alias_function_type_matches_oracle() {
+    // P064: a bare name claimed by exactly one non-generic alias to an
+    // admitted function type binds contextually (probed 7.0.2 `i` clean).
+    let source = include_str!("../../../corpus/check-calls/named-alias-clean.ts");
+    let expected = include_str!("../../../corpus/check-calls/named-alias-clean.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on the alias-typed call"
+    );
+    expect_differential_contextual(
+        "named_alias_function_type_matches_oracle",
+        source,
+        expected,
+        0,
+        &[ArrowArgShape {
+            call: 0,
+            arg: 0,
+            params: &[("x", false)],
+            params_complex: false,
+            body_kind: FrontendCallArgKind::Number,
+            body_ident: None,
+            body_complex: false,
+        }],
+    );
+}
+
+#[test]
+fn rest_arrow_declines_and_pins_clean_oracle() {
+    // P064: rest arrow params decline distinctly while tsc checks them
+    // (probed 7.0.2 `c` clean) — a pinned oracle-clean divergence.
+    let source = include_str!("../../../corpus/check-calls/rest-declined.ts");
+    let expected = include_str!("../../../corpus/check-calls/rest-declined.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on the rest arrow"
+    );
+    let (_, report) = run_pipeline_contextual(
+        source,
+        &[ArrowArgShape {
+            call: 0,
+            arg: 0,
+            params: &[("args", true)],
+            params_complex: false,
+            body_kind: FrontendCallArgKind::Number,
+            body_ident: None,
+            body_complex: false,
+        }],
+    );
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("rest arrow parameter"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn destructured_arrow_declines_and_pins_ts2339() {
+    // P064: destructured arrow params decline distinctly while tsc spells
+    // `TS2339` (probed 7.0.2 `d`) — a pinned oracle-error divergence.
+    let source = include_str!("../../../corpus/check-calls/destructured-declined.ts");
+    let expected = include_str!("../../../corpus/check-calls/destructured-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2339".to_owned(),
+            "Property 'x' does not exist on type 'Number'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline_contextual(
+        source,
+        &[ArrowArgShape {
+            call: 0,
+            arg: 0,
+            params: &[],
+            params_complex: true,
+            body_kind: FrontendCallArgKind::Number,
+            body_ident: None,
+            body_complex: false,
+        }],
+    );
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("non-identifier arrow parameter"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn free_standing_arrow_declines_as_before() {
+    // P064: an arrow against an unannotated callee parameter keeps the
+    // unannotated-parameter gate (the oracle spells two `TS7006`s — probed
+    // 7.0.2 `w` — while the solver records the same note as before).
+    let source = include_str!("../../../corpus/check-calls/free-standing-declined.ts");
+    let expected = include_str!("../../../corpus/check-calls/free-standing-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected).len(),
+        2,
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0]
+            .reason
+            .contains("unannotated parameter"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn returns_dependent_inference_stays_declined() {
+    // P064: generic `T`-typed signatures never admit (the parameter kind
+    // would come from the arrow's return), so the call declines as before
+    // while tsc infers silently (probed 7.0.2 `f`/`r` clean).
+    let source = include_str!("../../../corpus/check-calls/returns-dependent-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-calls/returns-dependent-declined.expected.txt");
+    assert!(
+        parse_baseline(expected).is_empty(),
+        "oracle is clean on the generic call"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
 }
 
 #[test]

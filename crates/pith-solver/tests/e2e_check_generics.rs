@@ -235,6 +235,7 @@ fn consts_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<
                 cast: None,
                 init_ternary: None,
                 init_member_ref: None,
+                init_arrow: None,
             }
         })
         .collect()
@@ -488,6 +489,8 @@ fn calls_from_facts(
                         ident: call_arg_ident(source, arg),
                         // Generic drivers never feed object members.
                         arg_object: None,
+                        // Generic drivers never feed arrow expressions.
+                        arg_arrow: None,
                     })
                     .collect(),
             },

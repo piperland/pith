@@ -150,6 +150,8 @@ fn decls_from_handfed(
                     cast: None,
                     init_ternary: None,
                     init_member_ref,
+                    // Enum drivers never feed arrow expressions.
+                    init_arrow: None,
                 },
                 init_text: spec.init_text.map(str::to_owned),
                 cross_file_deps: Vec::new(),
