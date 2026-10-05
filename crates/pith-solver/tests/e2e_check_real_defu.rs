@@ -18,8 +18,8 @@ use std::time::Instant;
 use pith_frontend::{
     parse_module, CallArgKind as FrontendCallArgKind, EffectCallFact as FrontendEffectCall,
     EnumValueKind as FrontendEnumValueKind, FunctionBodyFact, ImportedName as FrontendImportedName,
-    InitKind as FrontendInitKind, ParsedFile, ReturnKind as FrontendReturnKind,
-    SingleReturnFact as FrontendReturn,
+    InitFact as FrontendInitFact, InitKind as FrontendInitKind, ParsedFile,
+    ReturnKind as FrontendReturnKind, SingleReturnFact as FrontendReturn,
 };
 use pith_ids::{FileId, NodeId, Span, SymbolId};
 use pith_queries::{QueryDb, QueryKey, QueryKind};
@@ -82,6 +82,25 @@ fn map_init(kind: FrontendInitKind) -> InitKind {
         FrontendInitKind::Undefined => InitKind::Undefined,
         FrontendInitKind::NonLiteral => InitKind::NonLiteral,
     }
+}
+
+/// Maps one frontend initializer fact to the solver's, with the P060 regex
+/// seam (PITH-P066 backfill — verbatim mirror of the const suite's
+/// `map_init_kind`): the adapter emits no regex facts (regex literals
+/// classify `NonLiteral` frontend-side), so a bare `NonLiteral` whose
+/// sliced text leads with `/` maps to [`InitKind::RegExp`] — division
+/// cannot lead an expression, so only regex literals match. Casts,
+/// ternaries, and member refs keep their own facts (never reclassified);
+/// anything else keeps its historical mapping.
+fn map_init_kind(source: &str, init: &FrontendInitFact) -> InitKind {
+    let sliced_regex = init.cast.is_none()
+        && init.ternary.is_none()
+        && init.member_ref.is_none()
+        && slice_of(source, init.span).is_some_and(|text| text.trim_start().starts_with('/'));
+    if init.kind == FrontendInitKind::NonLiteral && sliced_regex {
+        return InitKind::RegExp;
+    }
+    map_init(init.kind)
 }
 
 /// Maps one frontend return-literal kind to the solver's primitive kind.
@@ -185,7 +204,10 @@ fn consts_from_facts(
                     fresh: true,
                 }),
             ),
-            None => (decl.init.as_ref().map(|init| map_init(init.kind)), None),
+            None => (
+                decl.init.as_ref().map(|init| map_init_kind(source, init)),
+                None,
+            ),
         };
         let ident = match (&decl.init, fed) {
             (Some(init), None) if init.kind == FrontendInitKind::NonLiteral => {
