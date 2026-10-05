@@ -35,7 +35,7 @@
 //! (`TS2322`/`TS2345`/`TS2304`/`TS2558`/`TS2344` <-> `PITH*`) plus the
 //! unsupported count. Elaboration continuation lines (`'T' could be
 //! instantiated …`) fold away exactly like check-narrowing's union
-//! elaborations. Eight fixtures diverge by design (oracle clean or erroring
+//! elaborations. Twelve fixtures diverge by design (oracle clean or erroring
 //! where the subset declines or skips); each pins its divergence explicitly
 //! instead of forcing a false match.
 
@@ -877,6 +877,42 @@ fixture_test!(
     &[None],
     1
 );
+fixture_test!(
+    explicit_ident_clean_binds_silently,
+    "explicit-ident-clean.ts",
+    "explicit-ident-clean.expected.txt",
+    &[Some(args1("number"))],
+    1
+);
+fixture_test!(
+    explicit_ident_wrong_matches_ts2345,
+    "explicit-ident-wrong.ts",
+    "explicit-ident-wrong.expected.txt",
+    &[Some(args1("string"))],
+    1
+);
+
+#[test]
+fn explicit_ident_unresolvable_keeps_skip() {
+    // `id<string>(nope)`: the oracle spells TS2304 at the argument while the
+    // explicit path keeps its historical per-argument skip (never a decline
+    // note), plus the body note — the P069 pinned divergence.
+    let source = include_str!("../../../corpus/check-generics/explicit-ident-unresolvable.ts");
+    let expected =
+        include_str!("../../../corpus/check-generics/explicit-ident-unresolvable.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [("TS2304".to_owned(), "Cannot find name 'nope'.".to_owned())],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source, &[Some(args1("string"))]);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+}
 
 #[test]
 fn param_sourced_arg_binds_silently() {
