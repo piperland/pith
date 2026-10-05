@@ -301,6 +301,23 @@ fn map_effect_call(call: &FrontendEffectCall) -> EffectCall {
     }
 }
 
+/// Maps one frontend parameter-default kind to the solver's (P070 seam —
+/// verbatim mirror of the check-functions driver's `map_default_kind`).
+/// Exhaustive so a new frontend variant fails to compile instead of
+/// silently mis-checking. Literal defaults (`="."` etc.) feed widened
+/// kinds; `={}`/non-literal/bare-optional arrive as `None` frontend-side
+/// and stay `None` here exactly as before.
+fn map_default_kind(kind: FrontendInitKind) -> InitKind {
+    match kind {
+        FrontendInitKind::Number => InitKind::Number,
+        FrontendInitKind::String => InitKind::String,
+        FrontendInitKind::Boolean => InitKind::Boolean,
+        FrontendInitKind::Null => InitKind::Null,
+        FrontendInitKind::Undefined => InitKind::Undefined,
+        FrontendInitKind::NonLiteral => InitKind::NonLiteral,
+    }
+}
+
 /// The function driver: a mechanical copy of the check-calls driver.
 fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDecl> {
     parsed
@@ -375,10 +392,10 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                         annotation: param.annotation_text.clone(),
                         optional: param.optional,
                         is_rest: param.is_rest,
-                        // No default-kind facts here (the check-functions
-                        // driver owns the P070 mapping): `None` keeps the
-                        // historical optional decline.
-                        default_kind: None,
+                        // Literal-default facts gate P048 propagation (P070
+                        // seam, mirrors the check-functions driver exactly);
+                        // every other shape records `None` and declines.
+                        default_kind: param.default_kind.map(map_default_kind),
                     })
                     .collect(),
                 params_complex: func.params_complex,
