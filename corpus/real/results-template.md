@@ -147,3 +147,96 @@ Ranked gaps (executed unsupported-note frequency, n=30):
    return + unannotated param — 2 (`DefuFunction` return, `namespace`).
 Module boilerplate (default exports, type-only import/re-export) declines
 by design with no attached notes (prescan-counted, not executed-noted).
+
+## P065 M6 re-trial (EXECUTED 2026-10-05, E2B Linux — 1/33 HOLDS, destr 8 NOT 5)
+
+Method (P026/P042 prescan method, same): per-case parse+bind wall times (no
+win claims) + EVERY executable file through `check_program` via the
+UNCHANGED P027–P029 drivers in
+`crates/pith-solver/tests/e2e_check_real_defu.rs` (zero driver edits — no
+new verdict kind appeared, every attached reason is established, so no
+pinning was needed). Engine: P048–P064 at `3888003` (clean tree).
+Box `i63nggzid9j6auu33adr5` (pith-rust template, 4vCPU/8GB, x86_64),
+rustc/cargo 1.98.1. Tree identity: 5/5 corpus sha256 match `SOURCES.md`
+pins (verified on-box: `8b52fa19…`, `4dc8c0f4…`, `3ac1d2ad…`,
+`ca1d205d…`, `d367543c…`). `cargo test --test e2e_check_real_defu --
+--nocapture` ×3 runs: 3 passed, 0 failed each, EXIT=0 ×3. Oracle baselines
+carried from P026 (files byte-identical to pins; no oracle re-run). Zero
+diagnostics in all 5 files across all 3 runs; note count 29/29/29
+(all notes, deterministic).
+
+Per-case walls (parse_bind / check ms; medians of 3 runs, raw in parens):
+defu 2/0 (3,2,2), destr 1/0 (1,1,1), plimit-stress 0/0 (0,0,1). Pith
+measures parse+bind+subset-check vs tsc full check (P026 medians
+416/404/438): NO comparison claims, different work.
+
+Per-file executed verdicts (identical 3/3 runs):
+- `defu/src/_utils.ts` — decline: complex body on `isPlainObject`,
+  1 unannotated const. 0 diag, 2 unsupported.
+- `defu/src/types.ts` — decline by design: type-only file, 0 diag,
+  0 unsupported.
+- `defu/src/defu.ts` — CONFIRM: `DEFU_IMPORT_VERDICT: CONFIRM silent
+  (1/33 holds)` 3/3; other 8 constructs decline (namespace param, `T`
+  ×3, unannotated ×6, `merger`/`currentValue` undeclared ×3, `Merger`
+  ×3, `DefuFunction` cross-file return). 0 diag, 17 unsupported.
+- `destr/src/index.ts` — decline: 4 unannotated consts (3 regex +
+  `_value`), effect-call-direct on `jsonParseTransform` (guard arm calls
+  `warnKeyDropped` directly — P050/P064 machinery now classifies the
+  arm instead of the whole body), complex body (`destr`), non-literal
+  return (`safeDestr`), `Options`-param call note. `warnKeyDropped`
+  EXECUTED silent 3/3. 0 diag, 8 unsupported.
+- `plimit-stress/index.d.ts` — decline: ambient overload signatures
+  with no body (`pLimit`, `limitFunction`). 0 diag, 2 unsupported.
+
+Coverage: **1/33 EXECUTED, 5/5 files EXECUTED** (M4 baseline holds — no
+M5/M6 admission flips any of the 32 declines).
+
+BY CONSTRUCTION reconciliation (P048–P064 raw.logs vs executed output):
+- P049 destr 9→8 — CONFIRMED: `warnKeyDropped` silent 3/3, file total 8.
+- P060 destr 8→5 — NOT CONFIRMED, corrected: executed 8. The 3 regex
+  consts still decline "no annotation". Read-only cause: the real-file
+  driver maps frontend NonLiteral→solver NonLiteral verbatim, while the
+  P060 RegExp silence requires `InitKind::RegExp`, which only the
+  const-suite driver feeds via its source-slice seam (`e2e_check_const.rs`
+  map_init: `/`-leading NonLiteral → RegExp). Driver-seam gap, not a
+  solver gap; the projected 8→5 needs a test-only driver backfill.
+- P048 t3 ident-chain flip — no visible effect (no single-level literal
+  const chains in real files; all real const inits are
+  regex/non-literal/casts). No real_delta was claimed; no-op confirmed.
+- P052 alias chains — no visible effect (`types.ts` aliases are generic;
+  `DefuFunction`/`Merger` notes unchanged). No-op confirmed.
+- P061 ident-arg generics — no visible effect (real driver feeds
+  `ident: None` on all call args; `T`×3/`Merger`×3/`Options`×1 unchanged).
+  Scoped no-op confirmed.
+- P062 structural admission — no visible effect (real driver feeds
+  `arg_object: None`; `Options` note unchanged). Scoped no-op confirmed.
+- P063 ambient overloads — no visible effect (plimit decls are
+  generic/union; P063 notes scope to non-generic only; same 2 notes).
+  CONFIRMED no-op as scoped.
+- P064 contextual arrows — no visible effect (real driver feeds
+  `arg_arrow: None`; `merger`/`currentValue` notes unchanged). Scoped
+  no-op confirmed.
+- P050 guard-effect chains — VISIBLE: `jsonParseTransform` decline reason
+  refined complex-body (P042) → effect-call-direct (guard-arm
+  classification); decline stands, `warnKeyDropped` stays silent.
+- P037 optional-member — stable: the destr call note still names
+  parameter type `Options`, unchanged from P042.
+
+Re-ranked gaps (executed unsupported-note frequency, n=29):
+1. Unannotated decls, no inference — 11 notes, 3 files (defu.ts ×6,
+   destr ×4, _utils ×1). 3 of the 11 (destr regex consts) are
+   driver-seam-only: a test-only P060-seam backfill silences them with
+   no solver work; the other 8 need real inference.
+2. Named/generic param types — 7 notes, 2 files (`T` ×3, `Merger` ×3,
+   `Options` ×1). Ex: `_defu<T>(baseObject: T, …)`.
+3. Undeclared callback names — 3 notes, 1 file (`merger` ×1,
+   `currentValue` ×2 in the `defuFn`/`defuArrayFn` arrows).
+4. Complex bodies — 2 notes (`isPlainObject`, `destr`).
+5. Ambient overloads without bodies — 2 notes (`pLimit`,
+   `limitFunction`; generic — P063 explicitly out of scope).
+6. Singletons — 4 notes: effect-call-direct guard arm
+   (`jsonParseTransform`), non-literal return (`safeDestr`),
+   cross-file named return (`DefuFunction`), unannotated param
+   (`namespace`).
+Module boilerplate declines by design with no attached notes
+(prescan-counted, not executed-noted).
