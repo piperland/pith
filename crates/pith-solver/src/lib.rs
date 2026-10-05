@@ -1190,6 +1190,63 @@
 //! flag, and classifies `await` as non-literal. Spans/scopes/identities
 //! always come from adapter facts; only shapes ride the seam.
 //!
+//! Pure known-method call results (P076, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p076-probes/`):
+//!
+//! - Receiver-independent global calls classify to probed kinds:
+//!   `parseInt`/`parseFloat` to `number`, `String` to `string`, `Number` to
+//!   `number`, `Boolean` to `boolean`, `Array.isArray` to `boolean`,
+//!   `Object.keys` to `string[]`, and `Object.getPrototypeOf`/`JSON.parse`
+//!   to `any`. Annotated mismatches diagnose with tsc's own spellings
+//!   (`Type 'number' is not assignable to type 'string'.`,
+//!   `Type 'string[]' is not assignable to type 'number[]'.`,
+//!   `Type 'any' is not assignable to type 'never'.`).
+//! - Bare-identifier receivers resolve one level through the P048 machinery
+//!   (verbatim reuse — [`resolve_ident`] on a probe declaration, so params,
+//!   shadowing, cycles, and forward references behave identically), then key
+//!   on the receiver CLASS, never blindly on the method: `any` absorbs to
+//!   `any` (silent everywhere except `never`), string-kind receivers read
+//!   the string-method table (`trim`/`toUpperCase`/`toLowerCase`/`slice`/
+//!   `charAt` to `string`, `split` to `string[]`; string-literal receivers
+//!   like `"hi"` classify without resolving), and every other class declines
+//!   with the historical non-literal note, byte-identical. Unlisted methods,
+//!   non-bare receivers, unresolvable receivers, and unknown globals decline
+//!   the same way (tsc spells `TS2339`/`TS2304` there — pinned oracle-error
+//!   divergences; the subset spells no member-miss family).
+//! - Known-global receivers (`Array`/`Object`/`JSON`) apply only when the
+//!   receiver does NOT resolve to a checkable binding (resolve-first, so a
+//!   shadowing const keeps its own class — the P024 shadowing precedent
+//!   inverted toward soundness: no forced verdict under shadowing).
+//! - Unannotated `any`-results go silent through the P025 absorption
+//!   (explicit narrowing of the P060 call exclusion below — charter-neutral:
+//!   no `.d.ts` modeling, only probed result kinds). Every other
+//!   unannotated call keeps the historical `no annotation` decline
+//!   byte-identically, while classifiable results still feed the
+//!   [`IdentTable`] so later uses check through them: globals and
+//!   string-literal receivers feed statically, bare-identifier receivers
+//!   (known globals included) resolve one level through the
+//!   declaration-order prefix (single pass, H-002).
+//! - Arguments never cross the seam (counts and types stay driver-side
+//!   text): arity errors (`TS2554`) and argument-type errors (`TS2345`)
+//!   are pinned oracle-error divergences, probed stable across
+//!   overloads — kinds ignore args entirely.
+//! - Pinned divergences (never forced verdicts): argument arity/type errors
+//!   (above); declining calls under `any`/`unknown` annotations (the oracle
+//!   spells `TS2339` there); `any`-results against union, lib-declined
+//!   (`: RegExp`), promise, interface, and enum annotations (the oracle is
+//!   clean — those gates run before the kind ever substitutes); ternary arms
+//!   holding calls (the arm gate declines those distinctly); and function
+//!   returns holding calls (returns keep the historical non-literal
+//!   decline — only `const` initializers classify).
+//!
+//! AMENDMENT (P076) to the P060 call exclusion above: "array/object/call/
+//! spread/index initializers (all [`InitKind::NonLiteral`] — no shape
+//! inference)" narrows to every call EXCEPT `any`-results. The exclusion
+//! stands byte-identically for all non-`any` calls (annotated or not);
+//! `any`-result calls (the two any tables plus any-receivers) go silent
+//! annotated AND unannotated via the P025 absorption, diagnosing only
+//! against `never` (`Type 'any' is not assignable to type 'never'.`).
+//!
 //! Design law (H-002): literal freshness and every other per-occurrence
 //! verdict lives in query-side tables keyed by occurrence
 //! ([`NodeId`], see [`FreshnessTable`] plus the [`QueryDb`] memo entries),
@@ -1308,6 +1365,17 @@ pub enum InitKind {
     /// [`evaluate_cast`] produces it). Spells `unknown` in messages, so
     /// `unknown`-into-`T` flows diagnose exactly like the oracle.
     Unknown,
+    /// An `any`-valued call result (never a direct literal: only
+    /// [`resolve_call`] produces it — `JSON.parse`, `getPrototypeOf`, and
+    /// any-receiver methods, probed tsc 7.0.2 P076). Spells `any` in
+    /// messages; silent against every annotation except `never` (the P025
+    /// absorption, which diagnoses `any` there exactly like the oracle).
+    Any,
+    /// A `string[]`-valued call result (never a direct literal: only
+    /// [`resolve_call`] produces it — `Object.keys` and `split`, probed
+    /// tsc 7.0.2 P076). Spells `string[]` in messages, so `string[]`-into-`T`
+    /// flows diagnose exactly like the oracle.
+    StringArray,
     /// Any non-literal initializer (identifier, object, call, ...).
     NonLiteral,
 }
@@ -1319,6 +1387,11 @@ impl InitKind {
     /// and callers must route it to unsupported, never to a verdict.
     /// [`InitKind::RegExp`] shares the fallback (see its docs): the
     /// inequality still diagnoses everywhere a comparison runs.
+    /// [`InitKind::StringArray`] shares it too (unequal to every primitive
+    /// and to `never`, so `string[]` actuals always diagnose with their own
+    /// spelling); [`InitKind::Any`] inhabits [`TypeStore::ANY`] truthfully —
+    /// the primitive tail intercepts it before any comparison (silence
+    /// everywhere except `never`, which diagnoses `any` like the oracle).
     #[must_use]
     pub fn type_id(self) -> TypeId {
         match self {
@@ -1327,7 +1400,10 @@ impl InitKind {
             Self::Boolean => TypeStore::BOOLEAN,
             Self::Null => TypeStore::NULL,
             Self::Undefined => TypeStore::UNDEFINED,
-            Self::RegExp | Self::Unknown | Self::NonLiteral => TypeStore::UNKNOWN,
+            Self::Any => TypeStore::ANY,
+            Self::RegExp | Self::Unknown | Self::StringArray | Self::NonLiteral => {
+                TypeStore::UNKNOWN
+            }
         }
     }
 
@@ -1341,6 +1417,8 @@ impl InitKind {
             Self::Null => "null",
             Self::Undefined => "undefined",
             Self::RegExp => "RegExp",
+            Self::Any => "any",
+            Self::StringArray => "string[]",
             Self::Unknown | Self::NonLiteral => "unknown",
         }
     }
@@ -1591,6 +1669,40 @@ pub struct MemberRef {
     pub span: Span,
 }
 
+/// One call-expression initializer's driver-sliced facts (P076).
+///
+/// The adapter emits no call facts for initializers (calls classify
+/// [`InitKind::NonLiteral`] frontend-side), so the driver slices the callee
+/// and receiver names from the initializer fact span — the same seam as
+/// [`ConstDecl::init_ident`] (bare identifiers and string-literal receivers
+/// only; anything else feeds `None` and keeps the historical decline).
+/// Names cross as facts and every resolution step goes through the
+/// [`Binder`]; argument counts and types never cross (arity/arg-type errors
+/// stay pinned oracle-error divergences — kind classification only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallInit {
+    /// Callee name as written (`parseInt` in `parseInt("10")`, `trim` in
+    /// `s.trim()`).
+    pub callee: String,
+    /// Receiver for member calls (`None` for direct global calls like
+    /// `parseInt("10")`).
+    pub receiver: Option<CallReceiver>,
+}
+
+/// One call receiver for [`CallInit`]: how the receiver classifies before
+/// any method-table lookup (receiver-class keying — never blind
+/// method-to-kind).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallReceiver {
+    /// A bare-identifier receiver (`s` in `s.trim()`): resolves one level
+    /// through the [`Binder`] against the [`IdentTable`] plus parameters
+    /// (the P048 machinery, reused verbatim).
+    Bare(String),
+    /// A string-literal receiver (`"hi"` in `"hi".trim()`): string class
+    /// with no resolution step.
+    StringLiteral,
+}
+
 /// One `const`/`let` declarator to check.
 ///
 /// `annotation`/`init`/`init_object` are hand-fed stand-ins for the missing
@@ -1623,6 +1735,13 @@ pub struct ConstDecl {
     /// level through the [`Binder`]; every other initializer shape feeds
     /// `None` and keeps its historical path.
     pub init_ident: Option<String>,
+    /// Call facts when the initializer is a `f(...)` or `r.m(...)` call
+    /// (`None` otherwise). Driver-sliced from the initializer fact span
+    /// (see [`CallInit`]) until the adapter emits call facts — the same
+    /// seam as `init_ident`. [`check_one`] classifies it to a probed result
+    /// kind (P076); anything else feeds `None` and keeps its historical
+    /// non-literal path byte-identically.
+    pub init_call: Option<CallInit>,
     /// Object-literal members when the initializer is `{ ... }`; `None`
     /// otherwise. A `Some` paired with a primitive `init` (or vice versa)
     /// is contradictory input and becomes an [`UnsupportedDecl`].
@@ -2949,18 +3068,28 @@ fn ident_symbol(
 }
 
 /// One [`IdentInput`] from a top-level declarator, in declaration order.
+///
+/// Static call results feed here without resolution (see
+/// [`static_call_prop`]); bare-identifier-receiver calls upgrade
+/// sequentially in [`ident_inputs_from_decls`], never here, so this stays
+/// total without a table.
 fn ident_input_from_decl(binder: &Binder, file: FileId, decl: &ConstDecl) -> IdentInput {
+    let init = source_init_kind(
+        decl.init,
+        decl.init_object.is_some() || decl.init_array.is_some(),
+        decl.cast.as_ref(),
+        decl.init_ident.as_deref(),
+        decl.scope,
+    );
+    let init = match init {
+        PropInit::Other => static_call_prop(decl).unwrap_or(init),
+        resolved => resolved,
+    };
     IdentInput {
         symbol: ident_symbol(binder, file, &decl.name, decl.scope, decl.symbol),
         kind: decl.kind,
         annotation: decl.annotation.clone(),
-        init: source_init_kind(
-            decl.init,
-            decl.init_object.is_some() || decl.init_array.is_some(),
-            decl.cast.as_ref(),
-            decl.init_ident.as_deref(),
-            decl.scope,
-        ),
+        init,
     }
 }
 
@@ -2983,12 +3112,80 @@ fn ident_input_from_leading(binder: &Binder, file: FileId, inner: &InnerDecl) ->
 }
 
 /// Builds the [`IdentTable`] inputs for one [`check_file`] run, in
-/// declaration order.
-fn ident_inputs_from_decls(binder: &Binder, file: FileId, decls: &[ConstDecl]) -> Vec<IdentInput> {
-    decls
-        .iter()
-        .map(|decl| ident_input_from_decl(binder, file, decl))
-        .collect()
+/// declaration order, resolving bare-identifier-receiver calls sequentially
+/// against the already-built prefix (one declaration-order pass, no flow
+/// analysis — H-002): a use only ever sees earlier declarators, exactly
+/// like check-time resolution through the visibility cursor, so build-time
+/// and check-time outcomes agree by construction. Static results feed in
+/// [`ident_input_from_decl`]; this upgrades only the still-`Other`
+/// bare-receiver calls whose receiver classifies to string (the method
+/// table) or `any` (absorption). Top-level runs thread no params, so the
+/// prefix table carries none either.
+fn ident_inputs_from_decls(
+    binder: &Binder,
+    file: FileId,
+    decls: &[ConstDecl],
+    scope: &LocalAliasScope<'_, '_>,
+) -> Vec<IdentInput> {
+    let mut inputs: Vec<IdentInput> = Vec::with_capacity(decls.len());
+    for decl in decls {
+        let mut input = ident_input_from_decl(binder, file, decl);
+        upgrade_bare_receiver_call(binder, file, decl, scope, &inputs, &mut input);
+        inputs.push(input);
+    }
+    inputs
+}
+
+/// Upgrades one still-`Other` bare-identifier-receiver call input in place
+/// (P076): resolves the receiver against the already-built prefix through
+/// the shared [`resolve_ident`] (verbatim reuse, so outcomes match the
+/// check-time [`classify_receiver`]), then keys on the class. Non-string,
+/// non-`any` receivers and unlisted methods keep `Other` (single level
+/// only — uses of such intermediates keep the historical decline).
+fn upgrade_bare_receiver_call(
+    binder: &Binder,
+    file: FileId,
+    decl: &ConstDecl,
+    scope: &LocalAliasScope<'_, '_>,
+    prefix: &[IdentInput],
+    input: &mut IdentInput,
+) {
+    if !matches!(input.init, PropInit::Other) {
+        return;
+    }
+    let Some(call) = decl.init_call.as_ref() else {
+        return;
+    };
+    let Some(CallReceiver::Bare(receiver)) = call.receiver.as_ref() else {
+        return;
+    };
+    let table = IdentTable {
+        inputs: prefix.to_vec(),
+        params: Vec::new(),
+        checked: prefix.len(),
+    };
+    let step = CallUse {
+        decl,
+        receiver: receiver.as_str(),
+        binder,
+        scope,
+        idents: &table,
+        file,
+    };
+    let kind = match classify_receiver(&step) {
+        ReceiverClass::String => string_method_kind(call.callee.as_str()),
+        ReceiverClass::Any => Some(InitKind::Any),
+        ReceiverClass::Unclaimed => known_receiver_kind(receiver.as_str(), call.callee.as_str()),
+        ReceiverClass::Other => None,
+    };
+    let Some(kind) = kind else {
+        return;
+    };
+    input.init = if kind == InitKind::Any {
+        PropInit::SilentAny
+    } else {
+        PropInit::Literal(kind)
+    };
 }
 
 /// Builds the [`IdentTable`] inputs for one straight-body function, in
@@ -3376,7 +3573,7 @@ pub fn check_file_with_aliases(
         const_names: &const_names,
     };
     let mut idents = IdentTable {
-        inputs: ident_inputs_from_decls(binder, file, decls),
+        inputs: ident_inputs_from_decls(binder, file, decls, &scope),
         params: Vec::new(),
         checked: 0,
     };
@@ -3552,6 +3749,7 @@ fn check_shaped_function(run: &mut FunctionRun<'_, '_>) {
             annotation: shaped_return.site.annotation.clone(),
             init: shaped_return.kind,
             init_ident: shaped_return.init_ident.clone(),
+            init_call: None,
             init_object: shaped_return.init_object.clone(),
             init_array: shaped_return.init_array.clone(),
             cast: shaped_return.cast.clone(),
@@ -5046,6 +5244,7 @@ fn check_structural_call_arg(
         annotation: None,
         init: None,
         init_ident: None,
+        init_call: None,
         init_object: Some(object.clone()),
         init_array: None,
         cast: None,
@@ -5176,6 +5375,7 @@ fn delegate_arrow_body(run: &mut ArrowRun<'_, '_>) {
         annotation: Some(run.signature.return_text.clone()),
         init: Some(body.kind),
         init_ident: body.ident.clone(),
+        init_call: None,
         init_object: None,
         init_array: None,
         cast: None,
@@ -6843,6 +7043,7 @@ fn check_class_properties(decl: &ClassDecl, run: &mut ClassRun<'_, '_>) {
             annotation: prop.annotation.clone(),
             init: prop.init,
             init_ident: None,
+            init_call: None,
             init_object: prop.init_object.clone(),
             init_array: None,
             cast: None,
@@ -9871,9 +10072,14 @@ fn apply_assertion(
 /// `let` stays declined (mutability is invisible to the pass), as do array,
 /// object, call, spread, index, identifier, ternary, cast, member-ref, and
 /// missing initializers — all byte-identical, no shape inference.
+///
+/// AMENDMENT (P076): the "call" exclusion above narrows — `any`-result
+/// calls go silent through [`decline_unannotated`]'s absorption rule, never
+/// here. This predicate is unchanged (calls still return false).
 fn unannotated_infers_silently(decl: &ConstDecl) -> bool {
     decl.kind == DeclKind::Const
         && decl.init_ident.is_none()
+        && decl.init_call.is_none()
         && decl.cast.is_none()
         && decl.init_object.is_none()
         && decl.init_array.is_none()
@@ -9893,12 +10099,29 @@ fn unannotated_infers_silently(decl: &ConstDecl) -> bool {
         )
 }
 
+/// Resolution inputs for the unannotated `any`-call rule, bundled so the
+/// missing-annotation path stays lean (pedantic arity discipline).
+struct UnannotatedCalls<'a, 'b, 'c, 'd> {
+    binder: &'a Binder,
+    scope: &'b LocalAliasScope<'c, 'd>,
+    idents: &'b IdentTable,
+    file: FileId,
+}
+
 /// The missing-annotation path for `check_one`: declined casts still
 /// diagnose without annotations (probed tsc 7.0.2); literal-inited
-/// unannotated consts infer silently (P060); admitted and complex casts
-/// plus every other unannotated shape fall into the usual no-annotation
-/// decline.
-fn decline_unannotated(decl: &ConstDecl, span: Span, file: FileId, report: &mut FileReport) {
+/// unannotated consts infer silently (P060); `any`-result calls go silent
+/// through the P025 absorption (P076's explicit narrowing of the P060 call
+/// exclusion — every other call keeps the historical decline); admitted and
+/// complex casts plus every other unannotated shape fall into the usual
+/// no-annotation decline.
+fn decline_unannotated(
+    decl: &ConstDecl,
+    span: Span,
+    report: &mut FileReport,
+    calls: &UnannotatedCalls<'_, '_, '_, '_>,
+) {
+    let file = calls.file;
     if let Some(cast) = decl.cast.as_ref() {
         if matches!(evaluate_cast(cast), CastEvaluation::Decline(_)) {
             emit_cast_diagnostic(file, cast, &mut *report);
@@ -9906,6 +10129,14 @@ fn decline_unannotated(decl: &ConstDecl, span: Span, file: FileId, report: &mut 
         }
     }
     if unannotated_infers_silently(decl) {
+        return;
+    }
+    if decl.init_call.is_some()
+        && matches!(
+            resolve_call(decl, calls.binder, calls.scope, calls.idents, calls.file),
+            IdentResolution::Substitute(InitKind::Any)
+        )
+    {
         return;
     }
     report.unsupported.push(UnsupportedDecl {
@@ -10063,6 +10294,25 @@ fn check_contradictory_inits(
             return true;
         }
     }
+    if decl.init_call.is_some() {
+        let paired = decl.init_object.is_some()
+            || decl.init_array.is_some()
+            || decl.cast.is_some()
+            || decl.init_ternary.is_some()
+            || decl.init_member_ref.is_some()
+            || decl.init_arrow.is_some()
+            || matches!(decl.init, Some(kind) if kind != InitKind::NonLiteral);
+        if paired {
+            report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: "contradictory initializer facts: call expression with \
+                    another initializer shape"
+                    .to_owned(),
+            });
+            return true;
+        }
+    }
     false
 }
 
@@ -10125,6 +10375,20 @@ fn finish_primitive_check(
             span,
             reason: "non-literal initializer is outside the subset".to_owned(),
         });
+        return;
+    }
+    if init == InitKind::Any {
+        // P025 absorption for `any`-result calls (P076): `any` admits every
+        // bearing value silently — except `never`, which diagnoses `any`
+        // with the oracle's own spelling (probed tsc 7.0.2).
+        if ann_ty == TypeStore::NEVER {
+            report.diagnostics.push(PithDiagnostic {
+                code: CODE_MISMATCH.to_owned(),
+                file,
+                span,
+                message: format!("Type 'any' is not assignable to type '{annotation}'."),
+            });
+        }
         return;
     }
     if init.type_id() != ann_ty {
@@ -10488,6 +10752,293 @@ fn resolve_ident_init(step: IdentStep<'_, '_, '_, '_, '_, '_>) -> bool {
     }
 }
 
+/// One known pure global call's probed result kind (P076; every entry
+/// probed clean/mismatch/unannotated on tsc 7.0.2 — see the module record).
+/// Unknown globals return `None` (the caller declines byte-identically).
+fn global_call_kind(callee: &str) -> Option<InitKind> {
+    match callee {
+        "parseInt" | "parseFloat" | "Number" => Some(InitKind::Number),
+        "String" => Some(InitKind::String),
+        "Boolean" => Some(InitKind::Boolean),
+        _ => None,
+    }
+}
+
+/// One string-receiver method's probed result kind (P076). Unlisted methods
+/// return `None` (the caller declines byte-identically — tsc spells `TS2339`
+/// there, a pinned divergence).
+fn string_method_kind(method: &str) -> Option<InitKind> {
+    match method {
+        "trim" | "toUpperCase" | "toLowerCase" | "slice" | "charAt" => Some(InitKind::String),
+        "split" => Some(InitKind::StringArray),
+        _ => None,
+    }
+}
+
+/// One known-global receiver plus method pair's probed result kind (P076):
+/// `Array.isArray` checks boolean, `Object.keys` spells `string[]`, and
+/// `Object.getPrototypeOf`/`JSON.parse` absorb to `any`. Applies only when
+/// the receiver resolves to no checkable binding (resolve-first — see
+/// [`resolve_call`]); anything else returns `None`.
+fn known_receiver_kind(receiver: &str, method: &str) -> Option<InitKind> {
+    match (receiver, method) {
+        ("Array", "isArray") => Some(InitKind::Boolean),
+        ("Object", "keys") => Some(InitKind::StringArray),
+        ("Object", "getPrototypeOf") | ("JSON", "parse") => Some(InitKind::Any),
+        _ => None,
+    }
+}
+
+/// What one call receiver classifies to (P076): only the string class reads
+/// a method table and only `any` absorbs — every other class declines
+/// through the historical note. Unclaimed names (no program binding) may
+/// still read the known-global pairs; claimed-but-unpropagatable names
+/// never do (resolve-first shadowing guard).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiverClass {
+    /// A string-kind receiver (string literal, string-annotated binding, or
+    /// string-literal source): reads [`string_method_kind`].
+    String,
+    /// An `any` receiver: absorbs the whole call to [`InitKind::Any`].
+    Any,
+    /// No program binding claims the name: known-global pairs
+    /// ([`known_receiver_kind`]) may apply.
+    Unclaimed,
+    /// Claimed by a binding but unpropagatable (numbers, booleans,
+    /// `unknown`, `never`, `let`s, resolved-but-unexpandable names):
+    /// declines byte-identically — the known-global pairs never see it.
+    Other,
+}
+
+/// Inputs for one [`resolve_call`] step, bundled (the [`IdentStep`]
+/// precedent).
+struct CallUse<'a, 'b, 'c, 'd, 'e> {
+    /// The declaration carrying the call facts.
+    decl: &'a ConstDecl,
+    /// The bare receiver name when the call has one.
+    receiver: &'a str,
+    binder: &'b Binder,
+    scope: &'c LocalAliasScope<'d, 'e>,
+    idents: &'c IdentTable,
+    file: FileId,
+}
+
+/// Classifies one bare-identifier call receiver one level (P076) by reusing
+/// [`resolve_ident`] verbatim on a probe declaration (the P051 probe
+/// precedent — params, shadowing, cycles, and forward references behave
+/// identically): `string` substitutes and `any` absorbs read their classes
+/// while every other outcome keys [`ReceiverClass::Other`] — except names
+/// no program binding claims, which key [`ReceiverClass::Unclaimed`] so the
+/// known-global pairs can still apply (resolve-first: a shadowing binding
+/// always wins over the globals, exactly like tsc's `TS2339`).
+fn classify_receiver(step: &CallUse<'_, '_, '_, '_, '_>) -> ReceiverClass {
+    let probe = ConstDecl {
+        name: step.decl.name.clone(),
+        span: step.decl.span,
+        scope: step.decl.scope,
+        symbol: step.decl.symbol,
+        kind: step.decl.kind,
+        annotation: None,
+        init: Some(InitKind::NonLiteral),
+        init_ident: Some(step.receiver.to_owned()),
+        init_call: None,
+        init_object: None,
+        init_array: None,
+        cast: None,
+        init_ternary: None,
+        init_member_ref: None,
+        init_arrow: None,
+    };
+    match resolve_ident(&probe, step.binder, step.scope, step.idents, step.file) {
+        IdentResolution::Substitute(InitKind::String) => ReceiverClass::String,
+        IdentResolution::SilentAny => ReceiverClass::Any,
+        _ if receiver_unclaimed_by_program(step) => ReceiverClass::Unclaimed,
+        _ => ReceiverClass::Other,
+    }
+}
+
+/// Whether a call receiver names no program binding (P076 flip): neither
+/// the binder resolves it in the use scope (walk-up included) nor does a
+/// same-function parameter claim the name (params can miss binder
+/// resolution — the P050 fallback precedent — yet still shadow globals by
+/// language semantics). Only then may the known-global pairs apply.
+fn receiver_unclaimed_by_program(step: &CallUse<'_, '_, '_, '_, '_>) -> bool {
+    if step
+        .binder
+        .resolve(step.file, step.decl.scope, step.receiver)
+        .is_some()
+    {
+        return false;
+    }
+    !step
+        .idents
+        .params
+        .iter()
+        .any(|param| param.name == step.receiver)
+}
+
+/// Maps one classified receiver plus method to its result kind (P076):
+/// `any` absorbs, string-kind receivers read the method table, unclaimed
+/// names read the known-global pairs, and claimed-but-unpropagatable names
+/// decline. Returns `None` for everything the subset
+/// declines (unlisted methods, non-string classes, unknown globals).
+fn receiver_result_kind(class: ReceiverClass, receiver: &str, method: &str) -> Option<InitKind> {
+    match class {
+        ReceiverClass::Any => Some(InitKind::Any),
+        ReceiverClass::String => string_method_kind(method),
+        ReceiverClass::Unclaimed => known_receiver_kind(receiver, method),
+        ReceiverClass::Other => None,
+    }
+}
+
+/// Resolves one call-expression initializer to its probed result kind
+/// (P076): receiver-independent globals and string-literal receivers
+/// classify statically; bare-identifier receivers classify through
+/// [`classify_receiver`] with receiver-class keying (never blind
+/// method-to-kind). `Keep` covers non-call shapes and contradictory
+/// companions (the prefix declines those first); every other outcome
+/// substitutes — including [`InitKind::Any` (which the annotation paths
+/// absorb silently everywhere except `never`, exactly like the oracle) —
+/// so verdicts match the literal paths by construction. `Decline` carries
+/// no reason because the caller always reports the historical non-literal
+/// note byte-identically.
+fn resolve_call(
+    decl: &ConstDecl,
+    binder: &Binder,
+    scope: &LocalAliasScope<'_, '_>,
+    idents: &IdentTable,
+    file: FileId,
+) -> IdentResolution {
+    let Some(call) = decl.init_call.as_ref() else {
+        return IdentResolution::Keep;
+    };
+    // Defensive shape guard: the prefix declines contradictory companions
+    // first, so a paired shape reaching here keeps the historical path. A
+    // paired bare identifier wins over the call (the driver never feeds
+    // both — this is unit-test skew only, and identifiers resolve first).
+    if decl.init != Some(InitKind::NonLiteral)
+        || decl.init_ident.is_some()
+        || decl.init_object.is_some()
+        || decl.init_array.is_some()
+        || decl.cast.is_some()
+        || decl.init_ternary.is_some()
+        || decl.init_member_ref.is_some()
+        || decl.init_arrow.is_some()
+    {
+        return IdentResolution::Keep;
+    }
+    match &call.receiver {
+        None => match global_call_kind(call.callee.as_str()) {
+            Some(kind) => IdentResolution::Substitute(kind),
+            None => IdentResolution::Decline(String::new()),
+        },
+        Some(CallReceiver::StringLiteral) => match string_method_kind(call.callee.as_str()) {
+            Some(kind) => IdentResolution::Substitute(kind),
+            None => IdentResolution::Decline(String::new()),
+        },
+        Some(CallReceiver::Bare(receiver)) => {
+            let step = CallUse {
+                decl,
+                receiver: receiver.as_str(),
+                binder,
+                scope,
+                idents,
+                file,
+            };
+            // Substituted kinds (including `any`) check below through the
+            // existing literal paths; `Decline` reasons never surface (see
+            // the caller).
+            let class = classify_receiver(&step);
+            match receiver_result_kind(class, receiver.as_str(), call.callee.as_str()) {
+                Some(kind) => IdentResolution::Substitute(kind),
+                None => IdentResolution::Decline(String::new()),
+            }
+        }
+    }
+}
+
+/// One call-classification step's inputs for [`resolve_call_init`], bundled
+/// so arity stays flat (the [`IdentStep`] precedent).
+struct CallStep<'a, 'b, 'c, 'd, 'e, 'f> {
+    decl: &'a ConstDecl,
+    binder: &'b Binder,
+    scope: &'c LocalAliasScope<'d, 'e>,
+    idents: &'c IdentTable,
+    file: FileId,
+    span: Span,
+    report: &'f mut FileReport,
+    init: &'f mut Option<InitKind>,
+}
+
+/// Call-expression classification step for [`check_one`] (P076): a listed
+/// call checks through the existing literal paths with its probed kind, an
+/// `any`-result stays silent, and anything else keeps the historical
+/// non-literal decline byte-identically (the resolution reasons never
+/// surface — tsc's `TS2339`/`TS2304` stay pinned divergences). Returns true
+/// when the declaration is done; otherwise substitutes the probed kind into
+/// `init` in place.
+fn resolve_call_init(step: CallStep<'_, '_, '_, '_, '_, '_>) -> bool {
+    let CallStep {
+        decl,
+        binder,
+        scope,
+        idents,
+        file,
+        span,
+        report,
+        init,
+    } = step;
+    match resolve_call(decl, binder, scope, idents, file) {
+        IdentResolution::Keep => false,
+        IdentResolution::Substitute(kind) => {
+            *init = Some(kind);
+            false
+        }
+        IdentResolution::SilentAny | IdentResolution::SilentNever => true,
+        IdentResolution::Decline(_) => {
+            report.unsupported.push(UnsupportedDecl {
+                file,
+                span,
+                reason: "non-literal initializer is outside the subset".to_owned(),
+            });
+            true
+        }
+    }
+}
+
+/// One static (resolution-free) call result for [`IdentTable`] feeding
+/// (P076): globals and string-literal receivers carry probed kinds with no
+/// table lookup, so unannotated intermediates still feed later uses (the
+/// P060-inference precedent). Bare-identifier receivers (known-global pairs
+/// included) resolve sequentially in [`ident_inputs_from_decls`] instead —
+/// never here, so this stays total without a table. Contradictory
+/// companions (which the prefix declines) never feed: only a bare
+/// `NonLiteral` with no other shape upgrades.
+fn static_call_prop(decl: &ConstDecl) -> Option<PropInit> {
+    let call = decl.init_call.as_ref()?;
+    if decl.init != Some(InitKind::NonLiteral)
+        || decl.init_ident.is_some()
+        || decl.init_object.is_some()
+        || decl.init_array.is_some()
+        || decl.cast.is_some()
+        || decl.init_ternary.is_some()
+        || decl.init_member_ref.is_some()
+        || decl.init_arrow.is_some()
+    {
+        return None;
+    }
+    let kind = match &call.receiver {
+        None => global_call_kind(call.callee.as_str())?,
+        Some(CallReceiver::StringLiteral) => string_method_kind(call.callee.as_str())?,
+        Some(CallReceiver::Bare(_)) => return None,
+    };
+    Some(if kind == InitKind::Any {
+        PropInit::SilentAny
+    } else {
+        PropInit::Literal(kind)
+    })
+}
+
 /// One ternary arm after resolution for [`check_ternary`] (P051).
 ///
 /// Provenance rides the variants (not a side flag): direct literals spell
@@ -10580,6 +11131,7 @@ fn resolve_ternary_arm(step: &TernaryArmStep<'_, '_, '_, '_, '_>) -> Result<Join
         annotation: decl.annotation.clone(),
         init: Some(InitKind::NonLiteral),
         init_ident: Some(name.to_owned()),
+        init_call: None,
         init_object: None,
         init_array: None,
         cast: None,
@@ -11092,6 +11644,10 @@ fn check_fn_annotation(check: &FnCheck<'_>, binder: &Binder, ctx: &mut CheckCtx<
         return;
     }
     match check.init {
+        Some(InitKind::Any) => {
+            // P025 absorption for `any`-result calls (P076): `any` admits
+            // every function type silently (probed tsc 7.0.2 clean).
+        }
         Some(kind) if kind != InitKind::NonLiteral => {
             ctx.report.diagnostics.push(PithDiagnostic {
                 code: CODE_MISMATCH.to_owned(),
@@ -11298,16 +11854,37 @@ struct CheckPrefix<'a> {
     init: Option<InitKind>,
 }
 
-/// Runs the [`check_one`] prefix gates (see [`CheckPrefix`]).
-fn check_prefix<'a>(
+/// Inputs for the [`check_one`] prefix gates, bundled so the
+/// unannotated `any`-call rule threads resolution without growing arity
+/// (the [`IdentStep`] precedent).
+struct PrefixStep<'a, 'b, 'c, 'd, 'e, 'f> {
     decl: &'a ConstDecl,
-    binder: &Binder,
+    binder: &'b Binder,
+    scope: &'c LocalAliasScope<'d, 'e>,
+    idents: &'c IdentTable,
     file: FileId,
-    report: &mut FileReport,
-) -> Option<CheckPrefix<'a>> {
+    report: &'f mut FileReport,
+}
+
+/// Runs the [`check_one`] prefix gates (see [`CheckPrefix`]).
+fn check_prefix<'a>(step: PrefixStep<'a, '_, '_, '_, '_, '_>) -> Option<CheckPrefix<'a>> {
+    let PrefixStep {
+        decl,
+        binder,
+        scope,
+        idents,
+        file,
+        report,
+    } = step;
     let span = binder_span(binder, file, decl);
     let Some(raw) = decl.annotation.as_deref() else {
-        decline_unannotated(decl, span, file, report);
+        let calls = UnannotatedCalls {
+            binder,
+            scope,
+            idents,
+            file,
+        };
+        decline_unannotated(decl, span, report, &calls);
         return None;
     };
     let annotation = raw.trim();
@@ -11376,12 +11953,36 @@ fn check_one(
     scope: &LocalAliasScope<'_, '_>,
 ) {
     let file = ctx.file;
-    let Some(prefix) = check_prefix(decl, binder, file, &mut *ctx.report) else {
+    let step = PrefixStep {
+        decl,
+        binder,
+        scope,
+        idents: ctx.idents,
+        file,
+        report: &mut *ctx.report,
+    };
+    let Some(prefix) = check_prefix(step) else {
         return;
     };
     let span = prefix.span;
     let annotation = prefix.annotation;
     let mut init = prefix.init;
+    // Call-expression initializers (P076; see `resolve_call_init`):
+    // listed calls check through the existing literal paths with their
+    // probed kind, `any`-results stay silent, and anything else keeps the
+    // historical non-literal decline.
+    if resolve_call_init(CallStep {
+        decl,
+        binder,
+        scope,
+        idents: ctx.idents,
+        file,
+        span,
+        report: &mut *ctx.report,
+        init: &mut init,
+    }) {
+        return;
+    }
     // Ternary initializers (P051; see `resolve_ternary_init`): agreeing
     // arms read as one literal kind, joins diagnose once, anything else
     // declines whole-declaration.
@@ -11542,7 +12143,7 @@ fn finish_object_check(
 ) {
     memoize_object_shape(expected, ctx);
     match decl.init_object.as_ref() {
-        None => check_object_annotation_non_object_init(init, span, expected_text, ctx),
+        None => check_object_annotation_non_object_init(init, span, expected, expected_text, ctx),
         Some(init_object) => {
             compare_object_members(span, expected, expected_text, init_object, ctx);
         }
@@ -11839,6 +12440,7 @@ fn diagnose_missing_members(
 fn check_object_annotation_non_object_init(
     init: Option<InitKind>,
     span: Span,
+    expected: &[ExpectedMember],
     expected_text: &str,
     ctx: &mut CheckCtx<'_>,
 ) {
@@ -11867,6 +12469,33 @@ fn check_object_annotation_non_object_init(
                 the oracle spells the missing-member family"
                     .to_owned(),
         });
+        return;
+    }
+    if init == InitKind::Any {
+        // P025 absorption for `any`-result calls (P076): `any` admits
+        // every object silently (probed tsc 7.0.2 clean).
+        return;
+    }
+    if init == InitKind::StringArray {
+        // A `string[]` actual carries no named members, so every REQUIRED
+        // expected member is missing (optional members stay silent —
+        // probed P037): the oracle's missing family with the array
+        // spelling as the actual type (probed tsc 7.0.2 P076).
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|member| !member.optional)
+            .map(|member| member.name.as_str())
+            .collect();
+        emit_missing(
+            ctx.file,
+            &MissingEmission {
+                span,
+                expected_text,
+                actual_text: "string[]".to_owned(),
+                missing,
+            },
+            &mut *ctx.report,
+        );
         return;
     }
     ctx.report.diagnostics.push(PithDiagnostic {
@@ -11983,6 +12612,15 @@ fn check_array_members(
     }
 }
 
+/// Whether a `string[]` call-result actual checks silently against one
+/// admitted array element (P076): `string` itself plus the accept-all
+/// boundaries (`any`/`unknown` admit every element — probed tsc 7.0.2).
+fn string_array_admits(element: &ArrayElement) -> bool {
+    element.id == TypeStore::STRING
+        || element.id == TypeStore::ANY
+        || element.id == TypeStore::UNKNOWN
+}
+
 /// Array annotation with a non-array initializer.
 ///
 /// Missing/non-literal initializers decline with the usual reasons;
@@ -12020,6 +12658,17 @@ fn check_array_annotation_non_array_init(
                 the oracle spells TS2740"
                 .to_owned(),
         });
+        return;
+    }
+    if init == InitKind::Any {
+        // P025 absorption for `any`-result calls (P076): `any` admits
+        // every array silently (probed tsc 7.0.2 clean, all elements).
+        return;
+    }
+    if init == InitKind::StringArray && string_array_admits(element) {
+        // A `string[]` actual against `string[]` (or accept-all elements)
+        // is clean (probed tsc 7.0.2); every other element diagnoses below
+        // with the `string[]` spelling.
         return;
     }
     ctx.report.diagnostics.push(PithDiagnostic {
@@ -13507,7 +14156,12 @@ impl EnumDeclCtx<'_, '_, '_> {
                     format!("Type '{spelling}' is not assignable to type '{display}'."),
                 );
             }
-            InitKind::Null | InitKind::Undefined | InitKind::Unknown | InitKind::RegExp => {
+            InitKind::Null
+            | InitKind::Undefined
+            | InitKind::Unknown
+            | InitKind::RegExp
+            | InitKind::Any
+            | InitKind::StringArray => {
                 self.diagnose(
                     span,
                     CODE_MISMATCH,
@@ -13990,6 +14644,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: Some(init),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -14015,6 +14670,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: None,
             init_ident: None,
+            init_call: None,
             init_object: Some(ObjectInit {
                 members: members
                     .into_iter()
@@ -14382,6 +15038,7 @@ mod tests {
                 annotation: None,
                 init: Some(InitKind::Number),
                 init_ident: None,
+                init_call: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -14471,6 +15128,7 @@ mod tests {
             annotation: ann.map(str::to_owned),
             init: Some(InitKind::NonLiteral),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: Some(CastInput {
@@ -14551,6 +15209,7 @@ mod tests {
             annotation: Some("any".to_owned()),
             init: None,
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -15794,6 +16453,7 @@ mod tests {
             annotation: Some(annotation.to_owned()),
             init: Some(InitKind::NonLiteral),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -16433,6 +17093,7 @@ mod tests {
                 annotation: None,
                 init: Some(InitKind::NonLiteral),
                 init_ident: None,
+                init_call: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -16450,6 +17111,7 @@ mod tests {
                 annotation: Some("number".to_owned()),
                 init: None,
                 init_ident: None,
+                init_call: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -16557,6 +17219,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: Some(init),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -16604,6 +17267,7 @@ mod tests {
             annotation: Some("number".to_owned()),
             init: Some(InitKind::String),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -16635,6 +17299,7 @@ mod tests {
             annotation: Some("string".to_owned()),
             init: Some(InitKind::Number),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -16664,6 +17329,7 @@ mod tests {
             annotation: Some("string".to_owned()),
             init: Some(InitKind::Number),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -17091,6 +17757,7 @@ mod tests {
             annotation: Some("{ a: number }".to_owned()),
             init: Some(InitKind::Number),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -17195,6 +17862,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: None,
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: Some(ArrayInit { members }),
             cast: None,
@@ -17791,6 +18459,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: Some(InitKind::NonLiteral),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -18084,6 +18753,7 @@ mod tests {
                 annotation: Some("number".to_owned()),
                 init: Some(InitKind::NonLiteral),
                 init_ident: None,
+                init_call: None,
                 init_object: None,
                 init_array: None,
                 cast: Some(never_cast),
@@ -19976,6 +20646,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init,
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -19995,6 +20666,7 @@ mod tests {
             annotation: Some("unknown".to_owned()),
             init,
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -20491,6 +21163,7 @@ mod tests {
                 annotation: Some("number | string".to_owned()),
                 init: None,
                 init_ident: None,
+                init_call: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -20795,6 +21468,7 @@ mod tests {
                 annotation: None,
                 init: Some(InitKind::NonLiteral),
                 init_ident: None,
+                init_call: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -21040,6 +21714,7 @@ mod tests {
             annotation: annotation.map(str::to_owned),
             init,
             init_ident: init_ident.map(str::to_owned),
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -22887,6 +23562,7 @@ mod tests {
                 annotation: Some(annotation.to_owned()),
                 init: Some(init),
                 init_ident: None,
+                init_call: None,
                 init_object: None,
                 init_array: None,
                 cast: None,
@@ -24334,6 +25010,7 @@ mod tests {
             annotation: Some(ann.to_owned()),
             init: Some(InitKind::NonLiteral),
             init_ident: Some(source.to_owned()),
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -24355,6 +25032,7 @@ mod tests {
             annotation: None,
             init: Some(init),
             init_ident: None,
+            init_call: None,
             init_object: None,
             init_array: None,
             cast: None,
@@ -24362,6 +25040,459 @@ mod tests {
             init_member_ref: None,
             init_arrow: None,
         }
+    }
+
+    /// One call-expression-initialized use: an optionally annotated `const`
+    /// whose initializer is a P076 call (the driver seam, hand-set here —
+    /// the e2e driver slices it from the init fact span).
+    fn call_use(
+        name: &str,
+        lo: u32,
+        hi: u32,
+        ann: Option<&str>,
+        callee: &str,
+        receiver: Option<CallReceiver>,
+    ) -> ConstDecl {
+        ConstDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: ann.map(str::to_owned),
+            init: Some(InitKind::NonLiteral),
+            init_ident: None,
+            init_call: Some(CallInit {
+                callee: callee.to_owned(),
+                receiver,
+            }),
+            init_object: None,
+            init_array: None,
+            cast: None,
+            init_ternary: None,
+            init_member_ref: None,
+            init_arrow: None,
+        }
+    }
+
+    /// One bare-identifier call receiver (`s` in `s.trim()`).
+    fn bare_receiver(name: &str) -> CallReceiver {
+        CallReceiver::Bare(name.to_owned())
+    }
+
+    #[test]
+    fn call_tables_map_probed_kinds() {
+        // Every table entry classifies to its probed tsc 7.0.2 kind; anything
+        // else maps to `None` (the caller declines byte-identically).
+        assert_eq!(global_call_kind("parseInt"), Some(InitKind::Number));
+        assert_eq!(global_call_kind("parseFloat"), Some(InitKind::Number));
+        assert_eq!(global_call_kind("String"), Some(InitKind::String));
+        assert_eq!(global_call_kind("Number"), Some(InitKind::Number));
+        assert_eq!(global_call_kind("Boolean"), Some(InitKind::Boolean));
+        assert_eq!(global_call_kind("nope"), None);
+        assert_eq!(global_call_kind("trim"), None);
+        assert_eq!(string_method_kind("trim"), Some(InitKind::String));
+        assert_eq!(string_method_kind("toUpperCase"), Some(InitKind::String));
+        assert_eq!(string_method_kind("toLowerCase"), Some(InitKind::String));
+        assert_eq!(string_method_kind("slice"), Some(InitKind::String));
+        assert_eq!(string_method_kind("charAt"), Some(InitKind::String));
+        assert_eq!(string_method_kind("split"), Some(InitKind::StringArray));
+        assert_eq!(string_method_kind("foo"), None);
+        assert_eq!(string_method_kind("parseInt"), None);
+        assert_eq!(
+            known_receiver_kind("Array", "isArray"),
+            Some(InitKind::Boolean)
+        );
+        assert_eq!(
+            known_receiver_kind("Object", "keys"),
+            Some(InitKind::StringArray)
+        );
+        assert_eq!(
+            known_receiver_kind("Object", "getPrototypeOf"),
+            Some(InitKind::Any)
+        );
+        assert_eq!(known_receiver_kind("JSON", "parse"), Some(InitKind::Any));
+        assert_eq!(known_receiver_kind("JSON", "stringify"), None);
+        assert_eq!(known_receiver_kind("Math", "floor"), None);
+    }
+
+    #[test]
+    fn call_global_clean_and_wrong() {
+        // `const a: number = parseInt("10")` is clean; against `string` it
+        // spells the probed `TS2322` (probes `g-parseInt-*`).
+        let binder = binder_with(&[("a", span(0, 10))]);
+        let mut db = QueryDb::new();
+        let clean = [call_use("a", 0, 10, Some("number"), "parseInt", None)];
+        let report = check_file(FILE, &clean, &binder, &mut db);
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        let mut db = QueryDb::new();
+        let wrong = [call_use("a", 0, 10, Some("string"), "parseInt", None)];
+        let report = check_file(FILE, &wrong, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, "PITH2322");
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn call_any_result_silent_except_never() {
+        // `JSON.parse` absorbs to `any`: silent against primitives and
+        // `any`, diagnosing only `never` with the oracle spelling (probes
+        // `g-jsonparse-*`, `t-jsonparse-never`).
+        let binder = binder_with(&[("a", span(0, 10))]);
+        for ann in ["string", "number", "boolean", "any", "unknown"] {
+            let mut db = QueryDb::new();
+            let use_decl = call_use("a", 0, 10, Some(ann), "parse", Some(bare_receiver("JSON")));
+            let report = check_file(FILE, &[use_decl], &binder, &mut db);
+            assert!(report.diagnostics.is_empty(), "{ann}: {report:?}");
+            assert!(report.unsupported.is_empty(), "{ann}: {report:?}");
+        }
+        let mut db = QueryDb::new();
+        let use_decl = call_use(
+            "a",
+            0,
+            10,
+            Some("never"),
+            "parse",
+            Some(bare_receiver("JSON")),
+        );
+        let report = check_file(FILE, &[use_decl], &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'any' is not assignable to type 'never'."
+        );
+    }
+
+    #[test]
+    fn call_string_array_paths() {
+        // `Object.keys` spells `string[]`: clean against `string[]`, one
+        // `TS2322` against `number`/`number[]`, and the missing family
+        // against objects (probes `g-keys-*`, `t-keys-*`).
+        let binder = binder_with(&[("a", span(0, 10))]);
+        let mut db = QueryDb::new();
+        let clean = [call_use(
+            "a",
+            0,
+            10,
+            Some("string[]"),
+            "keys",
+            Some(bare_receiver("Object")),
+        )];
+        let report = check_file(FILE, &clean, &binder, &mut db);
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        for (ann, message) in [
+            (
+                "number",
+                "Type 'string[]' is not assignable to type 'number'.",
+            ),
+            (
+                "number[]",
+                "Type 'string[]' is not assignable to type 'number[]'.",
+            ),
+        ] {
+            let mut db = QueryDb::new();
+            let use_decl = call_use("a", 0, 10, Some(ann), "keys", Some(bare_receiver("Object")));
+            let report = check_file(FILE, &[use_decl], &binder, &mut db);
+            assert_eq!(report.diagnostics.len(), 1, "{ann}: {report:?}");
+            assert_eq!(report.diagnostics[0].message, message);
+        }
+        let mut db = QueryDb::new();
+        let use_decl = call_use(
+            "a",
+            0,
+            10,
+            Some("{ x: number; }"),
+            "keys",
+            Some(bare_receiver("Object")),
+        );
+        let report = check_file(FILE, &[use_decl], &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, "PITH2741");
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Property 'x' is missing in type 'string[]' but required in type '{ x: number; }'."
+        );
+    }
+
+    #[test]
+    fn call_bare_string_receiver_checks() {
+        // `const s = "hi"; const a: string = s.trim();` is clean; against
+        // `number` it diagnoses (probes `r-ident-str-*`).
+        let binder = binder_with(&[("s", span(0, 10)), ("a", span(11, 21))]);
+        let mut db = QueryDb::new();
+        let clean = [
+            literal_source("s", 0, 10, InitKind::String),
+            call_use(
+                "a",
+                11,
+                21,
+                Some("string"),
+                "trim",
+                Some(bare_receiver("s")),
+            ),
+        ];
+        let report = check_file(FILE, &clean, &binder, &mut db);
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        let mut db = QueryDb::new();
+        let wrong = [
+            literal_source("s", 0, 10, InitKind::String),
+            call_use(
+                "a",
+                11,
+                21,
+                Some("number"),
+                "trim",
+                Some(bare_receiver("s")),
+            ),
+        ];
+        let report = check_file(FILE, &wrong, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+    }
+
+    #[test]
+    fn call_any_receiver_absorbs() {
+        // `const av: any = 1; const a: string = av.trim();` stays silent —
+        // even `split` against `string` (probes `r-any-*`).
+        let binder = binder_with(&[("av", span(0, 10)), ("a", span(11, 21))]);
+        let source = decl("av", 0, 10, "any", InitKind::Number);
+        for (method, ann) in [
+            ("trim", "string"),
+            ("split", "string"),
+            ("split", "string[]"),
+        ] {
+            let mut db = QueryDb::new();
+            let decls = [
+                source.clone(),
+                call_use("a", 11, 21, Some(ann), method, Some(bare_receiver("av"))),
+            ];
+            let report = check_file(FILE, &decls, &binder, &mut db);
+            assert!(report.diagnostics.is_empty(), "{method}/{ann}: {report:?}");
+            assert!(report.unsupported.is_empty(), "{method}/{ann}: {report:?}");
+        }
+    }
+
+    #[test]
+    fn call_declines_stay_byte_identical() {
+        // Number receivers, unlisted methods, unknown globals, and
+        // unresolvable receivers keep the exact historical note (tsc spells
+        // `TS2339`/`TS2304` there — pinned divergences, probed `r-num-*`,
+        // `u-foo-str`, `u-nosuch-clean`).
+        let binder = binder_with(&[("n", span(0, 10)), ("a", span(11, 21))]);
+        let source = literal_source("n", 0, 10, InitKind::Number);
+        let cases = [
+            call_use(
+                "a",
+                11,
+                21,
+                Some("string"),
+                "trim",
+                Some(bare_receiver("n")),
+            ),
+            call_use(
+                "a",
+                11,
+                21,
+                Some("string"),
+                "foo",
+                Some(CallReceiver::StringLiteral),
+            ),
+            call_use("a", 11, 21, Some("string"), "nope", None),
+            call_use(
+                "a",
+                11,
+                21,
+                Some("string"),
+                "trim",
+                Some(bare_receiver("ghost")),
+            ),
+        ];
+        for use_decl in cases {
+            let mut db = QueryDb::new();
+            let decls = [source.clone(), use_decl];
+            let report = check_file(FILE, &decls, &binder, &mut db);
+            assert!(report.diagnostics.is_empty(), "{report:?}");
+            assert_eq!(report.unsupported.len(), 1);
+            assert_eq!(
+                report.unsupported[0].reason,
+                "non-literal initializer is outside the subset"
+            );
+        }
+    }
+
+    #[test]
+    fn call_param_shadowed_global_declines() {
+        // A parameter naming a known global shadows it even when the binder
+        // misses the name (params can miss binder resolution — the P050
+        // precedent — yet still shadow by language semantics): the pairs
+        // never apply.
+        let binder = binder_with(&[("a", span(0, 10))]);
+        let table = params_table(vec![("Object", Some("number"), false, None)]);
+        let decl = decl("a", 0, 10, "string", InitKind::NonLiteral);
+        let step = CallUse {
+            decl: &decl,
+            receiver: "Object",
+            binder: &binder,
+            scope: &LocalAliasScope::EMPTY,
+            idents: &table,
+            file: FILE,
+        };
+        assert_eq!(classify_receiver(&step), ReceiverClass::Other);
+    }
+
+    #[test]
+    fn call_shadowed_globals_decline_byte_identically() {
+        // Resolve-first shadowing guard (P076 flip): a receiver naming a
+        // program binding never reads the known-global pairs (tsc spells
+        // `TS2339` there — pinned divergence); the historical note fires
+        // instead, exactly as before the pairs existed.
+        let binder = binder_with(&[
+            ("Object", span(0, 10)),
+            ("Array", span(11, 21)),
+            ("JSON", span(22, 30)),
+            ("a", span(31, 41)),
+        ]);
+        let cases = [
+            (
+                literal_source("Object", 0, 10, InitKind::Number),
+                "keys",
+                "Object",
+            ),
+            (
+                literal_source("Array", 11, 21, InitKind::String),
+                "isArray",
+                "Array",
+            ),
+            (
+                literal_source("JSON", 22, 30, InitKind::Number),
+                "parse",
+                "JSON",
+            ),
+        ];
+        for (source, method, receiver) in cases {
+            let mut db = QueryDb::new();
+            let use_decl = call_use(
+                "a",
+                31,
+                41,
+                Some("string"),
+                method,
+                Some(CallReceiver::Bare(receiver.to_owned())),
+            );
+            let decls = [source, use_decl];
+            let report = check_file(FILE, &decls, &binder, &mut db);
+            assert!(report.diagnostics.is_empty(), "{method}: {report:?}");
+            assert_eq!(report.unsupported.len(), 1, "{method}: {report:?}");
+            assert_eq!(
+                report.unsupported[0].reason, "non-literal initializer is outside the subset",
+                "{method}: {report:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn call_unannotated_any_silent_others_decline() {
+        // P076 narrows the P060 call exclusion explicitly: `any`-results go
+        // silent unannotated (absorption) while every other unannotated
+        // call keeps the historical `no annotation` decline (probes
+        // `g-proto-unann`, `g-parseInt-unann`).
+        let binder = binder_with(&[("a", span(0, 10))]);
+        let mut db = QueryDb::new();
+        let silent = [call_use(
+            "a",
+            0,
+            10,
+            None,
+            "getPrototypeOf",
+            Some(bare_receiver("Object")),
+        )];
+        let report = check_file(FILE, &silent, &binder, &mut db);
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        let mut db = QueryDb::new();
+        let declined = [call_use("a", 0, 10, None, "parseInt", None)];
+        let report = check_file(FILE, &declined, &binder, &mut db);
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "no annotation: inference is outside the subset"
+        );
+    }
+
+    #[test]
+    fn call_static_result_feeds_later_uses() {
+        // `const a = parseInt("10"); const b: string = a;` diagnoses at the
+        // use (probe `p-chain-wrong`); the intermediate keeps its
+        // unannotated decline while still feeding its kind.
+        let binder = binder_with(&[("a", span(0, 10)), ("b", span(11, 21))]);
+        let mut db = QueryDb::new();
+        let decls = [
+            call_use("a", 0, 10, None, "parseInt", None),
+            ident_use("b", 11, 21, "string", "a"),
+        ];
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "no annotation: inference is outside the subset"
+        );
+    }
+
+    #[test]
+    fn call_bare_receiver_result_feeds_one_level() {
+        // `const s = "hi"; const t = s.trim(); const b: number = t;`
+        // diagnoses at `b` (probe `p-method-chain`): the intermediate keeps
+        // its unannotated decline while its resolved kind still feeds.
+        let binder = binder_with(&[("s", span(0, 10)), ("t", span(11, 21)), ("b", span(22, 32))]);
+        let mut db = QueryDb::new();
+        let decls = [
+            literal_source("s", 0, 10, InitKind::String),
+            call_use("t", 11, 21, None, "trim", Some(bare_receiver("s"))),
+            ident_use("b", 22, 32, "number", "t"),
+        ];
+        let report = check_file(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn call_contradictory_shapes_decline() {
+        // Call facts paired with another initializer shape record the
+        // contradictory note (never a forced verdict).
+        let binder = binder_with(&[("a", span(0, 10))]);
+        let mut use_decl = call_use("a", 0, 10, Some("number"), "parseInt", None);
+        use_decl.init = Some(InitKind::Number);
+        let mut db = QueryDb::new();
+        let report = check_file(FILE, &[use_decl], &binder, &mut db);
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0]
+                .reason
+                .contains("contradictory initializer facts"),
+            "reason: {}",
+            report.unsupported[0].reason
+        );
     }
 
     /// One [`IdentTable`] holding only parameters, for classifier tests.
