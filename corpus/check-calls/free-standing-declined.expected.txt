@@ -1,0 +1,2 @@
+free-standing-declined.ts:TS7006: Parameter 'f' implicitly has an 'any' type.
+free-standing-declined.ts:TS7006: Parameter 'x' implicitly has an 'any' type.

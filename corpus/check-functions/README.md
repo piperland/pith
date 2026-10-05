@@ -17,6 +17,9 @@ machinery reused). Oracle baselines are tsc 7.0.2 via
 | two-returns.ts | 2x TS2322 (both returns) | 2x PITH2322 (sequence join, per-return) |
 | object-return.ts | clean | silent (object machinery reused, member facts fact-fed) |
 | excluded-shapes.ts | clean | silent, zero function facts (arrows, expressions, methods) |
+| leading-init-clean.ts | clean | silent (leading initializer binds contextually from its annotation) |
+| leading-init-wrong.ts | 1x TS2322 | 1x PITH2322 at the body span |
+| return-arrow-declined.ts | 1x TS2322 + 1x TS7006 | 1 UNSUPPORTED (return-position arrows keep the non-literal gate — pinned divergence) |
 
 Differential: 9/9 match on the straight-line-plus-joins subset (4 silent/clean +
 4 diagnostic pairs incl. the double-diagnostic join + 1 unsupported/clean); 1/1

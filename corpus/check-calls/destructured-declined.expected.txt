@@ -1,0 +1,1 @@
+destructured-declined.ts:TS2339: Property 'x' does not exist on type 'Number'.

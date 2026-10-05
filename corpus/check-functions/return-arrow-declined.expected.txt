@@ -1,0 +1,2 @@
+return-arrow-declined.ts:TS2322: Type '(x: any) => number' is not assignable to type 'number'.
+return-arrow-declined.ts:TS7006: Parameter 'x' implicitly has an 'any' type.

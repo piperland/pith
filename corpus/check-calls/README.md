@@ -53,6 +53,13 @@ tsc 7.0.2 via `.agent/scripts/pith-oracle/run.mjs` (normalized
 | overload-impl-excluded.ts | 1x TS2345 (`Argument of type 'boolean' …`) | 1x PITH2345 (implementation signature never participates) |
 | ts2391-impl-less-group.ts | 1x TS2391 (on the declaration) + 1x TS2769 + continuations | 1x PITH2769 (calls still resolve; the declaration diagnostic stays declined) |
 | non-callable-ambient-declined.ts | 1x TS2349 + continuation | UNSUPPORTED (bound name declares no function signature; the subset never spells `TS2349`) |
+| contextual-clean.ts | clean (3 calls: literal, identifier, and two-param arrow bodies) | silent (unannotated params bind from the expected signature) |
+| contextual-wrong-body.ts | 2x TS2322 (one per wrong body) | 2x PITH2322 at the body spans |
+| named-alias-clean.ts | clean | silent (alias-to-function admits one level, single pass) |
+| rest-declined.ts | clean | 1 UNSUPPORTED (rest arrow params decline distinctly — pinned divergence) |
+| destructured-declined.ts | 1x TS2339 | 1 UNSUPPORTED (destructured arrow params decline distinctly — pinned divergence) |
+| free-standing-declined.ts | 2x TS7006 | 1 UNSUPPORTED (unannotated-parameter gate, exactly as before) |
+| returns-dependent-declined.ts | clean | 1 UNSUPPORTED (generic `T` signatures never admit — pinned divergence) |
 
 Differential: 27/27 match on the checkable direct-call subset (9
 silent/clean + 18 diagnostic groups); 12/12 divergences pinned explicitly
