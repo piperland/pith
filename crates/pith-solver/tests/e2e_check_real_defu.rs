@@ -25,10 +25,10 @@ use pith_ids::{FileId, NodeId, Span, SymbolId};
 use pith_queries::{QueryDb, QueryKey, QueryKind};
 use pith_solver::{
     multifile::{check_program, AliasShape, ImportUse, ProgramFile, ProgramReport},
-    CallArg, CallSite, ConstDecl, DeclKind, EffectCall, EnumMember, EnumMemberValue, EnumShape,
-    FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, GuardEffectBody,
-    InitKind, InterfaceHeritage, InterfaceMember, InterfaceShape, JoinedReturns, NamespaceShape,
-    ObjectInit, ObjectMemberInit, ObjectMemberKind,
+    CallArg, CallInit, CallReceiver, CallSite, ConstDecl, DeclKind, EffectCall, EnumMember,
+    EnumMemberValue, EnumShape, FileReport, FunctionBody, FunctionDecl, FunctionParam,
+    FunctionReturn, GuardEffectBody, InitKind, InterfaceHeritage, InterfaceMember, InterfaceShape,
+    JoinedReturns, NamespaceShape, ObjectInit, ObjectMemberInit, ObjectMemberKind,
 };
 use pith_symbols::{
     multifile::{
@@ -169,6 +169,142 @@ fn is_bare_identifier(text: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
+/// Splits one sliced call head (`f`, `r.m`, or `"lit".m`) into its receiver
+/// and callee (P076 seam): a lone bare identifier is a global call, a
+/// single-dot pair of bare identifiers is a member call, and a quoted
+/// literal plus a bare method is a string-literal-receiver call. Anything
+/// else (empty heads, multi-dot paths, parenthesized or numeric receivers)
+/// is `None` — those receivers decline solver-side.
+fn split_call_head(head: &str) -> Option<(Option<CallReceiver>, String)> {
+    let head = head.trim();
+    if is_bare_identifier(head) {
+        return Some((None, head.to_owned()));
+    }
+    if let Some((receiver, method)) = head.rsplit_once('.') {
+        let (receiver, method) = (receiver.trim(), method.trim());
+        if is_bare_identifier(method) {
+            if is_bare_identifier(receiver) {
+                return Some((
+                    Some(CallReceiver::Bare(receiver.to_owned())),
+                    method.to_owned(),
+                ));
+            }
+            if is_quoted_string(receiver) {
+                return Some((Some(CallReceiver::StringLiteral), method.to_owned()));
+            }
+        }
+    }
+    None
+}
+
+/// Whether sliced text is a single- or double-quoted string literal
+/// (backticks never qualify: tagged and interpolated templates are outside
+/// the call subset).
+fn is_quoted_string(text: &str) -> bool {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+    (first == b'"' || first == b'\'') && last == first
+}
+
+/// Finds the opening paren of one sliced call text: the first `(` outside
+/// quoted runs, so a paren inside a string-literal receiver (`"(".trim()`)
+/// never splits the head. `None` when no unquoted `(` opens.
+fn find_call_open(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut cursor = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(mark) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == mark {
+                quote = None;
+            }
+        } else if byte == b'"' || byte == b'\'' {
+            quote = Some(byte);
+        } else if byte == b'(' {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// Parses one sliced initializer text as a call expression (P076 seam):
+/// `head(args)` where `head` splits per [`split_call_head`] and the
+/// argument span is paren-balanced through the final `)`. Arguments never
+/// cross (arity and arg types stay unchecked — kind classification only),
+/// but their parens must balance so `f(x) ? a : b` and `f()()` never
+/// mis-feed. Quote-aware (a paren inside a string literal never counts).
+fn parse_call_text(text: &str) -> Option<CallInit> {
+    let text = text.trim();
+    let open = find_call_open(text)?;
+    if !text.ends_with(')') {
+        return None;
+    }
+    // Balance-check the argument span, skipping quoted runs (escapes
+    // honored) so unbalanced or trailing text declines instead of
+    // mis-feeding.
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(mark) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == mark {
+                quote = None;
+            }
+        } else if byte == b'"' || byte == b'\'' {
+            quote = Some(byte);
+        } else if byte == b'(' {
+            depth += 1;
+        } else if byte == b')' {
+            if depth == 0 {
+                return None;
+            }
+            depth -= 1;
+            if depth == 0 && index != bytes.len() - 1 {
+                return None;
+            }
+        }
+        index += 1;
+    }
+    if quote.is_some() || depth != 0 {
+        return None;
+    }
+    let (receiver, callee) = split_call_head(&text[..open])?;
+    Some(CallInit { callee, receiver })
+}
+
+/// The fact-fed call seam (P076): a bare `NonLiteral` initializer with no
+/// cast, ternary, or member-reference facts slices to [`CallInit`] when its
+/// text parses as a call; anything else feeds `None` and keeps the
+/// historical non-literal path.
+fn parse_call_init(source: &str, init: &FrontendInitFact) -> Option<CallInit> {
+    if init.kind != FrontendInitKind::NonLiteral
+        || init.cast.is_some()
+        || init.ternary.is_some()
+        || init.member_ref.is_some()
+    {
+        return None;
+    }
+    parse_call_text(slice_of(source, init.span)?)
+}
+
 /// One file's hand-fed object members: declarator name plus member shapes.
 struct ObjectSpec<'a> {
     name: &'a str,
@@ -176,7 +312,9 @@ struct ObjectSpec<'a> {
 }
 
 /// The const driver: facts verbatim, plus sliced identifier names and
-/// literal spellings (disclosed seams) and object members from the table.
+/// literal spellings (disclosed seams), the P076 call seam ("member-call
+/// inits feed `CallInit` facts (bare-identifier receivers sliced from spans);
+/// all other inits map byte-identically"), and object members from the table.
 fn consts_from_facts(
     parsed: &ParsedFile,
     binder: &Binder,
@@ -215,6 +353,14 @@ fn consts_from_facts(
             }
             _ => None,
         };
+        // P076 backfill (PITH-P077): member-call inits feed CallInit facts
+        // (bare-identifier receivers sliced from spans); all other inits map
+        // byte-identically — verbatim mirror of the const suite's
+        // `parse_call_init` seam. Fed (hand-fed object) decls keep `None`.
+        let init_call = match (&decl.init, fed) {
+            (Some(init), None) => parse_call_init(source, init),
+            _ => None,
+        };
         let text = match &decl.init {
             Some(init)
                 if matches!(
@@ -238,7 +384,7 @@ fn consts_from_facts(
             annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
             init,
             init_ident: None,
-            init_call: None,
+            init_call,
             init_object,
             // No array-member facts yet (see the check-functions driver).
             init_array: None,
