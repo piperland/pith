@@ -48,8 +48,8 @@ use pith_frontend::{
 use pith_ids::{FileId, Span, SymbolId};
 use pith_queries::QueryDb;
 use pith_solver::{
-    check_file_with_aliases, ConstDecl, DeclKind, FileReport, InitKind, TernaryArm, TernaryInit,
-    TypeAliasShape,
+    check_file_with_aliases, CallInit, CallReceiver, ConstDecl, DeclKind, FileReport, InitKind,
+    TernaryArm, TernaryInit, TypeAliasShape,
 };
 use pith_symbols::{Binder, ScopeInput, SymbolInput, UnresolvedInput};
 
@@ -206,6 +206,142 @@ fn is_bare_identifier(text: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
+/// Splits one sliced call head (`f`, `r.m`, or `"lit".m`) into its receiver
+/// and callee (P076 seam): a lone bare identifier is a global call, a
+/// single-dot pair of bare identifiers is a member call, and a quoted
+/// literal plus a bare method is a string-literal-receiver call. Anything
+/// else (empty heads, multi-dot paths, parenthesized or numeric receivers)
+/// is `None` — those receivers decline solver-side.
+fn split_call_head(head: &str) -> Option<(Option<CallReceiver>, String)> {
+    let head = head.trim();
+    if is_bare_identifier(head) {
+        return Some((None, head.to_owned()));
+    }
+    if let Some((receiver, method)) = head.rsplit_once('.') {
+        let (receiver, method) = (receiver.trim(), method.trim());
+        if is_bare_identifier(method) {
+            if is_bare_identifier(receiver) {
+                return Some((
+                    Some(CallReceiver::Bare(receiver.to_owned())),
+                    method.to_owned(),
+                ));
+            }
+            if is_quoted_string(receiver) {
+                return Some((Some(CallReceiver::StringLiteral), method.to_owned()));
+            }
+        }
+    }
+    None
+}
+
+/// Whether sliced text is a single- or double-quoted string literal
+/// (backticks never qualify: tagged and interpolated templates are outside
+/// the call subset).
+fn is_quoted_string(text: &str) -> bool {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+    (first == b'"' || first == b'\'') && last == first
+}
+
+/// Finds the opening paren of one sliced call text: the first `(` outside
+/// quoted runs, so a paren inside a string-literal receiver (`"(".trim()`)
+/// never splits the head. `None` when no unquoted `(` opens.
+fn find_call_open(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut cursor = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(mark) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == mark {
+                quote = None;
+            }
+        } else if byte == b'"' || byte == b'\'' {
+            quote = Some(byte);
+        } else if byte == b'(' {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// Parses one sliced initializer text as a call expression (P076 seam):
+/// `head(args)` where `head` splits per [`split_call_head`] and the
+/// argument span is paren-balanced through the final `)`. Arguments never
+/// cross (arity and arg types stay unchecked — kind classification only),
+/// but their parens must balance so `f(x) ? a : b` and `f()()` never
+/// mis-feed. Quote-aware (a paren inside a string literal never counts).
+fn parse_call_text(text: &str) -> Option<CallInit> {
+    let text = text.trim();
+    let open = find_call_open(text)?;
+    if !text.ends_with(')') {
+        return None;
+    }
+    // Balance-check the argument span, skipping quoted runs (escapes
+    // honored) so unbalanced or trailing text declines instead of
+    // mis-feeding.
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(mark) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == mark {
+                quote = None;
+            }
+        } else if byte == b'"' || byte == b'\'' {
+            quote = Some(byte);
+        } else if byte == b'(' {
+            depth += 1;
+        } else if byte == b')' {
+            if depth == 0 {
+                return None;
+            }
+            depth -= 1;
+            if depth == 0 && index != bytes.len() - 1 {
+                return None;
+            }
+        }
+        index += 1;
+    }
+    if quote.is_some() || depth != 0 {
+        return None;
+    }
+    let (receiver, callee) = split_call_head(&text[..open])?;
+    Some(CallInit { callee, receiver })
+}
+
+/// The fact-fed call seam (P076): a bare `NonLiteral` initializer with no
+/// cast, ternary, or member-reference facts slices to [`CallInit`] when its
+/// text parses as a call; anything else feeds `None` and keeps the
+/// historical non-literal path.
+fn parse_call_init(source: &str, init: &FrontendInitFact) -> Option<CallInit> {
+    if init.kind != FrontendInitKind::NonLiteral
+        || init.cast.is_some()
+        || init.ternary.is_some()
+        || init.member_ref.is_some()
+    {
+        return None;
+    }
+    parse_call_text(slice_of(source, init.span)?)
+}
+
 /// The fact-fed driver: every [`ConstDecl`] field comes from adapter facts.
 ///
 /// - `name` via `ParsedFile.symbols[decl.symbol]` (never re-typed);
@@ -219,6 +355,10 @@ fn is_bare_identifier(text: &str) -> bool {
 ///   driver-sliced from the init fact span (the adapter emits no
 ///   identifier-init facts — see the solver's module-level BLOCKER);
 ///   anything else feeds `None` and keeps its historical gate;
+/// - `init_call` is the P076 seam: call-expression initializers slice to
+///   [`CallInit`] through [`parse_call_init`] (the adapter emits no call
+///   facts for initializers); anything else feeds `None` and keeps its
+///   historical gate;
 /// - `init_object` is `None` (no `ObjectMemberFact`s yet; check-const
 ///   fixtures hold no object literals anyway).
 fn decls_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<ConstDecl> {
@@ -235,6 +375,10 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<C
                 }
                 _ => None,
             };
+            let init_call = match &decl.init {
+                Some(init) => parse_call_init(source, init),
+                None => None,
+            };
             ConstDecl {
                 name,
                 span,
@@ -244,6 +388,7 @@ fn decls_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<C
                 annotation: decl.annotation.as_ref().map(|ann| ann.text.clone()),
                 init: decl.init.as_ref().map(|init| map_init_kind(source, init)),
                 init_ident,
+                init_call,
                 init_object: None,
                 // No array-member facts yet (see the check-functions driver).
                 init_array: None,
@@ -622,6 +767,113 @@ fixture_test!(
     "ternary-call-cond.expected.txt",
     0
 );
+fixture_test!(
+    call_global_clean_is_silent,
+    "call-global-clean.ts",
+    "call-global-clean.expected.txt",
+    0
+);
+fixture_test!(
+    call_global_wrong_matches_ts2322,
+    "call-global-wrong.ts",
+    "call-global-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    call_any_result_is_silent,
+    "call-any-clean.ts",
+    "call-any-clean.expected.txt",
+    0
+);
+fixture_test!(
+    call_unannotated_any_is_silent,
+    "call-any-unann.ts",
+    "call-any-unann.expected.txt",
+    0
+);
+fixture_test!(
+    call_string_method_clean_is_silent,
+    "call-string-method-clean.ts",
+    "call-string-method-clean.expected.txt",
+    0
+);
+fixture_test!(
+    call_split_clean_is_silent,
+    "call-split-clean.ts",
+    "call-split-clean.expected.txt",
+    0
+);
+fixture_test!(
+    call_split_wrong_matches_ts2322,
+    "call-split-wrong.ts",
+    "call-split-wrong.expected.txt",
+    0
+);
+fixture_test!(
+    call_any_receiver_absorbs,
+    "call-anyrecv-clean.ts",
+    "call-anyrecv-clean.expected.txt",
+    0
+);
+fixture_test!(
+    call_unannotated_non_any_keeps_decline,
+    "call-unann-declined.ts",
+    "call-unann-declined.expected.txt",
+    2
+);
+fixture_test!(
+    call_never_annotation_diagnoses_any,
+    "call-never-any.ts",
+    "call-never-any.expected.txt",
+    0
+);
+fixture_test!(
+    call_static_result_feeds_later_use,
+    "call-propagate.ts",
+    "call-propagate.expected.txt",
+    1
+);
+
+#[test]
+fn call_unlisted_divergence_pins_ts2339() {
+    // By design the subset declines where the oracle errors: tsc spells
+    // `TS2339` for unlisted methods and number receivers (plus `TS2304`
+    // for unknown globals) while the solver records one historical
+    // non-literal note per use and stays silent — the subset spells no
+    // member-miss family (probes `u-foo-str`, `r-num-trim`,
+    // `u-nosuch-clean`).
+    let source = include_str!("../../../corpus/check-const/call-unlisted-declined.ts");
+    let expected = include_str!("../../../corpus/check-const/call-unlisted-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            ("TS2304".to_owned(), "Cannot find name 'nope'.".to_owned()),
+            (
+                "TS2339".to_owned(),
+                "Property 'foo' does not exist on type '\"hi\"'.".to_owned()
+            ),
+            (
+                "TS2339".to_owned(),
+                "Property 'trim' does not exist on type '1'.".to_owned()
+            ),
+        ],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 3);
+    for note in &report.unsupported {
+        assert_eq!(
+            note.reason, "non-literal initializer is outside the subset",
+            "reason: {}",
+            note.reason
+        );
+    }
+}
 
 #[test]
 fn alias_chain_mutual_cycle_declines() {
@@ -931,4 +1183,87 @@ fn driver_detects_regex_literals_through_source_seam() {
     assert_eq!(decls[1].init_ident, None);
     assert_eq!(decls[2].init, Some(InitKind::NonLiteral));
     assert_eq!(decls[2].init_ident, None);
+}
+
+#[test]
+fn driver_parses_call_shapes_through_source_seam() {
+    // Guards the P076 seam: global, member, and string-literal-receiver
+    // calls slice to [`CallInit`] (never an identifier name), while
+    // non-call shapes keep the historical `None`.
+    let source = "const a = parseInt(\"10\"), b = s.trim(), c = \"hi\".split(\",\");\n";
+    let parsed = parse_module(FILE, "m.ts", source);
+    let errors = &parsed.errors;
+    assert!(parsed.errors.is_empty(), "errors: {errors:?}");
+    assert_eq!(parsed.decls.len(), 3);
+    let binder = build_binder(&parsed);
+    let decls = decls_from_facts(&parsed, &binder, source);
+    assert_eq!(decls.len(), 3);
+    for decl in &decls {
+        assert_eq!(decl.init, Some(InitKind::NonLiteral));
+        assert_eq!(decl.init_ident, None);
+    }
+    let global = decls[0].init_call.as_ref().expect("global call feeds");
+    assert_eq!(global.callee, "parseInt");
+    assert_eq!(global.receiver, None);
+    let member = decls[1].init_call.as_ref().expect("member call feeds");
+    assert_eq!(member.callee, "trim");
+    assert_eq!(member.receiver, Some(CallReceiver::Bare("s".to_owned())));
+    let literal = decls[2].init_call.as_ref().expect("literal receiver feeds");
+    assert_eq!(literal.callee, "split");
+    assert_eq!(literal.receiver, Some(CallReceiver::StringLiteral));
+}
+
+#[test]
+fn driver_rejects_non_call_shapes() {
+    // Guards the P076 seam's negative space: parenthesized receivers,
+    // chained calls, member-expression receivers, and ternaries never feed
+    // [`CallInit`] (those keep the historical decline solver-side).
+    for source in [
+        "const a = (s).trim();\n",
+        "const a = f()();\n",
+        "const a = o.s.trim();\n",
+        "const a = c ? f(x) : y;\n",
+        "const a = new Foo();\n",
+        "const a = s?.trim();\n",
+    ] {
+        let parsed = parse_module(FILE, "m.ts", source);
+        let errors = &parsed.errors;
+        assert!(parsed.errors.is_empty(), "errors: {errors:?} in {source}");
+        assert_eq!(parsed.decls.len(), 1, "decls in {source}");
+        let binder = build_binder(&parsed);
+        let decls = decls_from_facts(&parsed, &binder, source);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].init_call, None, "no call facts in {source}");
+    }
+}
+
+#[test]
+fn shadowed_global_receiver_declines_not_silences() {
+    // Resolve-first shadowing guard (P076 flip): `Object` names a program
+    // binding, so the known-global pairs never apply (tsc spells `TS2339`,
+    // a pinned oracle-error divergence); the historical non-literal note
+    // fires instead — never a forced verdict, never silence.
+    let source = include_str!("../../../corpus/check-const/shadowed-global-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-const/shadowed-global-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [(
+            "TS2339".to_owned(),
+            "Property 'keys' does not exist on type '1'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let report = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason, "non-literal initializer is outside the subset",
+        "reason: {}",
+        report.unsupported[0].reason
+    );
 }
