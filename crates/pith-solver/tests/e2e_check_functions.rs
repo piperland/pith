@@ -13,7 +13,9 @@
 //! to solver [`InitKind`]/[`ObjectMemberKind`]), mechanical and exhaustive
 //! like check-const's `map_init`, plus the P048 seam (bare-identifier
 //! initializer names sliced from init fact spans — the adapter emits no
-//! identifier-init facts). Returned object literals are always fresh
+//! identifier-init facts) and the P070 default-kind map (frontend
+//! [`InitKind`](pith_frontend::InitKind) to solver [`InitKind`)). Returned
+//! object literals are always fresh
 //! (only direct syntactic literals carry member facts), mirroring the
 //! check-object seam's `fresh: true`.
 //!
@@ -146,6 +148,16 @@
 //! historical whole-declaration non-literal decline (oracle `TS2322` plus
 //! `TS7006` — pinned divergence). Arrow facts ride per-fixture hand-fed
 //! tables ([`LeadingArrowShape`] — the adapter emits no arrow facts).
+//! Literal-defaulted params (P070) check uses like the declared type:
+//! `default-param-clean` is silent with zero notes while
+//! `default-param-wrong` matches its oracle `TS2322` at the use (the default
+//! kind gates but never narrows). Two more fixtures diverge by design (the
+//! oracle errors where the subset keeps the historical optional decline —
+//! each pins its oracle lines plus one unsupported note with the
+//! byte-identical reason): `default-brace-declined` (oracle `TS2322` twice —
+//! at the `{}` default and at the use) and `default-optional-declined`
+//! (oracle `TS2322` spelling `number | undefined` plus the indented
+//! elaboration, pinned header-only).
 
 use pith_frontend::{
     parse_module, CastFact as FrontendCastFact, CastKind as FrontendCastKind,
@@ -410,6 +422,21 @@ fn map_cast(cast: &FrontendCastFact) -> CastInput {
         target: cast.target_text.clone().unwrap_or_default(),
         operand_span: cast.operand_span,
         kind: map_cast_kind(cast.kind),
+    }
+}
+
+/// Maps one frontend parameter-default kind to the solver's.
+///
+/// Exhaustive so a new frontend variant fails to compile instead of
+/// silently mis-checking (mirrors [`map_inner_init_kind`]).
+fn map_default_kind(kind: FrontendInitKind) -> InitKind {
+    match kind {
+        FrontendInitKind::Number => InitKind::Number,
+        FrontendInitKind::String => InitKind::String,
+        FrontendInitKind::Boolean => InitKind::Boolean,
+        FrontendInitKind::Null => InitKind::Null,
+        FrontendInitKind::Undefined => InitKind::Undefined,
+        FrontendInitKind::NonLiteral => InitKind::NonLiteral,
     }
 }
 
@@ -735,6 +762,9 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> V
                         annotation: param.annotation_text.clone(),
                         optional: param.optional,
                         is_rest: param.is_rest,
+                        // Literal-default facts gate P048 propagation (P070);
+                        // every other shape records `None` and declines.
+                        default_kind: param.default_kind.map(map_default_kind),
                     })
                     .collect(),
                 params_complex: func.params_complex,
@@ -1348,6 +1378,92 @@ fixture_test!(
     "straight-identifier-init.expected.txt",
     0
 );
+fixture_test!(
+    default_param_clean_is_silent,
+    "default-param-clean.ts",
+    "default-param-clean.expected.txt",
+    0
+);
+fixture_test!(
+    default_param_wrong_matches_ts2322,
+    "default-param-wrong.ts",
+    "default-param-wrong.expected.txt",
+    0
+);
+
+#[test]
+fn default_brace_divergence_pins_two_ts2322() {
+    // By design the subset declines where the oracle errors twice: tsc
+    // reports `TS2322` at the parameter (the `{}` default) and `TS2322` at
+    // the use (typed by the annotation) while the solver records one
+    // unsupported note with the byte-identical optional reason and stays
+    // silent — `={}` carries no literal fact, never a forced verdict.
+    let source = include_str!("../../../corpus/check-functions/default-brace-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-functions/default-brace-declined.expected.txt");
+    assert_eq!(
+        parse_baseline(expected),
+        [
+            (
+                "TS2322".to_owned(),
+                "Type 'number' is not assignable to type 'string'.".to_owned()
+            ),
+            (
+                "TS2322".to_owned(),
+                "Type '{}' is not assignable to type 'number'.".to_owned()
+            ),
+        ],
+        "oracle baseline pins the divergence (parser sorts pairs)"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("optional"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
+
+#[test]
+fn default_optional_divergence_pins_ts2322_header() {
+    // By design the subset declines where the oracle errors: tsc reports
+    // `TS2322` spelling `number | undefined` (plus the indented
+    // `undefined` elaboration, which the header-only differential excludes
+    // — the `optional_param_declines` precedent) while the solver records
+    // one unsupported note with the byte-identical optional reason.
+    let source = include_str!("../../../corpus/check-functions/default-optional-declined.ts");
+    let expected =
+        include_str!("../../../corpus/check-functions/default-optional-declined.expected.txt");
+    let headers: Vec<(String, String)> = parse_baseline(expected)
+        .into_iter()
+        .filter(|line| line.0 == "TS2322")
+        .collect();
+    assert_eq!(
+        headers,
+        [(
+            "TS2322".to_owned(),
+            "Type 'number | undefined' is not assignable to type 'string'.".to_owned()
+        )],
+        "oracle baseline pins the divergence"
+    );
+    let (_, report) = run_pipeline(source);
+    assert!(
+        report.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.unsupported.len(), 1);
+    assert!(
+        report.unsupported[0].reason.contains("optional"),
+        "reason: {}",
+        report.unsupported[0].reason
+    );
+}
 
 #[test]
 fn straight_let_init_divergence_pins_ts2322() {

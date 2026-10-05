@@ -200,6 +200,9 @@ fn classes_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<ClassDecl> {
                         annotation: param.annotation_text.clone(),
                         optional: param.optional,
                         is_rest: param.is_rest,
+                        // Constructor facts carry no defaults (P070 covers
+                        // function params only): `None` keeps the decline.
+                        default_kind: None,
                     })
                     .collect(),
                 ctor_complex: fact.ctor_complex,

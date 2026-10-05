@@ -298,6 +298,10 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                         annotation: param.annotation_text.clone(),
                         optional: param.optional,
                         is_rest: param.is_rest,
+                        // No default-kind facts here (the check-functions
+                        // driver owns the P070 mapping): `None` keeps the
+                        // historical optional decline.
+                        default_kind: None,
                     })
                     .collect(),
                 params_complex: func.params_complex,
