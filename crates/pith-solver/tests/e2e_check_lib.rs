@@ -132,6 +132,7 @@ fn decls_from_handfed(
                 annotation: spec.annotation.map(str::to_owned),
                 init: spec.init,
                 init_ident: None,
+                init_call: None,
                 init_object: None,
                 init_array: spec.members.map(|members| ArrayInit {
                     members: members.to_vec(),

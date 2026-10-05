@@ -230,6 +230,7 @@ fn consts_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<
                     .as_ref()
                     .map(|init| map_const_init_kind(source, init)),
                 init_ident,
+                init_call: None,
                 init_object: None,
                 init_array: None,
                 cast: None,

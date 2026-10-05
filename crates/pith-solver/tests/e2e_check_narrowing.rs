@@ -175,6 +175,7 @@ fn narrowing_inputs_from_facts(
             annotation,
             init,
             init_ident: None,
+            init_call: None,
             init_object: None,
             // No array-member facts yet (see the check-functions driver).
             init_array: None,
