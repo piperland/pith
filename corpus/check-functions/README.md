@@ -286,3 +286,19 @@ declaration diagnostics — so every bodyless declaration records one
 unsupported note and stays silent instead of forcing a verdict. Call
 resolution over the same shapes lives in the check-calls P063 section.
 Probes in `.agent/scratch/p063-probes/`.
+
+## P070 literal-defaulted params
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| default-param-clean.ts | clean | silent, 0 notes (use checks like the declared type) |
+| default-param-wrong.ts | 1x TS2322 (use) | 1x PITH2322 (declared type propagates one level) |
+| default-brace-declined.ts | 2x TS2322 (parameter + use) | silent + 1 UNSUPPORTED, byte-identical optional reason (pinned) |
+| default-optional-declined.ts | 1x TS2322 (`number \| undefined` + elaboration) | silent + 1 UNSUPPORTED, byte-identical optional reason (pinned) |
+
+Differential: 4/4 match-or-pin (2 diagnostic/silent pairs + 2 pinned
+oracle-error divergences — `={}`/non-literal defaults and `?`-only params
+keep the historical optional decline instead of forcing a verdict). The
+default kind gates propagation but never narrows the use (uses check by
+the declared type); arity still reads the `optional` bit (P037
+unchanged). Probes in `.agent/scratch/p070-probes/`.

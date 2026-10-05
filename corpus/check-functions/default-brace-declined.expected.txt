@@ -1,0 +1,2 @@
+default-brace-declined.ts:TS2322: Type '{}' is not assignable to type 'number'.
+default-brace-declined.ts:TS2322: Type 'number' is not assignable to type 'string'.

@@ -1,0 +1,2 @@
+default-optional-declined.ts:TS2322: Type 'number | undefined' is not assignable to type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
