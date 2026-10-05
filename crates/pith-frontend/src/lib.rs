@@ -639,6 +639,13 @@ pub struct TypeParamFact {
 /// call-site checker (P014): arg-type checks need the annotated names, and
 /// exact-arity checks decline range (`b?: number`, defaulted `b: T = …`) and
 /// variadic (`...rest: T[]`) lists instead of mis-counting them.
+/// `default_kind` (P070) carries the default value's literal kind when the
+/// parameter default is a primitive literal (`=1`, `="s"`, `=true`, `=null`,
+/// `=undefined` — the [`InitKind`] subset, no peeling: `=(1)` reads
+/// `NonLiteral` exactly like P048's `p13`); it is `None` when the parameter
+/// has no default or the default is any other shape (`={}`, calls,
+/// identifiers, …). The solver gates literal-defaulted identifier uses on
+/// it (the annotation still types the use — the default never narrows).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionParamFact {
     /// Parameter name as written.
@@ -651,6 +658,9 @@ pub struct FunctionParamFact {
     pub optional: bool,
     /// `true` for `...rest: T[]` (variadic).
     pub is_rest: bool,
+    /// Literal kind of the `= …` default when it is a primitive literal;
+    /// `None` for absent or non-literal defaults.
+    pub default_kind: Option<InitKind>,
 }
 
 /// Literal kind of a straight-line `return <expr>;`, mirroring [`InitKind`].
@@ -1842,6 +1852,21 @@ fn param_annotation_text(
     annotation
         .and_then(|ann| annotation_fact(source, file, ann.span))
         .map(|fact| fact.text)
+}
+
+/// Classifies one parameter default into its literal kind (P070).
+///
+/// `Some` only for primitive literals (`=1`, `="s"`, `=true`, `=null`,
+/// `=undefined` — the shared [`init_kind`] subset, no peeling); `None` for
+/// absent defaults and every other shape (`={}`, calls, identifiers, …),
+/// which keep the historical optional decline solver-side. Facts only: the
+/// kind gates propagation, never types the use (no narrowing from defaults).
+fn param_default_kind(source: &str, initializer: Option<&Expression<'_>>) -> Option<InitKind> {
+    let expression = initializer?;
+    match init_kind(source, expression) {
+        InitKind::NonLiteral => None,
+        kind => Some(kind),
+    }
 }
 
 /// Slices one type-parameter bound (constraint or default) verbatim.
@@ -4121,6 +4146,9 @@ impl DeclCollector<'_> {
                 // like `b?: T`, so both mark `optional` for the call checker.
                 optional: item.optional || item.initializer.is_some(),
                 is_rest: false,
+                // Literal defaults ride as their kind (P070); `?`-only and
+                // non-literal defaults record `None` and decline as before.
+                default_kind: param_default_kind(self.source, item.initializer.as_deref()),
             });
         }
         if !params_complex {
@@ -4138,6 +4166,8 @@ impl DeclCollector<'_> {
                                 ),
                                 optional: false,
                                 is_rest: true,
+                                // Rest parameters carry no default.
+                                default_kind: None,
                             }),
                             None => {
                                 params_complex = true;
@@ -7362,6 +7392,45 @@ export function f(a: string): string { return a + b; }
             .collect();
         assert_eq!(texts, [Some("number"), Some("number"), Some("string")]);
         assert!(!fact.params.iter().any(|param| param.is_rest));
+    }
+
+    #[test]
+    fn function_facts_default_kinds_record_literals_only() {
+        // P070: primitive-literal defaults ride as their kind while `?`-only
+        // and non-literal (`={}`, identifier, call) defaults record `None`
+        // (facts only — the solver gates propagation on the kind, never
+        // narrows from it).
+        let src = "function defs(a: number = 1, s: string = \"x\", t: boolean = true,\n\
+                         n: null = null, u: undefined = undefined, o: number = {},\n\
+                         i: number = a, c: number = f(), q?: number): number {\n  return 1;\n}\n";
+        let pf = parse_module(FileId(0), "d.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.functions.len(), 1);
+        let fact = &pf.functions[0];
+        assert!(!fact.params_complex);
+        let kinds: Vec<Option<InitKind>> =
+            fact.params.iter().map(|param| param.default_kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Some(InitKind::Number),
+                Some(InitKind::String),
+                Some(InitKind::Boolean),
+                Some(InitKind::Null),
+                Some(InitKind::Undefined),
+                None,
+                None,
+                None,
+                None,
+            ]
+        );
+        // Arity still reads the `optional` bit: every defaulted or `?`
+        // parameter widens to a range (P037 unchanged).
+        let optional: Vec<bool> = fact.params.iter().map(|param| param.optional).collect();
+        assert_eq!(
+            optional,
+            [true, true, true, true, true, true, true, true, true]
+        );
     }
 
     #[test]
