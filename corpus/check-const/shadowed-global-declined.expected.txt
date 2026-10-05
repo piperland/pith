@@ -1,0 +1,1 @@
+shadowed-global-declined.ts:TS2339: Property 'keys' does not exist on type '1'.

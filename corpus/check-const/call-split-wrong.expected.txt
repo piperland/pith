@@ -1,0 +1,4 @@
+call-split-wrong.ts:TS2322: Type 'string[]' is not assignable to type 'string'.
+call-split-wrong.ts:TS2322: Type 'string[]' is not assignable to type 'number'.
+call-split-wrong.ts:TS2322: Type 'string[]' is not assignable to type 'number[]'.
+  Type 'string' is not assignable to type 'number'.

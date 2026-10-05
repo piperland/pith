@@ -69,7 +69,6 @@ message contract is first-line, like every existing fixture). Probes in
 `.agent/scratch/p051-probes/`.
 
 ## P060 widened-kind inference for unannotated consts
-
 | Fixture | tsc 7.0.2 baseline | Solver verdict |
 |---|---|---|
 | no-annotation.ts | clean | silent (P060 flip: the literal kind infers) |
@@ -89,3 +88,29 @@ the merged-pair delegation note — one converted out-of-subset shape, and
 one interfaces-differential count);
 unannotated `let`/array/object/call/spread/index/destructured verdicts stay
 byte-identical. Probes in `.agent/scratch/p060-probes/`.
+
+## P076 pure known-method call results
+
+| Fixture | tsc 7.0.2 baseline | Solver verdict |
+|---|---|---|
+| call-global-clean.ts | clean | silent (globals classify to probed kinds) |
+| call-global-wrong.ts | 4x TS2322 | 4x PITH2322 (same spellings) |
+| call-any-clean.ts | clean | silent (`any` absorbs every annotation) |
+| call-any-unann.ts | clean | silent (unannotated `any` absorbs via P025) |
+| call-string-method-clean.ts | clean | silent (string receivers read the table) |
+| call-split-clean.ts | clean | silent (`split`/`keys` spell `string[]`) |
+| call-split-wrong.ts | 3x TS2322 | 3x PITH2322 (header lines; the oracle's `number[]` elaboration is stripped by the differential, like ternary unions) |
+| call-anyrecv-clean.ts | clean | silent (`any` receivers absorb every method) |
+| call-unlisted-declined.ts | 2x TS2339 + 1x TS2304 | silent + 3 UNSUPPORTED (pinned oracle-error divergence: no member-miss family) |
+| shadowed-global-declined.ts | 1x TS2339 | silent + 1 UNSUPPORTED (pinned oracle-error divergence: shadowing bindings keep their own class, never the known-global pairs) |
+| call-unann-declined.ts | clean | silent + 2 UNSUPPORTED (pinned oracle-clean divergence: the narrowed P060 exclusion stands for non-`any` calls) |
+| call-never-any.ts | 1x TS2322 (`any`) | 1x PITH2322 (`any` diagnoses against `never`) |
+| call-propagate.ts | 1x TS2322 | 1x PITH2322 + 1 UNSUPPORTED (the static result feeds the use while the unannotated intermediate keeps its decline) |
+
+Differential: 13/13 match-or-pin (9 diagnostic/silent pairs + 1
+elaboration-strip + 3 pinned divergences — 2 oracle-error where the oracle
+spells member-miss/unknown-name errors the subset never forces (one a
+shadowing receiver that keeps its own class), 1
+oracle-clean where unannotated non-`any` calls keep the historical
+decline). Argument arity/type errors never surface (kinds ignore args —
+probed stable, pinned). Probes in `.agent/scratch/p076-probes/`.
