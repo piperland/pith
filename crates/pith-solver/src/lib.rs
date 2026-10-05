@@ -1045,10 +1045,15 @@
 //!   primitively annotated param checks like its annotation (`t3` flips
 //!   decline-to-match; `p14`, `p28` shadowing still resolves nearest), `any`
 //!   /`never` admit silently and `unknown` checks (probes `p17`–`p19`),
-//!   while optional params decline (tsc spells `number | undefined`, probe
-//!   `p16` — and defaulted params share the fact bit, so they decline too,
-//!   probe `p20`), and union/generic/complex annotations decline (probe
-//!   `p30`).
+//!   while `?`-only params decline (tsc spells `number | undefined`, probe
+//!   `p16`), as do `={}`/non-literal defaults (probes P070 `brace-decl`,
+//!   `nonlit-wrong`: tsc declaration-errors the former and checks the use
+//!   for the latter — both pinned oracle-error divergences). Literal
+//!   defaults (`=1`, `="s"`, `=true`, `=null`, `=undefined`) check like
+//!   their annotation instead (P070: tsc types those uses by the DECLARED
+//!   type, probes `lit-clean`/`lit-wrong`/`lit-multi`; the default never
+//!   narrows, so the kind gates but never substitutes), and
+//!   union/generic/complex annotations decline (probe `p30`).
 //! - Declines, each with a distinct reason, never a forced verdict: cycles
 //!   (the source's own init names the use — `p08`, `p09` spell `TS2448` plus
 //!   `TS2454` in tsc), `let` declarators (mutable: reassignment is invisible
@@ -1079,6 +1084,32 @@
 //! identifier-init fact. Spans/scopes/identities always come from adapter
 //! facts; only the referenced NAME rides the seam, and every resolution step
 //! goes through the [`Binder`].
+//!
+//! Literal-defaulted parameters (P070, probed on tsc 7.0.2
+//! `--strict --pretty false`; probes in `.agent/scratch/p070-probes/`):
+//!
+//! - `function f(n: number = 1)` types uses of `n` by the DECLARED type:
+//!   a matching use is clean (`lit-clean`) while a mismatched one reports
+//!   one `TS2322` at the use (`lit-wrong` spells `'number'` vs `'string'`;
+//!   `lit-multi` shows `="hi"`/`=true` widening per position). The default
+//!   kind gates propagation but never substitutes (no narrowing from
+//!   defaults): [`resolve_param_source`] admits literal-defaulted params
+//!   into the EXISTING annotation path, so verdicts match by construction.
+//! - `function g(n: number = {})` declaration-errors in tsc (`TS2322`
+//!   `'{}'` vs `'number'` at the parameter, probe `brace-decl` — the subset
+//!   spells no declaration diagnostics) while identifier/call defaults check
+//!   the use by the annotation (probe `nonlit-wrong` spells `'number'`).
+//!   Both keep the historical optional decline with byte-identical reasons
+//!   (pinned oracle-error divergences, never forced verdicts).
+//! - `?`-only params keep the historical decline (probe `opt-wrong` spells
+//!   `'number | undefined'`, which single-level propagation cannot spell);
+//!   `?`-with-initializer is itself a declaration error (`TS1015`, probe
+//!   `qopt-wrong`) while its use still spells the annotation, so literal
+//!   defaults gate regardless of the `?` bit. Unannotated defaults decline
+//!   (`function_shape` rejects unannotated params whole-decl — probe
+//!   `unann-default` stays pinned). Arity is untouched: the `optional` bit
+//!   still drives the P037 range (`arity` probe: `f()`/`f(2)` clean,
+//!   `f("s")` one `TS2345`, `f(1, 2, 3)` one range-spelled `TS2554`).
 //!
 //! Widened-kind inference for literal-inited unannotated consts (P060,
 //! probed on tsc 7.0.2 `--strict --pretty false`; probes in
@@ -1655,6 +1686,12 @@ pub struct FunctionParam {
     pub optional: bool,
     /// `true` for `...rest: T[]` (variadic).
     pub is_rest: bool,
+    /// Literal kind of the `= …` default when it is a primitive literal
+    /// (fact-fed from the adapter, P070); `None` for absent or non-literal
+    /// defaults. Gates [`IdentTable`] propagation only (a `Some` admits the
+    /// annotation path for `optional` params): it never types the use, so
+    /// no narrowing flows from defaults, and arity still reads `optional`.
+    pub default_kind: Option<InitKind>,
 }
 
 /// A straight-line `return <expr>;`: literal kind plus object members.
@@ -2811,8 +2848,14 @@ struct IdentParam {
     /// with unannotated params decline earlier, so this is defensive).
     annotation: Option<String>,
     /// `true` for `b?: number` and defaulted `b: T = …` (the facts conflate
-    /// the two, so both decline: tsc spells `| undefined` for the former).
+    /// the two, so both decline unless a literal default gates — tsc spells
+    /// `| undefined` for the former).
     optional: bool,
+    /// Literal kind of the `= …` default when primitive (P070); `None`
+    /// otherwise. A `Some` admits the annotation path for `optional`
+    /// params (tsc types literal-defaulted uses by the DECLARED type);
+    /// the kind itself never types the use (no narrowing from defaults).
+    default_kind: Option<InitKind>,
 }
 
 /// What one [`IdentInput`] would propagate to a use.
@@ -2971,6 +3014,7 @@ fn ident_params_from_function(params: &[FunctionParam]) -> Vec<IdentParam> {
             name: param.name.clone(),
             annotation: param.annotation.clone(),
             optional: param.optional,
+            default_kind: param.default_kind,
         })
         .collect()
 }
@@ -3250,8 +3294,11 @@ fn resolve_literal_source(
 /// `None` when no parameter bears the name (the caller falls through to
 /// the not-in-scope decline). Required primitively annotated params check
 /// like their annotation; `any`/`never` admit silently and `unknown`
-/// checks; optional, duplicate, unannotated, and non-primitive params
-/// decline with distinct reasons.
+/// checks; literal-defaulted params (P070) check like their annotation too
+/// (tsc types those uses by the DECLARED type — the default never narrows,
+/// so the kind gates but never substitutes); `?`-only, `={}`/non-literal
+/// defaults, duplicate, unannotated, and non-primitive params decline with
+/// their historical reasons, byte-identical.
 fn resolve_param_source(table: &IdentTable, name: &str) -> Option<IdentResolution> {
     let mut hits = table.params.iter().filter(|param| param.name == name);
     let param = hits.next()?;
@@ -3265,7 +3312,7 @@ fn resolve_param_source(table: &IdentTable, name: &str) -> Option<IdentResolutio
             "parameter '{name}' has no annotation: nothing to propagate"
         )));
     };
-    if param.optional {
+    if param.optional && param.default_kind.is_none() {
         return Some(IdentResolution::Decline(format!(
             "parameter '{name}' is optional: its type carries '| undefined', \
             which single-level propagation cannot spell"
@@ -5084,6 +5131,7 @@ fn gate_contextual_arrow(
             annotation: Some(expected.display.clone()),
             optional: false,
             is_rest: false,
+            default_kind: None,
         })
         .collect())
 }
@@ -15280,6 +15328,7 @@ mod tests {
                     annotation: Some("number".to_owned()),
                     optional: false,
                     is_rest: false,
+                    default_kind: None,
                 },
                 FunctionParam {
                     name: "second".to_owned(),
@@ -15287,6 +15336,7 @@ mod tests {
                     annotation: Some("Point".to_owned()),
                     optional: false,
                     is_rest: false,
+                    default_kind: None,
                 },
             ],
             params_complex: false,
@@ -15359,6 +15409,7 @@ mod tests {
                     annotation: Some("Point".to_owned()),
                     optional: false,
                     is_rest: false,
+                    default_kind: None,
                 },
                 FunctionParam {
                     name: "second".to_owned(),
@@ -15366,6 +15417,7 @@ mod tests {
                     annotation: Some("number".to_owned()),
                     optional: false,
                     is_rest: false,
+                    default_kind: None,
                 },
             ],
             params_complex: false,
@@ -17378,6 +17430,7 @@ mod tests {
                     annotation: None,
                     optional: false,
                     is_rest: false,
+                    default_kind: None,
                 })
                 .collect(),
             params_complex: false,
@@ -17416,6 +17469,7 @@ mod tests {
                     annotation: Some(ty.to_owned()),
                     optional: false,
                     is_rest: false,
+                    default_kind: None,
                 })
                 .collect(),
             params_complex: false,
@@ -17440,6 +17494,7 @@ mod tests {
                 annotation: Some(ty.to_owned()),
                 optional: false,
                 is_rest: false,
+                default_kind: None,
             }],
             params_complex: false,
             is_async: false,
@@ -17463,6 +17518,7 @@ mod tests {
                 annotation: Some("Point".to_owned()),
                 optional: false,
                 is_rest: false,
+                default_kind: None,
             }],
             params_complex: false,
             is_async: false,
@@ -17772,6 +17828,7 @@ mod tests {
                     annotation: Some(ty.to_owned()),
                     optional: false,
                     is_rest: false,
+                    default_kind: None,
                 })
                 .collect(),
             params_complex: false,
@@ -18599,6 +18656,7 @@ mod tests {
                 annotation: Some("string".to_owned()),
                 optional: false,
                 is_rest: false,
+                default_kind: None,
             }],
             params_complex: false,
             is_async: false,
@@ -19484,6 +19542,7 @@ mod tests {
             annotation: Some(ty.to_owned()),
             optional: false,
             is_rest: false,
+            default_kind: None,
         }
     }
 
@@ -19495,6 +19554,7 @@ mod tests {
             annotation: Some(ty.to_owned()),
             optional: true,
             is_rest: false,
+            default_kind: None,
         }
     }
 
@@ -20793,6 +20853,7 @@ mod tests {
             annotation: annotation.map(str::to_owned),
             optional: false,
             is_rest: false,
+            default_kind: None,
         }
     }
 
@@ -20803,6 +20864,7 @@ mod tests {
             annotation: annotation.map(str::to_owned),
             optional: false,
             is_rest: false,
+            default_kind: None,
         }
     }
 
@@ -21246,6 +21308,7 @@ mod tests {
                     annotation: Some(annotation.to_owned()),
                     optional: false,
                     is_rest: false,
+                    default_kind: None,
                 })
                 .collect(),
             scope: 0,
@@ -24302,15 +24365,18 @@ mod tests {
     }
 
     /// One [`IdentTable`] holding only parameters, for classifier tests.
-    fn params_table(params: Vec<(&str, Option<&str>, bool)>) -> IdentTable {
+    /// Each entry is `(name, annotation, optional, default_kind)`: a `Some`
+    /// default admits the annotation path for `optional` params (P070).
+    fn params_table(params: Vec<(&str, Option<&str>, bool, Option<InitKind>)>) -> IdentTable {
         IdentTable {
             inputs: Vec::new(),
             params: params
                 .into_iter()
-                .map(|(name, annotation, optional)| IdentParam {
+                .map(|(name, annotation, optional, default_kind)| IdentParam {
                     name: name.to_owned(),
                     annotation: annotation.map(str::to_owned),
                     optional,
+                    default_kind,
                 })
                 .collect(),
             checked: 0,
@@ -24659,13 +24725,13 @@ mod tests {
         // primitives substitute, `any`/`never` silence, `unknown` checks,
         // and everything else declines with its own reason.
         let table = params_table(vec![
-            ("n", Some("number"), false),
-            ("au", Some("any"), false),
-            ("nv", Some("never"), false),
-            ("uu", Some("unknown"), false),
-            ("opt", Some("number"), true),
-            ("uni", Some("number | string"), false),
-            ("gen", Some("T"), false),
+            ("n", Some("number"), false, None),
+            ("au", Some("any"), false, None),
+            ("nv", Some("never"), false, None),
+            ("uu", Some("unknown"), false, None),
+            ("opt", Some("number"), true, None),
+            ("uni", Some("number | string"), false, None),
+            ("gen", Some("T"), false, None),
         ]);
         assert_eq!(
             resolve_param_source(&table, "n"),
@@ -24701,13 +24767,234 @@ mod tests {
         );
     }
 
+    /// One literal-defaulted parameter for P070 tests: `(name, type,
+    /// optional, default kind)` — `optional` stays `true` (P037 range
+    /// arity reads it) while the `Some` kind gates the annotation path.
+    fn defaulted_param(
+        name: &str,
+        ty: &str,
+        optional: bool,
+        default: Option<InitKind>,
+    ) -> FunctionParam {
+        FunctionParam {
+            name: name.to_owned(),
+            annotated: true,
+            annotation: Some(ty.to_owned()),
+            optional,
+            is_rest: false,
+            default_kind: default,
+        }
+    }
+
+    /// One `const <name>: <ty> = <ident>;` straight-body leading for P070
+    /// tests: annotated (so it delegates) with a bare-identifier
+    /// initializer (so it resolves through the P048 table).
+    fn ident_leading(name: &str, lo: u32, hi: u32, ty: &str, ident: &str) -> InnerDecl {
+        InnerDecl {
+            name: name.to_owned(),
+            span: span(lo, hi),
+            scope: 0,
+            symbol: None,
+            kind: DeclKind::Const,
+            annotation: Some(ty.to_owned()),
+            init: Some(InitKind::NonLiteral),
+            init_ident: Some(ident.to_owned()),
+            init_object: None,
+            init_array: None,
+            cast: None,
+            member_ref: None,
+            init_arrow: None,
+        }
+    }
+
+    /// One straight-bodied `function f(<param>): number` with a single
+    /// leading plus a clean numeric tail, for P070 end-to-end tests.
+    fn defaulted_fn(param: FunctionParam, leading: InnerDecl) -> FunctionDecl {
+        FunctionDecl {
+            name: "f".to_owned(),
+            span: span(0, 20),
+            scope: 0,
+            symbol: None,
+            params: vec![param],
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("number".to_owned()),
+            body: FunctionBody::StraightBody(StraightBody {
+                leading: vec![leading],
+                tail: FunctionReturn {
+                    kind: Some(InitKind::Number),
+                    init_ident: None,
+                    init_object: None,
+                    init_array: None,
+                    cast: None,
+                    ternary: None,
+                    member_ref: None,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn literal_default_param_substitutes_annotation() {
+        // P070 (probed `lit-wrong`/`lit-multi` on tsc 7.0.2): a
+        // literal-defaulted use checks like the DECLARED type — the
+        // classifier substitutes the annotation kind for every literal
+        // default, including `=undefined`.
+        let table = params_table(vec![
+            ("n", Some("number"), true, Some(InitKind::Number)),
+            ("s", Some("string"), true, Some(InitKind::String)),
+            ("b", Some("boolean"), true, Some(InitKind::Boolean)),
+            ("z", Some("null"), true, Some(InitKind::Null)),
+            ("u", Some("undefined"), true, Some(InitKind::Undefined)),
+            ("au", Some("any"), true, Some(InitKind::Number)),
+            ("nv", Some("never"), true, Some(InitKind::Number)),
+            ("uu", Some("unknown"), true, Some(InitKind::String)),
+        ]);
+        assert_eq!(
+            resolve_param_source(&table, "n"),
+            Some(IdentResolution::Substitute(InitKind::Number))
+        );
+        assert_eq!(
+            resolve_param_source(&table, "s"),
+            Some(IdentResolution::Substitute(InitKind::String))
+        );
+        assert_eq!(
+            resolve_param_source(&table, "b"),
+            Some(IdentResolution::Substitute(InitKind::Boolean))
+        );
+        assert_eq!(
+            resolve_param_source(&table, "z"),
+            Some(IdentResolution::Substitute(InitKind::Null))
+        );
+        assert_eq!(
+            resolve_param_source(&table, "u"),
+            Some(IdentResolution::Substitute(InitKind::Undefined))
+        );
+        assert_eq!(
+            resolve_param_source(&table, "au"),
+            Some(IdentResolution::SilentAny)
+        );
+        assert_eq!(
+            resolve_param_source(&table, "nv"),
+            Some(IdentResolution::SilentNever)
+        );
+        assert_eq!(
+            resolve_param_source(&table, "uu"),
+            Some(IdentResolution::Substitute(InitKind::Unknown))
+        );
+    }
+
+    #[test]
+    fn bare_optional_and_nonliteral_default_decline_identically() {
+        // P070: `?`-only and `={}`/non-literal defaults (all `None`
+        // facts-side) keep the pre-P070 optional decline byte-identical —
+        // tsc spells `number | undefined` (probe `opt-wrong`), which
+        // single-level propagation cannot spell.
+        let table = params_table(vec![
+            ("opt", Some("number"), true, None),
+            ("req", Some("number"), false, None),
+        ]);
+        let reason = "parameter 'opt' is optional: its type carries '| undefined', \
+            which single-level propagation cannot spell";
+        assert_eq!(
+            resolve_param_source(&table, "opt"),
+            Some(IdentResolution::Decline(reason.to_owned()))
+        );
+        assert_eq!(
+            resolve_param_source(&table, "req"),
+            Some(IdentResolution::Substitute(InitKind::Number))
+        );
+    }
+
+    #[test]
+    fn literal_default_use_diagnoses_at_use_span() {
+        // End to end (probe `lit-wrong`): `const x: string = n` over
+        // `(n: number = 1)` diagnoses once at the use with the widened
+        // annotation spelling, while the matching use stays silent.
+        let binder = binder_with(&[("f", span(0, 20))]);
+        let wrong = [defaulted_fn(
+            defaulted_param("n", "number", true, Some(InitKind::Number)),
+            ident_leading("x", 21, 31, "string", "n"),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &wrong, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code, CODE_MISMATCH);
+        assert_eq!(report.diagnostics[0].span, span(21, 31));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+        let clean = [defaulted_fn(
+            defaulted_param("n", "number", true, Some(InitKind::Number)),
+            ident_leading("x", 21, 31, "number", "n"),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &clean, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn literal_default_never_narrows_the_use() {
+        // P070 design law: the default kind gates but never substitutes —
+        // even a default whose kind disagrees with the annotation checks
+        // the use by the annotation (tsc types uses by the DECLARED type;
+        // the declaration error itself is a pinned decl-side gap, like
+        // `brace-decl`).
+        let binder = binder_with(&[("f", span(0, 20))]);
+        let decls = [defaulted_fn(
+            defaulted_param("n", "number", true, Some(InitKind::String)),
+            ident_leading("x", 21, 31, "string", "n"),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert!(report.unsupported.is_empty());
+    }
+
+    #[test]
+    fn bare_optional_use_declines_end_to_end() {
+        // End to end (probe `opt-wrong`): `const x: string = n` over
+        // `(n?: number)` stays silent with the byte-identical optional
+        // note — a pinned oracle-error divergence, never a forced verdict.
+        let binder = binder_with(&[("f", span(0, 20))]);
+        let decls = [defaulted_fn(
+            defaulted_param("n", "number", true, None),
+            ident_leading("x", 21, 31, "string", "n"),
+        )];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(
+            report.unsupported[0].reason,
+            "parameter 'n' is optional: its type carries '| undefined', \
+            which single-level propagation cannot spell"
+        );
+    }
+
     #[test]
     fn ident_duplicate_params_decline() {
         // Two parameters sharing a name cannot disambiguate: decline
         // instead of picking first-wins.
         let table = params_table(vec![
-            ("n", Some("number"), false),
-            ("n", Some("string"), false),
+            ("n", Some("number"), false, None),
+            ("n", Some("string"), false, None),
         ]);
         let declined = resolve_param_source(&table, "n").expect("duplicates decline");
         assert!(
