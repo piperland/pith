@@ -1,0 +1,1 @@
+explicit-ident-unresolvable.ts:TS2304: Cannot find name 'nope'.

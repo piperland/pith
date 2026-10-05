@@ -50,17 +50,23 @@ kept in the baselines and folded by the differential, like check-narrowing).
 | param-sourced-arg.ts | clean | silent call (T binds from the enclosing parameter) + 1 UNSUPPORTED (body) |
 | cross-ident-pair.ts | clean | silent call (T, U bind per identifier position) + 1 UNSUPPORTED (body) |
 | unresolvable-declined.ts | 1x TS2304 (`Cannot find name 'nope'.`) | 2 UNSUPPORTED (distinct identifier decline + body) |
+| explicit-ident-clean.ts | clean | silent call (explicit `number` matches the resolved identifier kind) + 1 UNSUPPORTED (body) |
+| explicit-ident-wrong.ts | 1x TS2345 (explicit `string` vs the resolved `number` identifier kind) | 1x PITH2345 at the argument + 1 UNSUPPORTED (body) |
+| explicit-ident-unresolvable.ts | 1x TS2304 (`Cannot find name 'nope'.`) | silent call (explicit-path skip) + 1 UNSUPPORTED (body) |
 
-Differential: 11 diagnostic pairs match (explicit-wrong TS2345,
+Differential: 12 diagnostic pairs match (explicit-wrong TS2345,
 inferred-wrong TS2322-first-line, constrained-wrong TS2345 + TS2344,
 defaulted-override TS2345, pair-wrong-first/second TS2345,
 pair-explicit-wrong TS2345, pair-explicit-count 2x TS2558,
-ident-arg-wrong TS2345, inferred-kind-arg TS2345); 11 clean
+ident-arg-wrong TS2345, inferred-kind-arg TS2345,
+explicit-ident-wrong TS2345); 12 clean
 admission matches (explicit/inferred/constrained/defaulted-correct,
 multi-param-declined, pair-correct, pair-explicit-correct,
-triple-correct, ident-arg-clean, param-sourced-arg, cross-ident-pair);
-9 declined fixtures pin their divergence explicitly
+triple-correct, ident-arg-clean, param-sourced-arg, cross-ident-pair,
+explicit-ident-clean);
+11 declined fixtures pin their divergence explicitly
 (inference-failure, pair-inference-failure, unresolvable-declined,
+explicit-ident-unresolvable,
 constrained/defaulted-declined, union, object, keyof, conditional,
 mapped). No generic declaration is ever decl-silent, by tsc's own
 
@@ -83,6 +89,7 @@ non-identifier non-literal inference candidates, identifier sources beyond
 single-level literal/parameter propagation (`let` bindings, depth-2+
 chains, use-before-declaration, cross-file meanings — the P048 gates ride
 through), duplicate bare names sharing one slot (tsc binds the literal
-type — the P036 divergence), explicit type arguments over identifier
-arguments (the explicit path skips per-argument as before), empty
+type — the P036 divergence), unresolvable explicit-path identifier
+arguments (the explicit path skips per-argument as before — the P069
+pinned divergence), empty
 angle-bracket lists (tsc `TS1099`).
