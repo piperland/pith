@@ -243,11 +243,13 @@
 //!   annotation, probe `a`) is clean in tsc and admits silently with zero
 //!   positions (the throw-only precedent — the call emits no verdict and
 //!   carries no facts). Membership gates through the P024 tables over
-//!   fact-carried names only (never string-searching): direct calls and
-//!   unknown receivers/members decline distinctly, exact-arity opaque
-//!   signatures (`Math.floor`, `Array.isArray`, ...) enforce their count,
-//!   and range/variadic shapes (`console.warn`, `JSON.parse`, ...) admit
-//!   arity-free. Templated arguments need no literal facts (arity-only).
+//!   fact-carried names only (never string-searching): direct calls decline
+//!   distinctly except for the P082 same-file direct-callee arm (void-ish
+//!   return, required params, exact arity, unambiguous), and unknown
+//!   receivers/members decline distinctly, exact-arity opaque signatures
+//!   (`Math.floor`, `Array.isArray`, ...) enforce their count, and range/variadic
+//!   shapes (`console.warn`, `JSON.parse`, ...) admit arity-free. Templated
+//!   arguments need no literal facts (arity-only).
 //! - `if (c) { <effect call>; return; }` plus a trailing `return` skips the
 //!   arm and checks the tail through the existing literal paths (a wrong
 //!   literal tail reports one `TS2322`, probe `i`; a bare tail leaves no
@@ -3685,7 +3687,7 @@ pub fn check_functions_with_enums(
     let mut occurrence = 0usize;
     for decl in decls {
         let span = binder_span_for(binder, file, &decl.name, decl.scope, decl.symbol, decl.span);
-        match function_shape(decl) {
+        match function_shape(decl, decls) {
             Ok(shaped) => {
                 let mut run = FunctionRun {
                     file,
@@ -4092,18 +4094,68 @@ fn is_voidish_effect_annotation(annotation: &str) -> bool {
     )
 }
 
-/// Gates one effect call through the P024 allowlist (P049): `Ok` admits
-/// the position (the call emits no verdict — only tails and positions
-/// check); `Err` carries the distinct decline reason.
+/// Returns true iff a direct (receiver-less) effect call admits under P082.
+///
+/// The call is admitted silently when the callee name resolves to exactly one
+/// same-file `FunctionDecl` whose return annotation is void-ish (see
+/// [`is_voidish_effect_annotation`]) and whose params are all required,
+/// non-rest, and whose count matches `call.arg_count`. Alias-named annotations
+/// are treated conservatively: `is_voidish_effect_annotation` declines them,
+/// which is acceptable per H-002 single-pass law (no alias tables built here).
+#[must_use]
+fn direct_effect_callee_admits(call: &EffectCall, callees: &[FunctionDecl]) -> bool {
+    // Only direct calls participate in P082.
+    if call.receiver.is_some() {
+        return false;
+    }
+    let mut candidates = callees.iter().filter(|decl| decl.name == call.member);
+    let Some(candidate) = candidates.next() else {
+        return false;
+    };
+    // Ambiguity (a second same-name declaration) keeps the decline.
+    if candidates.next().is_some() {
+        return false;
+    }
+    // Params must be all required and non-rest.
+    if candidate
+        .params
+        .iter()
+        .any(|param| param.optional || param.is_rest)
+    {
+        return false;
+    }
+    if !usize::try_from(call.arg_count).is_ok_and(|count| count == candidate.params.len()) {
+        return false;
+    }
+    // Return annotation must be present and void-ish.
+    let Some(annotation) = candidate.return_annotation.as_deref() else {
+        return false;
+    };
+    let Ok(effective) = promise_effective_annotation(candidate, annotation) else {
+        return false;
+    };
+    is_voidish_effect_annotation(&effective)
+}
+
+/// Gates one effect call through the P024 allowlist (P049) and the P082
+/// same-file direct-callee arm: `Ok` admits the position (the call emits no
+/// verdict — only tails and positions check); `Err` carries the distinct
+/// decline reason.
 ///
 /// Membership rides the P024 tables over fact-carried names only (never
-/// string-searching): direct calls and unknown receivers/members decline
-/// (each distinctly), exact-arity opaque signatures (`Math.floor`,
-/// `Array.isArray`, ...) enforce their count, and range/variadic shapes
-/// (`console.warn`, `JSON.parse`, `Math.max`, ...) admit arity-free —
-/// their shapes are uncheckable in-subset either way (the P024 precedent).
-fn gate_effect_call(call: &EffectCall) -> Result<(), String> {
+/// string-searching): direct calls decline (each distinctly) except the P082
+/// same-file void-ish callee arm (unambiguous, exact arity, required params),
+/// and unknown receivers/members decline (each distinctly), exact-arity opaque
+/// signatures (`Math.floor`, `Array.isArray`, ...) enforce their count, and
+/// range/variadic shapes (`console.warn`, `JSON.parse`, `Math.max`, ...) admit
+/// arity-free — their shapes are uncheckable in-subset either way (the P024
+/// precedent).
+fn gate_effect_call(call: &EffectCall, callees: &[FunctionDecl]) -> Result<(), String> {
     let Some(receiver) = call.receiver.as_deref() else {
+        // P082 same-file direct-callee admission.
+        if direct_effect_callee_admits(call, callees) {
+            return Ok(());
+        }
         return Err(format!(
             "effect call to '{}': direct calls are outside the effect subset \
             (only P024 allowlist member calls admit)",
@@ -4163,9 +4215,10 @@ fn shape_effect_only(
     decl: &FunctionDecl,
     call: &EffectCall,
     effective: &str,
+    callees: &[FunctionDecl],
 ) -> Result<Vec<SynthReturn>, String> {
     gate_effect_annotation(decl, effective)?;
-    gate_effect_call(call)?;
+    gate_effect_call(call, callees)?;
     Ok(Vec::new())
 }
 
@@ -4178,9 +4231,10 @@ fn shape_guard_effect(
     decl: &FunctionDecl,
     body: &GuardEffectBody,
     effective: &str,
+    callees: &[FunctionDecl],
 ) -> Result<Vec<SynthReturn>, String> {
     gate_effect_annotation(decl, effective)?;
-    gate_effect_call(&body.call)?;
+    gate_effect_call(&body.call, callees)?;
     match body.tail.as_ref() {
         None => Ok(Vec::new()),
         Some(tail) => Ok(vec![shape_return(
@@ -4236,7 +4290,7 @@ fn shape_straight_throw(
 /// Gates one function declaration: `Ok` carries the [`ShapedBody`] (one
 /// [`SynthReturn`] per checkable position, in source order);
 /// `Err` carries the unsupported reason.
-fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
+fn function_shape(decl: &FunctionDecl, callees: &[FunctionDecl]) -> Result<ShapedBody, String> {
     if decl.params_complex {
         return Err("non-identifier parameter pattern is outside the subset".to_owned());
     }
@@ -4285,8 +4339,8 @@ fn function_shape(decl: &FunctionDecl) -> Result<ShapedBody, String> {
         FunctionBody::GuardChain(body) => shape_guard_chain(decl, body, &effective)?,
         FunctionBody::GuardThrow(body) => shape_guard_throw(decl, body, &effective)?,
         FunctionBody::StraightThrow(body) => shape_straight_throw(decl, body, &effective)?,
-        FunctionBody::EffectOnly(call) => shape_effect_only(decl, call, &effective)?,
-        FunctionBody::GuardEffect(body) => shape_guard_effect(decl, body, &effective)?,
+        FunctionBody::EffectOnly(call) => shape_effect_only(decl, call, &effective, callees)?,
+        FunctionBody::GuardEffect(body) => shape_guard_effect(decl, body, &effective, callees)?,
         FunctionBody::StraightBody(straight) => {
             let mut positions = Vec::with_capacity(straight.leading.len().saturating_add(1));
             for (leading_index, inner) in straight.leading.iter().enumerate() {
@@ -19339,7 +19393,270 @@ mod tests {
         assert!(reasons[2].contains("TS2355"), "reason: {}", reasons[2]);
     }
 
+    /// One direct (receiver-less) call fact for the P082 gate tests.
+    fn direct_call(member: &str, arg_count: u32) -> EffectCall {
+        EffectCall {
+            receiver: None,
+            member: member.to_owned(),
+            arg_count,
+        }
+    }
+
+    /// One guard-effect host whose arm is a direct call to `member`.
+    fn direct_guard_host(name: &str, lo: u32, hi: u32, member: &str) -> FunctionDecl {
+        function(
+            name,
+            lo,
+            hi,
+            Vec::new(),
+            Some("void"),
+            FunctionBody::GuardEffect(GuardEffectBody {
+                call: direct_call(member, 1),
+                tail: None,
+            }),
+        )
+    }
+
     #[test]
+    fn p082_direct_effect_same_file_void_admits() {
+        let binder = binder_with(&[("callee", span(0, 6)), ("host", span(7, 11))]);
+        let callee = function(
+            "callee",
+            0,
+            6,
+            vec![("x", true)],
+            Some("void"),
+            FunctionBody::EffectOnly(warn_call()),
+        );
+        let host = direct_guard_host("host", 7, 11, "callee");
+        let decls = [callee, host];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn p082_direct_effect_ambiguous_decline_byte_identical() {
+        let binder = binder_with(&[("a", span(0, 1)), ("b", span(2, 3)), ("c", span(4, 5))]);
+        let callee1 = function(
+            "c",
+            0,
+            0,
+            vec![("x", true)],
+            Some("void"),
+            FunctionBody::EffectOnly(warn_call()),
+        );
+        let callee2 = function(
+            "c",
+            1,
+            1,
+            vec![("x", true)],
+            Some("void"),
+            FunctionBody::EffectOnly(warn_call()),
+        );
+        let host = function(
+            "b",
+            2,
+            3,
+            vec![],
+            Some("void"),
+            FunctionBody::GuardEffect(GuardEffectBody {
+                call: EffectCall {
+                    receiver: None,
+                    member: "c".to_owned(),
+                    arg_count: 1,
+                },
+                tail: None,
+            }),
+        );
+        let a = function(
+            "a",
+            4,
+            5,
+            vec![],
+            Some("void"),
+            FunctionBody::EffectOnly(warn_call()),
+        );
+        let decls = [callee1, callee2, host, a];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        let reason = &report.unsupported[0].reason;
+        assert_eq!(reason, "effect call to 'c': direct calls are outside the effect subset (only P024 allowlist member calls admit)");
+    }
+
+    #[test]
+    fn p082_direct_effect_non_voidish_decline_byte_identical() {
+        // The callee must check silently on its own (a valued single return
+        // under a `string` annotation) so the only note is the host's
+        // direct-call decline.
+        let binder = binder_with(&[("callee", span(0, 6)), ("host", span(7, 11))]);
+        let callee = function(
+            "callee",
+            0,
+            6,
+            vec![("x", true)],
+            Some("string"),
+            single(InitKind::String),
+        );
+        let host = direct_guard_host("host", 7, 11, "callee");
+        let decls = [callee, host];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(
+            report.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(
+            report.unsupported.len(),
+            1,
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(
+            report.unsupported[0].reason,
+            "effect call to 'callee': direct calls are outside the effect subset \
+             (only P024 allowlist member calls admit)"
+        );
+    }
+
+    #[test]
+    fn p082_direct_effect_arity_mismatch_decline_byte_identical() {
+        let binder = binder_with(&[("callee", span(0, 6)), ("host", span(7, 11))]);
+        let callee = function(
+            "callee",
+            0,
+            6,
+            vec![("x", true)],
+            Some("void"),
+            FunctionBody::EffectOnly(warn_call()),
+        );
+        let host = function(
+            "host",
+            7,
+            11,
+            vec![],
+            Some("void"),
+            FunctionBody::GuardEffect(GuardEffectBody {
+                call: EffectCall {
+                    receiver: None,
+                    member: "callee".to_owned(),
+                    arg_count: 2,
+                },
+                tail: None,
+            }),
+        );
+        let decls = [callee, host];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].reason, "effect call to 'callee': direct calls are outside the effect subset (only P024 allowlist member calls admit)");
+    }
+
+    #[test]
+    fn p082_direct_effect_optional_param_decline_byte_identical() {
+        let binder = binder_with(&[("callee", span(0, 6)), ("host", span(7, 11))]);
+        let callee = FunctionDecl {
+            name: "callee".to_owned(),
+            span: span(0, 6),
+            scope: 0,
+            symbol: None,
+            params: vec![FunctionParam {
+                name: "x".to_owned(),
+                annotated: true,
+                annotation: None,
+                optional: true,
+                is_rest: false,
+                default_kind: None,
+            }],
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("void".to_owned()),
+            body: FunctionBody::EffectOnly(warn_call()),
+        };
+        let host = function(
+            "host",
+            7,
+            11,
+            vec![],
+            Some("void"),
+            FunctionBody::GuardEffect(GuardEffectBody {
+                call: EffectCall {
+                    receiver: None,
+                    member: "callee".to_owned(),
+                    arg_count: 1,
+                },
+                tail: None,
+            }),
+        );
+        let decls = [callee, host];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].reason, "effect call to 'callee': direct calls are outside the effect subset (only P024 allowlist member calls admit)");
+    }
+
+    #[test]
+    fn p082_direct_effect_rest_param_decline_byte_identical() {
+        let binder = binder_with(&[("callee", span(0, 6)), ("host", span(7, 11))]);
+        let callee = FunctionDecl {
+            name: "callee".to_owned(),
+            span: span(0, 6),
+            scope: 0,
+            symbol: None,
+            params: vec![FunctionParam {
+                name: "xs".to_owned(),
+                annotated: true,
+                annotation: None,
+                optional: false,
+                is_rest: true,
+                default_kind: None,
+            }],
+            params_complex: false,
+            is_async: false,
+            has_type_params: false,
+            return_annotation: Some("void".to_owned()),
+            body: FunctionBody::EffectOnly(warn_call()),
+        };
+        let host = function(
+            "host",
+            7,
+            11,
+            vec![],
+            Some("void"),
+            FunctionBody::GuardEffect(GuardEffectBody {
+                call: EffectCall {
+                    receiver: None,
+                    member: "callee".to_owned(),
+                    arg_count: 1,
+                },
+                tail: None,
+            }),
+        );
+        let decls = [callee, host];
+        let mut db = QueryDb::new();
+        let report = check_functions(FILE, &decls, &binder, &mut db);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].reason, "effect call to 'callee': direct calls are outside the effect subset (only P024 allowlist member calls admit)");
+    }
+
+    #[test]
+
     fn guard_chain_checks_per_position_like_joins() {
         // Probed tsc 7.0.2 (P050 `b`): each chain position checks
         // independently through the same synthetic delegation as joins — a
