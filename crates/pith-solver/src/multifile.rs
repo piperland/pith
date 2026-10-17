@@ -121,8 +121,9 @@ use pith_symbols::{
 };
 
 use super::{
-    check_calls, check_enums, check_functions, ArrayInit, CallSite, ConstDecl, EnumDecl, EnumInput,
-    EnumShape, FileReport, FunctionDecl, InitKind, InterfaceShape, NamespaceShape, ObjectInit,
+    check_calls, check_enums, check_functions, ArrayInit, CallSite, ConstDecl, EnclosingFunction,
+    EnumDecl, EnumInput, EnumShape, FileReport, FunctionDecl, InitKind, InterfaceShape,
+    NamespaceShape, ObjectInit,
 };
 
 /// Code for missing exported members (oracle `TS2305`).
@@ -191,6 +192,10 @@ pub struct ProgramFile {
     pub enum_texts: Vec<Option<String>>,
     /// Local function declarations in source order.
     pub functions: Vec<FunctionDecl>,
+    /// Enclosing-function parameter facts per file, driver-mapped from
+    /// the adapter's `FunctionFact`s (body scope plus params — the
+    /// P081 index input for the enum entry's `IdentTable` threading).
+    pub enclosing: Vec<EnclosingFunction>,
     /// Local direct call sites in source order.
     pub calls: Vec<CallSite>,
     /// Local interface shapes in source order.
@@ -1146,6 +1151,7 @@ fn check_const_decls(ctx: &mut FileCtx<'_>) {
         enums: &enums,
         interfaces: &interfaces,
         namespaces: &ctx.input.namespaces,
+        functions: &ctx.input.enclosing,
     };
     let mut report = check_enums(file, &decls, &input, ctx.binder, &mut *ctx.db);
     for (span, reason) in sink.notes {
