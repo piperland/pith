@@ -1213,10 +1213,10 @@ fixture_test!(
     1
 );
 fixture_test!(
-    void_effect_guard_nonallowlist_is_unsupported,
-    "void-effect-guard-nonallowlist.ts",
-    "void-effect-guard-nonallowlist.expected.txt",
-    1
+    void_effect_guard_direct_admits_is_silent,
+    "void-effect-guard-direct-admits.ts",
+    "void-effect-guard-direct-admits.expected.txt",
+    0
 );
 fixture_test!(
     void_effect_guard_valued_return_is_unsupported,
