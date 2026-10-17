@@ -935,8 +935,10 @@
 //!   same-scope redeclarations, so the shape claim fires first — probed: the
 //!   use still checks as the interface alongside tsc's `TS2300`s).
 //! - Entry coverage: [`check_enums_with_aliases`] relinks shapes and,
-//!   since P078, threads [`IdentTable`] inputs built from its declarators
-//!   (params empty — pinned gap); [`check_file_with_aliases`] rewrites
+//!   since P078, threads [`IdentTable`] inputs built from its declarators;
+//!   since P081 it also threads the innermost enclosing function's params
+//!   from [`EnumInput::functions`] per declarator (binder-resolved consts
+//!   still win). [`check_file_with_aliases`] rewrites
 //!   primitives but declines named-shape targets — it holds no shape
 //!   tables — with an entry-point reason. The base [`check_file`]/
 //!   [`check_enums`] entries thread empty alias tables and keep the
@@ -1259,7 +1261,7 @@ use std::collections::HashMap;
 
 use pith_ids::{FileId, NodeId, Span, SymbolId, TypeId};
 use pith_queries::{Dep, QueryDb, QueryKey, QueryKind};
-use pith_symbols::Binder;
+use pith_symbols::{Binder, ScopeNode};
 use pith_types::{TypeData, TypeStore};
 
 /// Multi-file programs: import graphs, cross-file checking, invalidation.
@@ -3122,17 +3124,23 @@ fn ident_input_from_leading(binder: &Binder, file: FileId, inner: &InnerDecl) ->
 /// [`ident_input_from_decl`]; this upgrades only the still-`Other`
 /// bare-receiver calls whose receiver classifies to string (the method
 /// table) or `any` (absorption). Top-level runs thread no params, so the
-/// prefix table carries none either.
+/// prefix table carries none either — callers with enclosing functions
+/// pass them per declaration (see the enum entry).
 fn ident_inputs_from_decls(
     binder: &Binder,
     file: FileId,
     decls: &[ConstDecl],
     scope: &LocalAliasScope<'_, '_>,
+    params_per_decl: Option<&[Vec<IdentParam>]>,
 ) -> Vec<IdentInput> {
     let mut inputs: Vec<IdentInput> = Vec::with_capacity(decls.len());
-    for decl in decls {
+    for (index, decl) in decls.iter().enumerate() {
         let mut input = ident_input_from_decl(binder, file, decl);
-        upgrade_bare_receiver_call(binder, file, decl, scope, &inputs, &mut input);
+        let params = params_per_decl
+            .and_then(|per_decl| per_decl.get(index))
+            .cloned()
+            .unwrap_or_default();
+        upgrade_bare_receiver_call(binder, file, decl, scope, &inputs, params, &mut input);
         inputs.push(input);
     }
     inputs
@@ -3150,6 +3158,7 @@ fn upgrade_bare_receiver_call(
     decl: &ConstDecl,
     scope: &LocalAliasScope<'_, '_>,
     prefix: &[IdentInput],
+    params: Vec<IdentParam>,
     input: &mut IdentInput,
 ) {
     if !matches!(input.init, PropInit::Other) {
@@ -3163,7 +3172,7 @@ fn upgrade_bare_receiver_call(
     };
     let table = IdentTable {
         inputs: prefix.to_vec(),
-        params: Vec::new(),
+        params,
         checked: prefix.len(),
     };
     let step = CallUse {
@@ -3575,7 +3584,7 @@ pub fn check_file_with_aliases(
         const_names: &const_names,
     };
     let mut idents = IdentTable {
-        inputs: ident_inputs_from_decls(binder, file, decls, &scope),
+        inputs: ident_inputs_from_decls(binder, file, decls, &scope, None),
         params: Vec::new(),
         checked: 0,
     };
@@ -3646,6 +3655,7 @@ pub fn check_functions(
         enums: &[],
         interfaces: &[],
         namespaces: &[],
+        functions: &[],
     };
     check_functions_with_enums(file, decls, &empty, binder, db)
 }
@@ -13049,6 +13059,22 @@ pub struct EnumInput<'a> {
     pub interfaces: &'a [InterfaceShape],
     /// Namespace shapes driver-mapped from adapter facts.
     pub namespaces: &'a [NamespaceShape],
+    /// Enclosing-function parameter facts for the enum entry's
+    /// [`IdentTable`] params threading (P081); empty on entries that run
+    /// no function scopes.
+    pub functions: &'a [EnclosingFunction],
+}
+
+/// One function's body scope plus its identifier parameters,
+/// driver-mapped verbatim from the adapter's `FunctionFact` (P081): the
+/// per-file facts [`check_enums_with_aliases`] indexes by body scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnclosingFunction {
+    /// Per-file scope index of the function body (`u32::MAX` when
+    /// indeterminable: contributes nothing to the index).
+    pub body_scope: u32,
+    /// Identifier parameters in source order (names only).
+    pub params: Vec<FunctionParam>,
 }
 
 /// Checks `const`/`let` declarators whose annotations may name interfaces.
@@ -13440,14 +13466,28 @@ pub fn check_enums_with_aliases(
         const_names: &const_names,
     };
     let const_decls: Vec<ConstDecl> = decls.iter().map(|decl| decl.decl.clone()).collect();
-    let mut idents = IdentTable {
-        inputs: ident_inputs_from_decls(binder, file, &const_decls, &alias_scope),
-        params: Vec::new(),
-        checked: 0,
-    };
+    let params_index = enclosing_params_index(input.functions);
+    // Per-declarator enclosing params for input building (P081): each
+    // prefix entry upgrades against its own enclosing function, exactly
+    // like the per-decl check-time tables below.
+    let params_per_decl: Vec<Vec<IdentParam>> = const_decls
+        .iter()
+        .map(|decl| enclosing_params(&params_index, binder, file, decl.scope))
+        .collect();
+    let const_inputs = ident_inputs_from_decls(
+        binder,
+        file,
+        &const_decls,
+        &alias_scope,
+        Some(&params_per_decl),
+    );
     let mut report = FileReport::default();
     for (index, decl) in decls.iter().enumerate() {
-        idents.checked = index;
+        let idents = IdentTable {
+            inputs: const_inputs.clone(),
+            params: enclosing_params(&params_index, binder, file, decl.decl.scope),
+            checked: index,
+        };
         let mut route = EnumDeclCtx {
             file,
             node: occurrence_node(index),
@@ -13466,6 +13506,54 @@ pub fn check_enums_with_aliases(
     report
 }
 
+/// Builds the per-file body-scope → params index the const loop uses
+/// (P081, H-002 side table only): one entry per function whose body
+/// scope resolved, first declaration wins on a duplicate body scope,
+/// `u32::MAX` entries skipped. A single bounded pass — no fixpoint.
+fn enclosing_params_index(functions: &[EnclosingFunction]) -> Vec<(u32, Vec<IdentParam>)> {
+    let mut index: Vec<(u32, Vec<IdentParam>)> = Vec::new();
+    for function in functions {
+        if function.body_scope == u32::MAX {
+            continue;
+        }
+        if index.iter().any(|(scope, _)| *scope == function.body_scope) {
+            continue;
+        }
+        index.push((
+            function.body_scope,
+            ident_params_from_function(&function.params),
+        ));
+    }
+    index
+}
+
+/// The params of the innermost function enclosing `scope` (P081): one
+/// bounded walk up the [`Binder`] scope parents, first hit wins.
+/// Non-function scopes contribute nothing (only function body scopes are
+/// indexed), and nested functions resolve innermost-first. Empty outside
+/// functions and for unresolvable scopes.
+fn enclosing_params(
+    index: &[(u32, Vec<IdentParam>)],
+    binder: &Binder,
+    file: FileId,
+    scope: u32,
+) -> Vec<IdentParam> {
+    let Some(scopes) = binder.scopes_of(file) else {
+        return Vec::new();
+    };
+    let mut current = scope;
+    for _ in 0..scopes.len() {
+        if let Some((_, params)) = index.iter().find(|(body, _)| *body == current) {
+            return params.clone();
+        }
+        match scopes.get(current as usize).and_then(ScopeNode::parent) {
+            Some(parent) => current = parent,
+            None => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
 /// Routing state for one [`check_enums`] declaration, bundled so the
 /// per-decl helpers stay lean (pedantic arity discipline, mirroring
 /// [`InterfaceDeclCtx`]).
@@ -13481,9 +13569,9 @@ struct EnumDeclCtx<'a, 'b, 'c> {
     freshness: &'a FreshnessTable,
     report: &'a mut FileReport,
     /// Identifier sources, built from the declarators through the same
-    /// [`ident_inputs_from_decls`] builder as the const entry; params stay
-    /// empty here (pinned gap: function-parameter/body idents still resolve
-    /// only on function entries).
+    /// [`ident_inputs_from_decls`] builder as the const entry; params
+    /// come from the innermost enclosing function's facts (P081), so
+    /// function-parameter/body idents resolve here too.
     idents: &'a IdentTable,
 }
 
@@ -23657,6 +23745,7 @@ mod tests {
             enums: &[shape],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let decls = [
             enum_decl_for("a", 6, 16, "Color", InitKind::Number, Some("1")),
@@ -23689,6 +23778,7 @@ mod tests {
             enums: &[shape],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let decls = [
             enum_decl_for("g", 4, 14, "Str", InitKind::String, Some("\"a\"")),
@@ -23763,6 +23853,7 @@ mod tests {
             enums: &[computed, ambient, first, second],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let decls = [
             enum_decl_for("a", 13, 23, "Comp", InitKind::Number, Some("0")),
@@ -23803,6 +23894,7 @@ mod tests {
             enums: &[shape],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let mut objected = enum_decl_for("o", 6, 16, "Color", InitKind::Number, None);
         objected.decl.init = None;
@@ -23904,6 +23996,7 @@ mod tests {
             enums: &[color, other, string],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let decls = [
             enum_member_decl_for("a", 16, 26, "Color", "Color", "Red"),
@@ -23970,6 +24063,7 @@ mod tests {
             enums: &[color, computed, ambient],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let mut contradictory = enum_member_decl_for("f", 70, 80, "Color", "Color", "Red");
         contradictory.decl.init = Some(InitKind::Number);
@@ -24020,6 +24114,7 @@ mod tests {
             enums: &[shape],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let decls = [enum_member_decl_for("a", 6, 16, "Color", "Nope", "Red")];
         let report = enums_report(&decls, &input, &binder);
@@ -24052,6 +24147,7 @@ mod tests {
             enums: &[color, other],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let decls = [
             function(
@@ -24123,6 +24219,7 @@ mod tests {
             enums: &[dir],
             interfaces: &[],
             namespaces: &[ns],
+            functions: &[],
         };
         let decls = [
             enum_decl_for("w", 20, 30, "NS.Dir", InitKind::Number, Some("0")),
@@ -24166,6 +24263,7 @@ mod tests {
             enums: &[hidden],
             interfaces: &[],
             namespaces: &[ns],
+            functions: &[],
         };
         let decls = [
             enum_decl_for("a", 21, 35, "NS.Nope", InitKind::Number, Some("1")),
@@ -24207,6 +24305,7 @@ mod tests {
             enums: &[],
             interfaces: &[],
             namespaces: &[ns],
+            functions: &[],
         };
         let decls = [
             enum_decl_for("a", 21, 35, "NS.Nope", InitKind::Number, Some("1")),
@@ -24240,6 +24339,7 @@ mod tests {
             enums: &[],
             interfaces: &[],
             namespaces: &[ns],
+            functions: &[],
         };
         let decls = [
             enum_decl_for("a", 3, 17, "NS2.Foo", InitKind::Number, Some("1")),
@@ -24283,6 +24383,7 @@ mod tests {
             enums: &[],
             interfaces: &[point],
             namespaces: &[ns],
+            functions: &[],
         };
         let good = EnumDecl {
             decl: object_decl("v", 9, 19, "Point", vec![("x", ObjectMemberKind::Number)]),
@@ -24316,6 +24417,7 @@ mod tests {
             enums: &[],
             interfaces: &[],
             namespaces: &[outer, inner],
+            functions: &[],
         };
         let decls = [enum_decl_for(
             "m",
@@ -24352,6 +24454,7 @@ mod tests {
             enums: &[],
             interfaces: &[point],
             namespaces: &[ns],
+            functions: &[],
         };
         let decls = [enum_decl_for(
             "q",
@@ -24633,6 +24736,7 @@ mod tests {
             enums: &[],
             interfaces: &[point],
             namespaces: &[],
+            functions: &[],
         };
         let aliases = [alias_shape("A", "Point"), alias_shape("B", "A")];
         let decls = [EnumDecl {
@@ -24814,6 +24918,7 @@ mod tests {
             enums: &[],
             interfaces: &[point],
             namespaces: &[],
+            functions: &[],
         };
         let aliases = [alias_shape("Alias", "Point")];
         let decls = [
@@ -24887,6 +24992,7 @@ mod tests {
             enums: &[shape],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let aliases = [alias_shape("C", "Color")];
         let decls = [
@@ -24911,6 +25017,7 @@ mod tests {
             enums: &[],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let aliases = [alias_shape("Num", "number")];
         let decls = [enum_decl_for(
@@ -24939,6 +25046,7 @@ mod tests {
             enums: &[],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let aliases = [alias_shape("Z", "Nowhere")];
         let decls = [enum_decl_for("z", 10, 20, "Z", InitKind::Number, Some("1"))];
@@ -24970,6 +25078,7 @@ mod tests {
             enums: &[],
             interfaces: &[],
             namespaces: &[ns],
+            functions: &[],
         };
         let aliases = [alias_shape("N", "NS")];
         let decls = [enum_decl_for("v", 10, 20, "N", InitKind::Number, Some("1"))];
@@ -24991,6 +25100,7 @@ mod tests {
             enums: &[],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let aliases = [alias_shape("Alias", "number")];
         let decls = [
@@ -25490,13 +25600,15 @@ mod tests {
         // P078: the enum entry builds IdentTable inputs from its declarators
         // through the same builder as the const path, so a bare-identifier
         // receiver call (`s.trim()`) upgrades and its result feeds one
-        // level; params stay empty (pinned gap), so a receiver naming a
-        // function parameter would NOT resolve here.
+        // level; params stay empty on this literal-built table (P081
+        // threads them from `functions` — covered below), so a receiver
+        // naming a function parameter would NOT resolve here.
         let binder = binder_with(&[("s", span(0, 10)), ("t", span(11, 21)), ("b", span(22, 32))]);
         let input = EnumInput {
             enums: &[],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let wrap = |decl: ConstDecl| EnumDecl {
             decl,
@@ -25515,6 +25627,158 @@ mod tests {
             )),
             wrap(ident_use("b", 22, 32, "number", "t")),
         ];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn enum_entry_threads_enclosing_function_params() {
+        // P081: the enum entry indexes function facts by body scope and
+        // threads the innermost enclosing function's params per declarator,
+        // so a param-fed const call (`s.trim()` inside the function)
+        // upgrades — the shape the P078 test leaves pinned because its
+        // `functions` slice is empty.
+        let mut binder = Binder::new();
+        binder.build_file(
+            FILE,
+            &[
+                ScopeInput {
+                    index: 0,
+                    parent: u32::MAX,
+                },
+                ScopeInput {
+                    index: 1,
+                    parent: 0,
+                },
+            ],
+            &[
+                SymbolInput {
+                    scope: 1,
+                    name: "t".to_owned(),
+                    span: span(33, 43),
+                    flags: 0,
+                },
+                SymbolInput {
+                    scope: 1,
+                    name: "b".to_owned(),
+                    span: span(44, 54),
+                    flags: 0,
+                },
+            ],
+            &[],
+        );
+        let functions = [EnclosingFunction {
+            body_scope: 1,
+            params: vec![FunctionParam {
+                name: "s".to_owned(),
+                annotated: true,
+                annotation: Some("string".to_owned()),
+                optional: false,
+                is_rest: false,
+                default_kind: None,
+            }],
+        }];
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[],
+            functions: &functions,
+        };
+        let wrap = |decl: ConstDecl| EnumDecl {
+            decl,
+            init_text: None,
+            cross_file_deps: Vec::new(),
+        };
+        let mut t = call_use("t", 33, 43, None, "trim", Some(bare_receiver("s")));
+        t.scope = 1;
+        let mut b = ident_use("b", 44, 54, "number", "t");
+        b.scope = 1;
+        let decls = [wrap(t), wrap(b)];
+        let report = enums_report(&decls, &input, &binder);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(report.unsupported.len(), 1);
+    }
+
+    #[test]
+    fn enum_entry_const_shadows_enclosing_function_param() {
+        // P081: params lose to binder-resolved consts — a same-name const
+        // (`s` as a `string`) still beats the enclosing param (`s: number`),
+        // so the receiver classifies as the const's `string`, and the
+        // mismatch below proves the param never won (a param win would
+        // decline the call instead of diagnosing the use).
+        let mut binder = Binder::new();
+        binder.build_file(
+            FILE,
+            &[
+                ScopeInput {
+                    index: 0,
+                    parent: u32::MAX,
+                },
+                ScopeInput {
+                    index: 1,
+                    parent: 0,
+                },
+            ],
+            &[
+                SymbolInput {
+                    scope: 1,
+                    name: "s".to_owned(),
+                    span: span(22, 32),
+                    flags: 0,
+                },
+                SymbolInput {
+                    scope: 1,
+                    name: "t".to_owned(),
+                    span: span(33, 43),
+                    flags: 0,
+                },
+                SymbolInput {
+                    scope: 1,
+                    name: "b".to_owned(),
+                    span: span(44, 54),
+                    flags: 0,
+                },
+            ],
+            &[],
+        );
+        let functions = [EnclosingFunction {
+            body_scope: 1,
+            params: vec![FunctionParam {
+                name: "s".to_owned(),
+                annotated: true,
+                annotation: Some("number".to_owned()),
+                optional: false,
+                is_rest: false,
+                default_kind: None,
+            }],
+        }];
+        let input = EnumInput {
+            enums: &[],
+            interfaces: &[],
+            namespaces: &[],
+            functions: &functions,
+        };
+        let wrap = |decl: ConstDecl| EnumDecl {
+            decl,
+            init_text: None,
+            cross_file_deps: Vec::new(),
+        };
+        let mut s = literal_source("s", 22, 32, InitKind::String);
+        s.scope = 1;
+        let mut t = call_use("t", 33, 43, None, "trim", Some(bare_receiver("s")));
+        t.scope = 1;
+        let mut b = ident_use("b", 44, 54, "number", "t");
+        b.scope = 1;
+        let decls = [wrap(s), wrap(t), wrap(b)];
         let report = enums_report(&decls, &input, &binder);
         assert_eq!(report.diagnostics.len(), 1);
         assert_eq!(
@@ -26462,6 +26726,7 @@ mod tests {
             enums: &[shape],
             interfaces: &[],
             namespaces: &[],
+            functions: &[],
         };
         let decls = [enum_decl_for("a", 6, 16, "Color", InitKind::RegExp, None)];
         let report = enums_report(&decls, &input, &binder);
