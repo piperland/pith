@@ -25,8 +25,8 @@ use pith_ids::{FileId, NodeId, Span, SymbolId};
 use pith_queries::{QueryDb, QueryKey, QueryKind};
 use pith_solver::{
     multifile::{check_program, AliasShape, ImportUse, ProgramFile, ProgramReport},
-    CallArg, CallInit, CallReceiver, CallSite, ConstDecl, DeclKind, EffectCall, EnumMember,
-    EnumMemberValue, EnumShape, FileReport, FunctionBody, FunctionDecl, FunctionParam,
+    CallArg, CallInit, CallReceiver, CallSite, ConstDecl, DeclKind, EffectCall, EnclosingFunction,
+    EnumMember, EnumMemberValue, EnumShape, FileReport, FunctionBody, FunctionDecl, FunctionParam,
     FunctionReturn, GuardEffectBody, InitKind, InterfaceHeritage, InterfaceMember, InterfaceShape,
     JoinedReturns, NamespaceShape, ObjectInit, ObjectMemberInit, ObjectMemberKind,
 };
@@ -465,6 +465,31 @@ fn map_default_kind(kind: FrontendInitKind) -> InitKind {
     }
 }
 
+/// The enclosing-function index driver: a mechanical copy of each
+/// function fact's body scope plus its params (P081 — feeds
+/// [`ProgramFile`]'s `enclosing` field).
+fn enclosing_from_facts(parsed: &ParsedFile) -> Vec<EnclosingFunction> {
+    parsed
+        .functions
+        .iter()
+        .map(|func| EnclosingFunction {
+            body_scope: func.body_scope,
+            params: func
+                .params
+                .iter()
+                .map(|param| FunctionParam {
+                    name: param.name.clone(),
+                    annotated: param.annotated,
+                    annotation: param.annotation_text.clone(),
+                    optional: param.optional,
+                    is_rest: param.is_rest,
+                    default_kind: param.default_kind.map(map_default_kind),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// The function driver: a mechanical copy of the check-calls driver.
 fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDecl> {
     parsed
@@ -804,6 +829,7 @@ fn run_program(specs: &[FileSpec<'_>]) -> Program {
             ident_inits: idents,
             enum_texts: texts,
             functions: functions_from_facts(file_parsed, &binder),
+            enclosing: enclosing_from_facts(file_parsed),
             calls: calls_from_facts(file_parsed),
             interfaces: interfaces_from_facts(file_parsed, &binder),
             enums: enums_from_facts(file_parsed, &binder),

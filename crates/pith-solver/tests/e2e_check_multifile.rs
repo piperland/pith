@@ -44,10 +44,10 @@ use pith_solver::{
         check_program, AliasShape, ImportUse, ProgramFile, ProgramReport, CODE_NO_EXPORTED,
         CODE_NO_MODULE,
     },
-    CallArg, CallSite, ConstDecl, DeclKind, EnumMember, EnumMemberValue, EnumShape, FileReport,
-    FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, InitKind, InterfaceHeritage,
-    InterfaceMember, InterfaceShape, JoinedReturns, NamespaceShape, ObjectInit, ObjectMemberInit,
-    ObjectMemberKind,
+    CallArg, CallSite, ConstDecl, DeclKind, EnclosingFunction, EnumMember, EnumMemberValue,
+    EnumShape, FileReport, FunctionBody, FunctionDecl, FunctionParam, FunctionReturn, InitKind,
+    InterfaceHeritage, InterfaceMember, InterfaceShape, JoinedReturns, NamespaceShape, ObjectInit,
+    ObjectMemberInit, ObjectMemberKind,
 };
 use pith_symbols::{
     multifile::{
@@ -303,6 +303,34 @@ fn map_joined(first: &FrontendReturn, second: &FrontendReturn) -> JoinedReturns 
         first: map_function_return(first),
         second: map_function_return(second),
     }
+}
+
+/// The enclosing-function index driver: a mechanical copy of each
+/// function fact's body scope plus its params (P081 — feeds
+/// [`ProgramFile::enclosing`]).
+fn enclosing_from_facts(parsed: &ParsedFile) -> Vec<EnclosingFunction> {
+    parsed
+        .functions
+        .iter()
+        .map(|func| EnclosingFunction {
+            body_scope: func.body_scope,
+            params: func
+                .params
+                .iter()
+                .map(|param| FunctionParam {
+                    name: param.name.clone(),
+                    annotated: param.annotated,
+                    annotation: param.annotation_text.clone(),
+                    optional: param.optional,
+                    is_rest: param.is_rest,
+                    // No default-kind facts here (the check-functions
+                    // driver owns the P070 mapping): `None` keeps the
+                    // historical optional decline.
+                    default_kind: None,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// The function driver: a mechanical copy of the check-calls driver
@@ -629,6 +657,7 @@ fn run_program(specs: &[FileSpec<'_>]) -> Program {
             ident_inits: idents,
             enum_texts: texts,
             functions: functions_from_facts(file_parsed, &binder),
+            enclosing: enclosing_from_facts(file_parsed),
             calls: calls_from_facts(file_parsed),
             interfaces: interfaces_from_facts(file_parsed, &binder),
             enums: enums_from_facts(file_parsed, &binder),

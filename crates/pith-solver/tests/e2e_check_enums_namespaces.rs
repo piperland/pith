@@ -335,6 +335,7 @@ fn run_pipeline(source: &str, specs: &[HandFed<'_>]) -> FileReport {
         enums: &enums,
         interfaces: &interfaces,
         namespaces: &namespaces,
+        functions: &[],
     };
     let mut db = QueryDb::new();
     check_enums_with_aliases(FILE, &decls, &input, &aliases, &binder, &mut db)
@@ -744,6 +745,7 @@ fn run_function_pipeline(source: &str) -> FileReport {
         enums: &enums,
         interfaces: &interfaces,
         namespaces: &namespaces,
+        functions: &[],
     };
     let mut db = QueryDb::new();
     check_functions_with_enums(FILE, &decls, &input, &binder, &mut db)
@@ -1142,6 +1144,7 @@ fn unresolved_qualification_head_skips_silently() {
         enums: &enums,
         interfaces: &interfaces,
         namespaces: &namespaces,
+        functions: &[],
     };
     let mut db = QueryDb::new();
     let report = check_enums_with_aliases(FILE, &decls, &input, &aliases, &binder, &mut db);
