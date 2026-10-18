@@ -341,3 +341,63 @@ P065, all three the now-silent regex consts):
    (`namespace`).
 Module boilerplate declines by design with no attached notes
 (prescan-counted, not executed-noted).
+
+## P084 M8 re-trial (EXECUTED 2026-10-18, E2B Linux — 1/33 HOLDS, destr 3, total 23)
+
+Method (P026/P042/P065/P071 prescan method, same): per-case parse+bind wall
+times (no win claims) + EVERY executable file through `check_program` via
+the UNCHANGED P027–P029 drivers in `crates/pith-solver/tests/e2e_check_real_defu.rs`
+(zero P081–P083 driver edits required for this trial — every attached reason
+is established, no pinning needed; the P083 seam is already in the driver at
+HEAD). Engine: P081–P083 at `20477b9` (clean tree). Box `ikuotezjjfqtefgxvq0v9`
+(molt-dev substitute — the durable pith-rust template alias vanished
+2026-10-17; 4vCPU/8GB, x86_64; rustup 1.98.1 pinned by rust-toolchain.toml).
+Tree identity: 5/5 corpus sha256 match `SOURCES.md` pins (verified on-box:
+`8b52fa19…`, `4dc8c0f4…`, `3ac1d2ad…`, `ca1d205d…`, `d367543c…`).
+`cargo test --workspace` EXIT=0 (844 pass, zero FAILED; lib 335 = 327 at
+P071 + P081/P082 additions). `cargo test --test e2e_check_real_defu --
+--nocapture` ×3 runs: 3 passed, 0 failed each, EXIT=0 ×3. Zero diagnostics
+in all 5 files across all 3 runs; note count 23/23/23 (all notes,
+deterministic; normalized verdict-line sets IDENTICAL_3_OF_3). Evidence:
+`.agent/evidence/PITH-P084/raw.log` + per-run logs.
+
+Per-case walls (parse_bind / check ms; medians of 3 runs, raw in parens):
+defu 3/0 (4,2,3), destr 1/0 (1,1,1), plimit-stress 1/0 (1,1,1). Pith measures
+parse+bind+subset-check vs tsc full check (P026 medians 416/404/438): NO
+comparison claims, different work.
+
+Per-file executed verdicts (identical 3/3 runs):
+- `defu/src/_utils.ts` — decline: complex body on `isPlainObject`.
+  0 diag, 1 unsupported.
+- `defu/src/types.ts` — decline by design: type-only file, 0 diag,
+  0 unsupported.
+- `defu/src/defu.ts` — CONFIRM: `DEFU_IMPORT_VERDICT: CONFIRM silent
+  (1/33 holds)` 3/3; 17 unsupported byte-identical to P071/P042 (namespace
+  param, `T` ×3, unannotated ×6, `merger`/`currentValue` ×3, `Merger`
+  ×3, `DefuFunction` cross-file return). 0 diag, 17 unsupported.
+- `destr/src/index.ts` — decline: 3 notes (complex body `destr`,
+  non-literal return `safeDestr`, `Options`-param call). CONSTRUCTS now
+  6/9 silent: `jsonParseTransform` EXECUTED silent 3/3 (P082 arm admission +
+  P083 tail seam — the v2 `decline` projection is now an executed FLIP,
+  `DESTR_TARGET_VERDICT: EXECUTED silent`), `warnKeyDropped` silent,
+  3 regex consts silent (P066 seam), `_value` silent (P081 enclosing-params
+  threading). 0 diag, 3 unsupported (was 5 at P071).
+- `plimit-stress/index.d.ts` — decline: ambient overload signatures
+  (`pLimit`, `limitFunction`). 0 diag, 2 unsupported (unchanged).
+
+Coverage: **1/33 EXECUTED, 5/5 files EXECUTED** (M4 baseline holds — no
+M8-era admission flips any prescan-declined construct).
+
+Re-ranked gaps (executed unsupported-note frequency, n=23; −3 vs P071,
+all three the destr conversions P081/P082/P083 chain):
+1. Named/generic param types — 7 notes, 2 files (`T` ×3, `Merger`
+   ×3, `Options` ×1). Ex: `_defu<T>(baseObject: T, …)`.
+2. Unannotated decls, no inference — 6 notes, 1 file (defu.ts ×6).
+3. Undeclared callback names — 3 notes, 1 file (`merger` ×1,
+   `currentValue` ×2 in the defuFn/defuArrayFn arrows).
+4. Complex bodies — 2 notes (`isPlainObject`, `destr`).
+5. Ambient overloads without bodies — 2 notes (`pLimit`,
+   `limitFunction`; generic — P063 explicitly out of scope).
+6. Singletons — 3 notes: non-literal return (`safeDestr`), cross-file
+   named return (`DefuFunction`), unannotated param (`namespace`).
+Module boilerplate declines by design with no attached notes.
