@@ -1123,14 +1123,40 @@ pub enum CallArgKind {
     NonLiteral,
 }
 
+/// One `{ ... }` member of an object-literal call argument (P085).
+///
+/// Mirrors [`ReturnMemberFact`] field-for-field: identifier keys only,
+/// the value classifies through the same [`return_kind`] rules, the span
+/// is the value expression's own range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArgMemberFact {
+    /// Member name (identifier keys only; any unrepresentable key degrades
+    /// the whole argument's member list to `None`).
+    pub name: String,
+    /// Literal kind of the member value.
+    pub kind: ReturnKind,
+    /// Span of the member value expression.
+    pub span: Span,
+}
+
 /// One argument of a direct call: literal kind plus span.
 ///
 /// `span` is the argument expression's own range, so the solver anchors
 /// `TS2345`-family diagnostics at the mismatched argument exactly like tsc.
 /// `cast` carries the outermost `as` / `satisfies` / angle assertion when
 /// the argument is one (parentheses peel transparently); the `kind` stays
-/// [`CallArgKind::NonLiteral` either way — the solver evaluates the cast
+/// [`CallArgKind::NonLiteral` either way - the solver evaluates the cast
 /// fact instead of the kind.
+///
+/// P085 adds the argument-object shape: `members` records an object-literal
+/// argument's explicit members (source order) when the DIRECT expression is
+/// the literal (a cast-wrapped literal keeps its cast fact and no members —
+/// conservative, mirroring the return-position gate), and `spread` records
+/// spread-member PRESENCE as a syntax fact. Unlike the return position, a
+/// spread does NOT degrade the list (tsc 7.0.2 probed: excess/misfit/missing
+/// families all still fire with spreads present — see the pinned probe notes);
+/// methods, accessors, computed keys, and non-identifier keys still degrade
+/// to `None`. Non-object arguments: `members: None, spread: false`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallArgFact {
     /// Literal kind of the argument expression.
@@ -1139,6 +1165,12 @@ pub struct CallArgFact {
     pub span: Span,
     /// Outermost assertion facts; `None` for non-assertion arguments.
     pub cast: Option<CastFact>,
+    /// Explicit members of an object-literal argument (`None` for every
+    /// other argument shape and for literals with unrepresentable members).
+    pub members: Option<Vec<ArgMemberFact>>,
+    /// `true` when the object-literal argument contains a spread member
+    /// (syntax presence only — spread value types stay invented-structure).
+    pub spread: bool,
 }
 
 /// Which assertion form one [`CastFact`] records.
@@ -2588,6 +2620,54 @@ impl<'a> Visit<'a> for ThisAssignScan {
         }
         walk::walk_update_expression(self, it);
     }
+}
+
+/// Classifies one object-literal call argument's members (P085, source
+/// order) — the argument-position sibling of [`return_members`] with ONE
+/// recorded relaxation: a spread member does not degrade the list, it sets the
+/// `spread` flag and explicit members still collect (tsc 7.0.2
+/// probed: excess/misfit/missing families all fire with spreads present, so
+/// the explicit members stay checkable). Methods, accessors, computed keys,
+/// and non-identifier keys still degrade to `None` exactly like the return
+/// position, and non-object expressions return `(None, false)`.
+fn arg_members(
+    source: &str,
+    file: FileId,
+    expression: &Expression<'_>,
+) -> (Option<Vec<ArgMemberFact>>, bool) {
+    let Expression::ObjectExpression(object) = expression else {
+        return (None, false);
+    };
+    let mut spread = false;
+    let mut members = Vec::with_capacity(object.properties.len());
+    for property in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(member) = property else {
+            // SpreadElement: presence is a syntax fact (P085 relax, argument
+            // position only).
+            spread = true;
+            continue;
+        };
+        if member.method || member.computed || member.kind != PropertyKind::Init {
+            return (None, spread);
+        }
+        let PropertyKey::StaticIdentifier(key) = &member.key else {
+            return (None, spread);
+        };
+        let Some(name) = slice_at(source, key.span) else {
+            return (None, spread);
+        };
+        let span = member.value.span();
+        members.push(ArgMemberFact {
+            name: name.to_owned(),
+            kind: return_kind(source, &member.value),
+            span: Span {
+                file,
+                lo: span.start,
+                hi: span.end,
+            },
+        });
+    }
+    (Some(members), spread)
 }
 
 /// Classifies a returned `{ ... }` literal into member facts (literal
@@ -4467,6 +4547,7 @@ impl DeclCollector<'_> {
                 return;
             };
             let span = expression.span();
+            let (members, spread) = arg_members(self.source, self.file, expression);
             args.push(CallArgFact {
                 kind: call_arg_kind(self.source, expression),
                 span: Span {
@@ -4475,6 +4556,8 @@ impl DeclCollector<'_> {
                     hi: span.end,
                 },
                 cast: cast_fact(self.source, self.file, expression),
+                members,
+                spread,
             });
         }
         let callee_span = Span {
@@ -4532,6 +4615,7 @@ impl DeclCollector<'_> {
                 return;
             };
             let span = expression.span();
+            let (members, spread) = arg_members(self.source, self.file, expression);
             args.push(CallArgFact {
                 kind: call_arg_kind(self.source, expression),
                 span: Span {
@@ -4540,6 +4624,8 @@ impl DeclCollector<'_> {
                     hi: span.end,
                 },
                 cast: cast_fact(self.source, self.file, expression),
+                members,
+                spread,
             });
         }
         self.member_calls.push(MemberCallFact {
@@ -7629,6 +7715,21 @@ export function f(a: string): string { return a + b; }
             assert_eq!(arg.span.file, FileId(0));
             assert!(arg.span.lo < arg.span.hi);
         }
+        // P085: the object-literal argument records members; every other
+        // shape stays None/false byte-identically.
+        assert!(outer.args[..6]
+            .iter()
+            .all(|arg| arg.members.is_none() && !arg.spread));
+        assert!(outer.args[7].members.is_none());
+        let object_arg = outer.args[6]
+            .members
+            .as_ref()
+            .expect("object arg records members");
+        assert_eq!(object_arg.len(), 1);
+        assert_eq!(object_arg[0].name, "x");
+        assert_eq!(object_arg[0].kind, ReturnKind::Number);
+        assert_eq!(slice_of(src, object_arg[0].span), "1");
+        assert!(!outer.args[6].spread);
         let inner = &pf.calls[1];
         assert_eq!(inner.callee, "g");
         assert_eq!(inner.args.len(), 1);
@@ -7650,6 +7751,42 @@ export function f(a: string): string { return a + b; }
         assert_eq!(callees, ["missing", "add"]);
         let last = &pf.calls[1];
         assert_eq!(last.args.len(), 2);
+    }
+
+    #[test]
+    fn call_arg_object_members_record_spread_and_degrade() {
+        // P085: explicit members record in source order; a spread member sets
+        // the flag WITHOUT dropping the explicit members; a method key degrades
+        // the list to None while keeping spread presence honest; a member-call
+        // argument shares the rules.
+        let src = "f({ ...base, ok: 1 });\ng({ m() { return 1; } });\nh({ ...base });\nJSON.parse({ raw: \"x\" });\n";
+        let pf = parse_module(FileId(0), "m.ts", src);
+        assert!(pf.errors.is_empty(), "errors: {:?}", pf.errors);
+        assert_eq!(pf.calls.len(), 3);
+        let spread_then_member = &pf.calls[0].args[0];
+        assert!(spread_then_member.spread);
+        let members = spread_then_member
+            .members
+            .as_ref()
+            .expect("explicit members survive a spread");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "ok");
+        assert_eq!(members[0].kind, ReturnKind::Number);
+        let method_degrades = &pf.calls[1].args[0];
+        assert!(!method_degrades.spread);
+        assert!(method_degrades.members.is_none(), "method key degrades");
+        let empty_after_spread = &pf.calls[2].args[0];
+        assert!(empty_after_spread.spread);
+        assert_eq!(empty_after_spread.members.as_deref(), Some(&[][..]));
+        let member_call_arg = &pf.member_calls[0].args[0];
+        assert!(!member_call_arg.spread);
+        let cm = member_call_arg
+            .members
+            .as_ref()
+            .expect("member-call object records members");
+        assert_eq!(cm.len(), 1);
+        assert_eq!(cm[0].name, "raw");
+        assert_eq!(cm[0].kind, ReturnKind::String);
     }
 
     #[test]
