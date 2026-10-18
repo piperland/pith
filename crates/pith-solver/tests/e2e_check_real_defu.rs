@@ -430,6 +430,25 @@ fn map_function_return(ret: &FrontendReturn) -> FunctionReturn {
     }
 }
 
+/// Maps one frontend guard-effect tail to the solver's: the literal shape
+/// through [`map_function_return`] plus the P048 seam for bare-identifier
+/// tails (PITH-P083, verbatim mirror of the check-functions driver's
+/// `map_ident_tail`: the adapter emits no identifier facts for returns, so
+/// the name slices from the return span — bare identifiers only, so
+/// parenthesized idents keep the historical decline).
+fn map_ident_tail(source: &str, ret: &FrontendReturn) -> FunctionReturn {
+    let mut mapped = map_function_return(ret);
+    let bare = mapped.kind == Some(InitKind::NonLiteral)
+        && mapped.init_object.is_none()
+        && mapped.cast.is_none();
+    if bare {
+        mapped.init_ident = slice_of(source, ret.span)
+            .filter(|text| is_bare_identifier(text))
+            .map(str::to_owned);
+    }
+    mapped
+}
+
 /// Maps one joined frontend return pair to the solver's joined shape.
 fn map_joined(first: &FrontendReturn, second: &FrontendReturn) -> JoinedReturns {
     JoinedReturns {
@@ -491,7 +510,9 @@ fn enclosing_from_facts(parsed: &ParsedFile) -> Vec<EnclosingFunction> {
 }
 
 /// The function driver: a mechanical copy of the check-calls driver.
-fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDecl> {
+/// PITH-P083: guard-effect tails feed the P048 ident seam through
+/// [`map_ident_tail`]; every other position maps exactly as before.
+fn functions_from_facts(parsed: &ParsedFile, binder: &Binder, source: &str) -> Vec<FunctionDecl> {
     parsed
         .functions
         .iter()
@@ -543,7 +564,7 @@ fn functions_from_facts(parsed: &ParsedFile, binder: &Binder) -> Vec<FunctionDec
                 FunctionBodyFact::GuardEffect { call, tail } => {
                     FunctionBody::GuardEffect(GuardEffectBody {
                         call: map_effect_call(call),
-                        tail: tail.as_ref().map(map_function_return),
+                        tail: tail.as_ref().map(|ret| map_ident_tail(source, ret)),
                     })
                 }
                 FunctionBodyFact::EffectUnsupported { reason } => FunctionBody::EffectUnsupported {
@@ -828,7 +849,7 @@ fn run_program(specs: &[FileSpec<'_>]) -> Program {
             consts,
             ident_inits: idents,
             enum_texts: texts,
-            functions: functions_from_facts(file_parsed, &binder),
+            functions: functions_from_facts(file_parsed, &binder, spec.source),
             enclosing: enclosing_from_facts(file_parsed),
             calls: calls_from_facts(file_parsed),
             interfaces: interfaces_from_facts(file_parsed, &binder),
