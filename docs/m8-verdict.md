@@ -62,6 +62,20 @@ conversions and one honest falsification chain.
    planned as the P085→P086 facts-then-admission chain. NOT the wall itself:
    admitted structure comes from recorded verbatim alias text, spread
    presence is a syntax fact; spread VALUE semantics stay invented-structure.
+   **CORRECTED 2026-10-18 (P086 closed unmet-by-analysis):** this entry's
+   optimism was FALSIFIED by trace + probes (`.agent/scratch/p084-probes/`).
+   (i) `resolve_params` filters the shape lookup whenever the callee declares
+   type parameters (`lib.rs:5658`), so P062-style admission never runs for
+   `destr<T>`/`_defu<T>` — tsc DOES structural-check alias-object params
+   through generic callees (probe: TS2322/TS2353 fire on
+   `destr<string>(x, { strict: 1 })`), i.e. this note belongs to the
+   GENERIC-INSTANTIATION blocker, not the admission class; (ii) the real
+   argument is spread-bearing (`{ ...options, ... }`), whose contributed
+   members tsc knows but facts do not record — judging explicit members
+   alone would report MISSING/EXCESS verdicts tsc would not, inventing the
+   spread's structure. "solver already admits" (inherited from M7) is false
+   for this call family. The P085 member facts remain correct and consumed
+   by no admission path yet.
 2. Unannotated decls, no inference — 6 (defu.ts ×6). Blocker: inference of
    non-literal initializers beyond P076/P081-known positions — value facts
    the single pass refuses to invent.
@@ -81,7 +95,11 @@ conversions and one honest falsification chain.
 
 The wall is not one thing: the ledger separates (a) buildable in-subset
 chains the probes already pin — the Options/argument-object admission pair
-(P085 facts, P086 admission), enclosing-param callee signatures (callbacks ×3),
+(P085 facts, P086 admission — CLOSED UNMET 2026-10-18 by trace+probe
+falsification: generic callees filter the shape lookup and the argument is
+spread-bearing, so Options joins the generic-instantiation blocker class;
+the same trace pulls the callbacks ×3 behind the Merger generic alias),
+enclosing-param callee signatures (callbacks ×3),
 ambient generic overloads (×2); from (b) declared impossible-without-breach —
 type-operator evaluation (`Merger` ×3, `T` ×3 instantiation), control flow
 (×2), value inference (×6), cross-file named returns + unannotated-param gate
